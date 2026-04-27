@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0"
+    />
+    <title>Kerbodyne Ground Station</title>
+    <script>
+      window.addEventListener('error', function (event) {
+        console.error(
+          'Browser startup error:',
+          event.message,
+          event.filename,
+          event.lineno,
+          event.colno,
+          event.error && event.error.stack ? event.error.stack : ''
+        );
+      });
+
+      window.addEventListener('unhandledrejection', function (event) {
+        console.error('Browser startup rejection:', event.reason);
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+  </html>

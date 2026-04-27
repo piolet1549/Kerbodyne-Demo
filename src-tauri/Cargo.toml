@@ -1,0 +1,27 @@
+[package]
+name = "kerbodyne-ground-station"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata]
+
+[lib]
+name = "kerbodyne_ground_station_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+futures-util = "0.3"
+hyper = { version = "0.14", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["protocol-asset"] }
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+uuid = { version = "1", features = ["v4", "serde"] }

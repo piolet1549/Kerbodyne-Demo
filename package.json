@@ -1,0 +1,33 @@
+{
+  "name": "kerbodyne-ground-station",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 1420",
+    "dev:tauri-server": "node scripts/tauri-dev-server.mjs",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "clean:build": "powershell -ExecutionPolicy Bypass -File scripts/clean-build-artifacts.ps1",
+    "clean:cache": "powershell -ExecutionPolicy Bypass -File scripts/clean-runtime-cache.ps1",
+    "clean:all": "npm run clean:build && npm run clean:cache",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@protomaps/basemaps": "^5.7.2",
+    "@tauri-apps/api": "^2.0.0",
+    "maplibre-gl": "^4.7.1",
+    "pmtiles": "^4.4.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^6.0.1",
+    "typescript": "^5.6.2",
+    "vite": "^8.0.8"
+  }
+}

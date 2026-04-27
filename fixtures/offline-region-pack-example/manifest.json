@@ -1,0 +1,10 @@
+{
+  "id": "example-site",
+  "name": "Example Site",
+  "bounds": [-121.5242, 38.5564, -121.4868, 38.5851],
+  "center": [-121.5054, 38.5707],
+  "street_pmtiles": "street.pmtiles",
+  "satellite_pmtiles": "satellite.pmtiles",
+  "imagery_attribution": "USDA NAIP / OpenStreetMap",
+  "imagery_capture_date": "2024-06-15"
+}
