@@ -3,7 +3,6 @@ import { createPortal } from 'react-dom';
 import maplibregl, { type GeoJSONSource, type Map } from 'maplibre-gl';
 import {
   buildAlertSectorsGeoJson,
-  buildAircraftGeoJson,
   buildAlertsGeoJson,
   buildCoverageBoundsGeoJson,
   buildCoverageMaskGeoJson,
@@ -36,7 +35,6 @@ interface LiveMapProps {
   onSelectAlert: (alertId: string) => void;
 }
 
-const SOURCE_AIRCRAFT = 'aircraft-source';
 const SOURCE_TRACK = 'track-source';
 const SOURCE_ALERTS = 'alerts-source';
 const SOURCE_SECTOR = 'sector-source';
@@ -71,6 +69,8 @@ export function LiveMap({
 }: LiveMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
+  const aircraftMarkerRef = useRef<maplibregl.Marker | null>(null);
+  const aircraftMarkerGlyphRef = useRef<HTMLDivElement | null>(null);
   const lastRightClickRef = useRef<{ at: number; x: number; y: number } | null>(null);
   const didAutoFitTrack = useRef(false);
   const fittedRegionIdRef = useRef<string | null>(null);
@@ -277,21 +277,37 @@ export function LiveMap({
 
     try {
       setMapLoadingLabel(buildMapLoadingLabel(mapMode));
-      const map = new maplibregl.Map({
-        container: containerRef.current,
-        style,
+        const map = new maplibregl.Map({
+          container: containerRef.current,
+          style,
         center: initialView.center,
         zoom: initialView.zoom,
         pitch: 0,
         pitchWithRotate: false,
         attributionControl: false,
         renderWorldCopies: false
-      });
+        });
 
-      map.dragRotate.enable();
-      map.touchZoomRotate.disableRotation();
+        map.dragRotate.enable();
+        map.touchZoomRotate.disableRotation();
 
-      map.on('error', (event) => {
+        const aircraftMarkerElement = document.createElement('div');
+        aircraftMarkerElement.className = 'aircraft-marker';
+        const aircraftMarkerGlyph = document.createElement('div');
+        aircraftMarkerGlyph.className = 'aircraft-marker__glyph';
+        aircraftMarkerElement.appendChild(aircraftMarkerGlyph);
+        const aircraftMarker = new maplibregl.Marker({
+          element: aircraftMarkerElement,
+          anchor: 'center',
+          rotationAlignment: 'map'
+        })
+          .setLngLat([0, 0])
+          .addTo(map);
+        aircraftMarkerRef.current = aircraftMarker;
+        aircraftMarkerGlyphRef.current = aircraftMarkerGlyph;
+        syncAircraftMarker(aircraftMarker, aircraftMarkerGlyph, liveStateRef.current);
+
+        map.on('error', (event) => {
         const message =
           event.error instanceof Error ? event.error.message : 'Map rendering failed';
         console.error('Kerbodyne map error:', event.error ?? event);
@@ -303,12 +319,12 @@ export function LiveMap({
         applyOverlayAppearance(map, mapModeRef.current);
         syncMapData(
           map,
-          liveStateRef.current,
           trackRef.current,
           alertsRef.current,
           selectedAlertIdRef.current,
           enabledRegions
         );
+        syncAircraftMarker(aircraftMarkerRef.current, aircraftMarkerGlyphRef.current, liveStateRef.current);
         syncMeasureData(map, measurePointsRef.current);
         syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
         const currentCenter = map.getCenter();
@@ -400,12 +416,15 @@ export function LiveMap({
       canvas.addEventListener('mouseup', handleMouseUp);
 
       mapRef.current = map;
-      return () => {
-        canvas.removeEventListener('contextmenu', handleContextMenu);
-        canvas.removeEventListener('mouseup', handleMouseUp);
-        map.remove();
-        mapRef.current = null;
-      };
+        return () => {
+          canvas.removeEventListener('contextmenu', handleContextMenu);
+          canvas.removeEventListener('mouseup', handleMouseUp);
+          aircraftMarker.remove();
+          aircraftMarkerRef.current = null;
+          aircraftMarkerGlyphRef.current = null;
+          map.remove();
+          mapRef.current = null;
+        };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Map initialization failed';
       console.error('Kerbodyne map initialization failed:', error);
@@ -440,7 +459,8 @@ export function LiveMap({
 
     ensureSources(map);
     applyOverlayAppearance(map, mapMode);
-    syncMapData(map, filteredLiveState, filteredTrack, filteredAlerts, selectedAlertId, enabledRegions);
+    syncMapData(map, filteredTrack, filteredAlerts, selectedAlertId, enabledRegions);
+    syncAircraftMarker(aircraftMarkerRef.current, aircraftMarkerGlyphRef.current, filteredLiveState);
     syncMeasureData(map, measurePoints);
     syncMeasureOverlay(map, measurePoints, measureUnit, setMeasureLabelScreen);
   }, [enabledRegions, filteredAlerts, filteredLiveState, filteredTrack, mapMode, measurePoints, measureUnit, selectedAlertId]);
@@ -769,30 +789,6 @@ function ensureSources(map: Map) {
     });
   }
 
-  if (!map.getSource(SOURCE_AIRCRAFT)) {
-    map.addSource(SOURCE_AIRCRAFT, {
-      type: 'geojson',
-      data: buildAircraftGeoJson(null)
-    });
-    map.addLayer({
-      id: 'aircraft-layer',
-      type: 'fill',
-      source: SOURCE_AIRCRAFT,
-      paint: {
-        'fill-color': '#f7f7f7',
-        'fill-opacity': 0.98
-      }
-    });
-    map.addLayer({
-      id: 'aircraft-outline',
-      type: 'line',
-      source: SOURCE_AIRCRAFT,
-      paint: {
-        'line-color': '#020202',
-        'line-width': 1.8
-      }
-    });
-  }
 }
 
 function applyOverlayAppearance(map: Map, mapMode: MapMode) {
@@ -807,20 +803,17 @@ function applyOverlayAppearance(map: Map, mapMode: MapMode) {
   map.setPaintProperty('track-layer', 'line-width', satellite ? 3.6 : 2.8);
   map.setPaintProperty('track-layer', 'line-color', satellite ? '#ffffff' : '#ededed');
   map.setPaintProperty('alerts-halo-layer', 'circle-opacity', satellite ? 0.34 : 0.22);
-  map.setPaintProperty('aircraft-outline', 'line-width', satellite ? 2.2 : 1.8);
   map.setPaintProperty('coverage-mask-layer', 'fill-opacity', satellite ? 0.64 : 0.56);
   map.setPaintProperty('coverage-bounds-layer', 'line-opacity', satellite ? 0.6 : 0.5);
 }
 
 function syncMapData(
   map: Map,
-  liveState: AircraftLiveState | null | undefined,
   track: Array<[number, number]>,
   alerts: AlertRecord[],
   selectedAlertId?: string | null,
   enabledRegions: OfflineRegionManifest[] = []
 ) {
-  (map.getSource(SOURCE_AIRCRAFT) as GeoJSONSource).setData(buildAircraftGeoJson(liveState));
   (map.getSource(SOURCE_TRACK) as GeoJSONSource).setData(buildTrackGeoJson(track));
   (map.getSource(SOURCE_ALERTS) as GeoJSONSource).setData(
     buildAlertsGeoJson(alerts, selectedAlertId)
@@ -834,6 +827,25 @@ function syncMapData(
   (map.getSource(SOURCE_COVERAGE_BOUNDS) as GeoJSONSource).setData(
     buildCoverageBoundsGeoJson(enabledRegions)
   );
+}
+
+function syncAircraftMarker(
+  marker: maplibregl.Marker | null,
+  glyph: HTMLDivElement | null,
+  liveState: AircraftLiveState | null | undefined
+) {
+  if (!marker || !glyph) {
+    return;
+  }
+
+  if (!liveState || !isValidCoordinate(liveState.lat, liveState.lon)) {
+    marker.getElement().style.display = 'none';
+    return;
+  }
+
+  marker.getElement().style.display = 'block';
+  marker.setLngLat([liveState.lon as number, liveState.lat as number]);
+  glyph.style.transform = `rotate(${Math.round(liveState.heading_deg ?? 0)}deg)`;
 }
 
 function syncMeasureData(map: Map, points: Array<[number, number]>) {
