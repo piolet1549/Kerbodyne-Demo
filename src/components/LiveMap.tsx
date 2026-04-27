@@ -330,9 +330,6 @@ export function LiveMap({
         const currentCenter = map.getCenter();
         setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
         syncScaleIndicator(map, setScaleIndicator);
-      });
-
-      map.on('idle', () => {
         setMapLoadingLabel(null);
       });
 
@@ -460,10 +457,13 @@ export function LiveMap({
     ensureSources(map);
     applyOverlayAppearance(map, mapMode);
     syncMapData(map, filteredTrack, filteredAlerts, selectedAlertId, enabledRegions);
-    syncAircraftMarker(aircraftMarkerRef.current, aircraftMarkerGlyphRef.current, filteredLiveState);
     syncMeasureData(map, measurePoints);
     syncMeasureOverlay(map, measurePoints, measureUnit, setMeasureLabelScreen);
-  }, [enabledRegions, filteredAlerts, filteredLiveState, filteredTrack, mapMode, measurePoints, measureUnit, selectedAlertId]);
+  }, [enabledRegions, filteredAlerts, filteredTrack, mapMode, measurePoints, measureUnit, selectedAlertId]);
+
+  useEffect(() => {
+    syncAircraftMarker(aircraftMarkerRef.current, aircraftMarkerGlyphRef.current, filteredLiveState);
+  }, [filteredLiveState]);
 
   useEffect(() => {
     if (filteredTrack.length === 0) {
@@ -845,7 +845,7 @@ function syncAircraftMarker(
 
   marker.getElement().style.display = 'block';
   marker.setLngLat([liveState.lon as number, liveState.lat as number]);
-  glyph.style.transform = `rotate(${Math.round(liveState.heading_deg ?? 0)}deg)`;
+  marker.setRotation(Math.round(liveState.heading_deg ?? 0));
 }
 
 function syncMeasureData(map: Map, points: Array<[number, number]>) {
