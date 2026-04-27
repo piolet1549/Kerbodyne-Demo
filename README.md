@@ -108,4 +108,4 @@ npm run tauri:build
 
 ## License
 
-This repository does not currently grant an open-source license. See [LICENSE](LICENSE).
+This repository is licensed under the [MIT License](LICENSE).
