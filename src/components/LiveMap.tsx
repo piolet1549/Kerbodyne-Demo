@@ -71,6 +71,7 @@ export function LiveMap({
   const mapRef = useRef<Map | null>(null);
   const aircraftMarkerRef = useRef<maplibregl.Marker | null>(null);
   const aircraftMarkerGlyphRef = useRef<HTMLDivElement | null>(null);
+  const appliedStyleKeyRef = useRef<string | null>(null);
   const lastRightClickRef = useRef<{ at: number; x: number; y: number } | null>(null);
   const didAutoFitTrack = useRef(false);
   const fittedRegionIdRef = useRef<string | null>(null);
@@ -129,6 +130,22 @@ export function LiveMap({
       config.map_tile_template,
       mapMode
     ]
+  );
+  const styleKey = useMemo(
+    () =>
+      JSON.stringify({
+        mapMode,
+        assetOrigin: assetOrigin ?? '',
+        regions: enabledRegions.map((region) => ({
+          id: region.id,
+          street_pmtiles: region.street_pmtiles,
+          street_source_type: region.street_source_type ?? '',
+          street_image: region.street_image ?? '',
+          satellite_pmtiles: region.satellite_pmtiles,
+          satellite_image: region.satellite_image ?? ''
+        }))
+      }),
+    [assetOrigin, enabledRegions, mapMode]
   );
   const coverageUnavailable = enabledRegions.length > 0
     ? !enabledRegions.some((region) =>
@@ -275,8 +292,8 @@ export function LiveMap({
 
     const initialView = computeInitialView(selectedRegion, enabledRegions, containerRef.current);
 
-    try {
-      setMapLoadingLabel(buildMapLoadingLabel(mapMode));
+      try {
+        setMapLoadingLabel(buildMapLoadingLabel(mapMode));
         const map = new maplibregl.Map({
           container: containerRef.current,
           style,
@@ -305,6 +322,7 @@ export function LiveMap({
           .addTo(map);
         aircraftMarkerRef.current = aircraftMarker;
         aircraftMarkerGlyphRef.current = aircraftMarkerGlyph;
+        appliedStyleKeyRef.current = styleKey;
         syncAircraftMarker(aircraftMarker, aircraftMarkerGlyph, liveStateRef.current);
 
         map.on('error', (event) => {
@@ -314,9 +332,9 @@ export function LiveMap({
         setMapError(message);
       });
 
-      map.on('style.load', () => {
-        ensureSources(map);
-        applyOverlayAppearance(map, mapModeRef.current);
+        map.on('style.load', () => {
+          ensureSources(map);
+          applyOverlayAppearance(map, mapModeRef.current);
         syncMapData(
           map,
           trackRef.current,
@@ -326,12 +344,16 @@ export function LiveMap({
         );
         syncAircraftMarker(aircraftMarkerRef.current, aircraftMarkerGlyphRef.current, liveStateRef.current);
         syncMeasureData(map, measurePointsRef.current);
-        syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
-        const currentCenter = map.getCenter();
-        setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
-        syncScaleIndicator(map, setScaleIndicator);
-        setMapLoadingLabel(null);
-      });
+          syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
+          const currentCenter = map.getCenter();
+          setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
+          syncScaleIndicator(map, setScaleIndicator);
+          setMapLoadingLabel(null);
+        });
+
+        map.on('load', () => {
+          setMapLoadingLabel(null);
+        });
 
       map.on('click', (event) => {
         if (measureEnabledRef.current) {
@@ -436,9 +458,26 @@ export function LiveMap({
       return;
     }
 
+    if (appliedStyleKeyRef.current === styleKey) {
+      return;
+    }
+
     setMapError(null);
+    setMapLoadingLabel(buildMapLoadingLabel(mapMode));
+    appliedStyleKeyRef.current = styleKey;
+
+    let cleared = false;
+    const clearLoading = () => {
+      if (cleared) {
+        return;
+      }
+      cleared = true;
+      setMapLoadingLabel(null);
+    };
+
     try {
-      setMapLoadingLabel(buildMapLoadingLabel(mapMode));
+      map.once('styledata', clearLoading);
+      map.once('idle', clearLoading);
       map.setStyle(style);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to switch map style';
@@ -446,7 +485,7 @@ export function LiveMap({
       setMapError(message);
       setMapLoadingLabel(null);
     }
-  }, [style]);
+  }, [mapMode, style, styleKey]);
 
   useEffect(() => {
     const map = mapRef.current;
