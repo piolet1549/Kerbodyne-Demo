@@ -1,15 +1,15 @@
 import { useEffect, useState } from 'react';
-import type { MissionSession, SystemStatusRecord } from '../lib/types';
+import type { MissionSession } from '../lib/types';
 import { formatTimestamp } from '../lib/time';
 
 interface FlightSavesPanelProps {
   sessions: MissionSession[];
   focusedSessionId?: string | null;
   activeSessionId?: string | null;
-  statuses: SystemStatusRecord[];
   onFocusSession: (sessionId: string) => void;
   onUpdateSession: (sessionId: string, name: string, description?: string | null) => void;
   onRequestDeleteSession: (sessionId: string, name: string) => void;
+  onExportSession: (sessionId: string) => void;
 }
 
 function formatStorage(bytes: number): string {
@@ -28,19 +28,25 @@ function formatStorage(bytes: number): string {
   return `${value.toFixed(precision)} ${units[unitIndex]}`;
 }
 
-function isErrorStatus(status: string): boolean {
-  const normalized = status.trim().toUpperCase();
-  return normalized.includes('ERROR') || normalized.includes('FAIL');
+function ExportIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="icon-export">
+      <path d="M12 4v10" />
+      <path d="m8 10 4 4 4-4" />
+      <path d="M5 17.5h14" />
+      <path d="M7 20h10" />
+    </svg>
+  );
 }
 
 export function FlightSavesPanel({
   sessions,
   focusedSessionId,
   activeSessionId,
-  statuses,
   onFocusSession,
   onUpdateSession,
-  onRequestDeleteSession
+  onRequestDeleteSession,
+  onExportSession
 }: FlightSavesPanelProps) {
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState('');
@@ -123,48 +129,68 @@ export function FlightSavesPanel({
                   <div className="save-row__actions">
                     {isEditing ? (
                       <>
-                        <input
-                          className="save-name-input"
-                          value={draftName}
-                          onChange={(event) => setDraftName(event.target.value)}
-                        />
-                        <textarea
-                          className="save-name-input save-description-input"
-                          value={draftDescription}
-                          onChange={(event) => setDraftDescription(event.target.value)}
-                          rows={3}
-                          placeholder="Optional description"
-                        />
-                        <button
-                          className="secondary-button"
-                          onClick={() => {
-                            onUpdateSession(session.id, draftName, draftDescription);
-                            setEditingSessionId(null);
-                          }}
-                        >
-                          Save
-                        </button>
-                        <button
-                          className="secondary-button secondary-button--muted"
-                          onClick={() => setEditingSessionId(null)}
-                        >
-                          Cancel
-                        </button>
+                        <div className="save-row__actions-left save-row__actions-left--editing">
+                          <input
+                            className="save-name-input"
+                            value={draftName}
+                            onChange={(event) => setDraftName(event.target.value)}
+                          />
+                          <textarea
+                            className="save-name-input save-description-input"
+                            value={draftDescription}
+                            onChange={(event) => setDraftDescription(event.target.value)}
+                            rows={3}
+                            placeholder="Optional description"
+                          />
+                          <div className="save-row__button-row">
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              onClick={() => {
+                                onUpdateSession(session.id, draftName, draftDescription);
+                                setEditingSessionId(null);
+                              }}
+                            >
+                              Save
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button secondary-button--muted"
+                              onClick={() => setEditingSessionId(null)}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
                       </>
                     ) : (
                       <>
+                        <div className="save-row__actions-left">
+                          <button
+                            type="button"
+                            className="secondary-button secondary-button--muted"
+                            onClick={() => setEditingSessionId(session.id)}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button secondary-button--danger"
+                            onClick={() => onRequestDeleteSession(session.id, session.name)}
+                            disabled={isLive}
+                          >
+                            Delete
+                          </button>
+                        </div>
                         <button
-                          className="secondary-button secondary-button--muted"
-                          onClick={() => setEditingSessionId(session.id)}
-                        >
-                          Edit
-                        </button>
-                        <button
-                          className="secondary-button secondary-button--danger"
-                          onClick={() => onRequestDeleteSession(session.id, session.name)}
+                          type="button"
+                          className="secondary-button secondary-button--muted save-row__icon-button save-row__icon-button--bottom"
+                          onClick={() => onExportSession(session.id)}
                           disabled={isLive}
+                          title="Export telemetry"
+                          aria-label={`Export telemetry for ${session.name}`}
                         >
-                          Delete
+                          <ExportIcon />
                         </button>
                       </>
                     )}
@@ -178,27 +204,6 @@ export function FlightSavesPanel({
             <p>{sessions.length > 0 ? 'No flights match that search' : 'No saved flights yet'}</p>
           </div>
         )}
-
-        {statuses.length > 0 ? (
-          <div className="flight-events">
-            <span className="section-title section-title--small">Flight events</span>
-            <div className="flight-events__list">
-              {statuses.slice(0, 4).map((status) => (
-                <div key={status.id} className="flight-events__row">
-                  <span
-                    className={`event-dot ${
-                      isErrorStatus(status.status) ? 'event-dot--error' : 'event-dot--ok'
-                    }`}
-                  />
-                  <div>
-                    <strong>{status.message}</strong>
-                    <span>{formatTimestamp(status.reported_at)}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ) : null}
       </div>
     </section>
   );

@@ -109,8 +109,18 @@ async fn delete_session(
     state.delete_session(&app, session_id).await
 }
 
+#[tauri::command]
+async fn export_session_telemetry(
+    state: State<'_, Arc<AppRuntime>>,
+    session_id: String,
+    output_path: Option<String>,
+) -> Result<String, String> {
+    state.export_session_telemetry(session_id, output_path).await
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let runtime = AppRuntime::initialize(app.handle())
                 .map_err(|message| io::Error::new(io::ErrorKind::Other, message))?;
@@ -129,7 +139,8 @@ pub fn run() {
             focus_session,
             clear_focused_session,
             update_session_details,
-            delete_session
+            delete_session,
+            export_session_telemetry
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kerbodyne Ground Station");

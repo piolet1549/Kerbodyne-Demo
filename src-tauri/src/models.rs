@@ -29,6 +29,9 @@ pub struct AppConfig {
     pub default_range_m: f64,
     pub stale_after_seconds: u64,
     pub class_display_names: BTreeMap<String, String>,
+    pub aircraft_icon: AircraftIconConfig,
+    pub track_display: TrackDisplayConfig,
+    pub flight_alerts: FlightAlertConfig,
 }
 
 impl Default for AppConfig {
@@ -46,11 +49,14 @@ impl Default for AppConfig {
             selected_region_id: None,
             enabled_region_ids: Vec::new(),
             region_name_overrides: BTreeMap::new(),
-            default_map_mode: MapMode::StreetDark,
+            default_map_mode: MapMode::Satellite,
             default_fov_deg: 38.0,
             default_range_m: 250.0,
             stale_after_seconds: 10,
             class_display_names,
+            aircraft_icon: AircraftIconConfig::default(),
+            track_display: TrackDisplayConfig::default(),
+            flight_alerts: FlightAlertConfig::default(),
         }
     }
 }
@@ -62,6 +68,77 @@ pub enum MapMode {
     Satellite,
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AircraftIconShape {
+    Compass,
+    Delta,
+    Dart,
+    Kite,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AircraftIconConfig {
+    pub size_px: u16,
+    pub color_hex: String,
+    pub shape: AircraftIconShape,
+}
+
+impl Default for AircraftIconConfig {
+    fn default() -> Self {
+        Self {
+            size_px: 38,
+            color_hex: "#f7f7f7".into(),
+            shape: AircraftIconShape::Compass,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackLineStyle {
+    Solid,
+    Dashed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackDisplayConfig {
+    pub enabled: bool,
+    pub color_hex: String,
+    pub width_px: f64,
+    pub style: TrackLineStyle,
+}
+
+impl Default for TrackDisplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            color_hex: "#f0f0f0".into(),
+            width_px: 2.8,
+            style: TrackLineStyle::Solid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlightAlertConfig {
+    pub high_speed_warning_mps: f64,
+    pub low_speed_warning_mps: f64,
+    pub high_altitude_warning_m: f64,
+    pub low_battery_warning_percent: f64,
+}
+
+impl Default for FlightAlertConfig {
+    fn default() -> Self {
+        Self {
+            high_speed_warning_mps: 35.0,
+            low_speed_warning_mps: 9.0,
+            high_altitude_warning_m: 120.0,
+            low_battery_warning_percent: 20.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

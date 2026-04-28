@@ -462,6 +462,77 @@ impl AppRuntime {
         Ok(())
     }
 
+    pub async fn export_session_telemetry(
+        &self,
+        session_id: String,
+        output_path: Option<String>,
+    ) -> Result<String, String> {
+        let _session = self
+            .sessions
+            .read()
+            .await
+            .iter()
+            .find(|entry| entry.id == session_id)
+            .cloned()
+            .ok_or_else(|| "Flight not found.".to_string())?;
+        let replay_events = self.db.load_replay_events(&session_id)?;
+        let path = output_path
+            .map(PathBuf::from)
+            .ok_or_else(|| "No export path selected.".to_string())?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut rows = String::from(
+            "recorded_at,message_id,aircraft_id,armed,lat,lon,alt_msl_m,groundspeed_mps,heading_deg,flight_time_s,battery_voltage_v,battery_percent,extras_json,raw_json\n",
+        );
+
+        for frame in replay_events {
+            let Ok(envelope) = serde_json::from_str::<WireEnvelope<TelemetryPayload>>(&frame.envelope_json)
+            else {
+                continue;
+            };
+            if envelope.envelope_type != "telemetry" {
+                continue;
+            }
+            let extras_json =
+                serde_json::to_string(&envelope.payload.extras).map_err(|error| error.to_string())?;
+            write_csv_row(
+                &mut rows,
+                &[
+                    normalize_timestamp(&envelope.sent_at),
+                    envelope.message_id,
+                    envelope.aircraft_id,
+                    envelope.payload.armed.to_string(),
+                    csv_option_f64(envelope.payload.lat),
+                    csv_option_f64(envelope.payload.lon),
+                    csv_option_f64(envelope.payload.alt_msl_m),
+                    csv_option_f64(envelope.payload.groundspeed_mps),
+                    csv_option_f64(envelope.payload.heading_deg),
+                    csv_option_f64(envelope.payload.flight_time_s),
+                    csv_option_f64(
+                        envelope
+                            .payload
+                            .battery
+                            .as_ref()
+                            .and_then(|battery| battery.voltage_v),
+                    ),
+                    csv_option_f64(
+                        envelope
+                            .payload
+                            .battery
+                            .as_ref()
+                            .and_then(|battery| battery.percent),
+                    ),
+                    extras_json,
+                    frame.envelope_json,
+                ],
+            );
+        }
+
+        fs::write(&path, rows).map_err(|error| error.to_string())?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
     pub async fn complete_active_stream(
         &self,
         app: &AppHandle,
@@ -1071,11 +1142,7 @@ impl AppRuntime {
             .await?;
 
         if is_error_status(&record.status) {
-            self.push_warning(
-                app,
-                format!("Aircraft reported {}: {}", record.status, record.message),
-            )
-            .await;
+            self.emit_snapshot(app).await?;
             return Ok(());
         }
 
@@ -1290,6 +1357,30 @@ fn sanitize_extension(extension: &str) -> &str {
         "png" => "png",
         _ => "bin",
     }
+}
+
+fn csv_option_f64(value: Option<f64>) -> String {
+    value.map(|number| number.to_string()).unwrap_or_default()
+}
+
+fn escape_csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn write_csv_row(target: &mut String, fields: &[String]) {
+    let mut first = true;
+    for field in fields {
+        if !first {
+            target.push(',');
+        }
+        first = false;
+        target.push_str(&escape_csv_field(field));
+    }
+    target.push('\n');
 }
 
 fn review_frames_from_replay(frames: Vec<ReplayFrame>) -> Vec<ReviewTelemetryFrame> {

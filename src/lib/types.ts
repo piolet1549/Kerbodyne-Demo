@@ -1,5 +1,7 @@
 export type RuntimeMode = 'idle' | 'live';
 export type MapMode = 'street_dark' | 'satellite';
+export type AircraftIconShape = 'compass' | 'delta' | 'dart' | 'kite';
+export type TrackLineStyle = 'solid' | 'dashed';
 
 export type ConnectionStatus =
   | 'disconnected'
@@ -19,6 +21,32 @@ export interface LinkSummary {
   latency_ms?: number | null;
 }
 
+export interface AircraftIconConfig {
+  size_px: number;
+  color_hex: string;
+  shape: AircraftIconShape;
+}
+
+export interface TrackDisplayConfig {
+  enabled: boolean;
+  color_hex: string;
+  width_px: number;
+  style: TrackLineStyle;
+}
+
+export interface FlightAlertConfig {
+  high_speed_warning_mps: number;
+  low_speed_warning_mps: number;
+  high_altitude_warning_m: number;
+  low_battery_warning_percent: number;
+}
+
+export interface HudMetricState {
+  tone: 'normal' | 'caution' | 'warning';
+  color_hex?: string | null;
+  pulse?: boolean;
+}
+
 export interface AppConfig {
   listen_port: number;
   aircraft_label: string;
@@ -33,6 +61,9 @@ export interface AppConfig {
   default_range_m: number;
   stale_after_seconds: number;
   class_display_names: Record<string, string>;
+  aircraft_icon: AircraftIconConfig;
+  track_display: TrackDisplayConfig;
+  flight_alerts: FlightAlertConfig;
 }
 
 export interface OfflineRegionManifest {

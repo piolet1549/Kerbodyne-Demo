@@ -64,6 +64,13 @@ export async function deleteSession(sessionId: string): Promise<void> {
   return invoke('delete_session', { sessionId });
 }
 
+export async function exportSessionTelemetry(
+  sessionId: string,
+  outputPath: string
+): Promise<string> {
+  return invoke<string>('export_session_telemetry', { sessionId, outputPath });
+}
+
 export async function listenToRuntimeEvents(
   handler: (event: RuntimeEvent) => void
 ): Promise<UnlistenFn> {

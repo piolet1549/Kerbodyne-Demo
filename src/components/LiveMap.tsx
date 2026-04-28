@@ -29,6 +29,7 @@ interface LiveMapProps {
   mapMode: MapMode;
   activeFlight: boolean;
   reviewMode: boolean;
+  linkPulseActive: boolean;
   measureToolbarHost?: HTMLElement | null;
   focusTarget?: [number, number] | null;
   focusKey?: string | null;
@@ -50,6 +51,24 @@ const MEASURE_UNIT_LABELS: Record<MeasureUnit, string> = {
   km: 'Kilometers'
 };
 
+function RotateLeftIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="map-control-wheel__icon">
+      <path d="M16.4 8.2a6.2 6.2 0 0 0-8 4.8" />
+      <path d="M8.4 13l-2.8.3 1.7-2.3" />
+    </svg>
+  );
+}
+
+function RotateRightIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="map-control-wheel__icon">
+      <path d="M7.6 8.2a6.2 6.2 0 0 1 8 4.8" />
+      <path d="m15.6 13 2.8.3-1.7-2.3" />
+    </svg>
+  );
+}
+
 export function LiveMap({
   config,
   liveState,
@@ -62,6 +81,7 @@ export function LiveMap({
   mapMode,
   activeFlight,
   reviewMode,
+  linkPulseActive,
   measureToolbarHost,
   focusTarget,
   focusKey,
@@ -73,7 +93,6 @@ export function LiveMap({
   const aircraftMarkerGlyphRef = useRef<HTMLDivElement | null>(null);
   const appliedStyleKeyRef = useRef<string | null>(null);
   const lastRightClickRef = useRef<{ at: number; x: number; y: number } | null>(null);
-  const didAutoFitTrack = useRef(false);
   const fittedRegionIdRef = useRef<string | null>(null);
   const onSelectAlertRef = useRef(onSelectAlert);
   const liveStateRef = useRef(liveState);
@@ -82,6 +101,11 @@ export function LiveMap({
   const selectedAlertIdRef = useRef(selectedAlertId);
   const mapModeRef = useRef(mapMode);
   const reviewModeRef = useRef(reviewMode);
+  const configRef = useRef(config);
+  const linkPulseActiveRef = useRef(linkPulseActive);
+  const activeFlightRef = useRef(activeFlight);
+  const enabledRegionsRef = useRef(enabledRegions);
+  const selectedRegionRef = useRef(selectedRegion);
   const measureEnabledRef = useRef(false);
   const measurePointsRef = useRef<Array<[number, number]>>([]);
   const measureUnitRef = useRef<MeasureUnit>('nm');
@@ -102,6 +126,7 @@ export function LiveMap({
   const [scaleIndicator, setScaleIndicator] = useState<{ widthPx: number; label: string } | null>(
     null
   );
+  const [followEnabled, setFollowEnabled] = useState(true);
   const [centerCoordinates, setCenterCoordinates] = useState<[number, number]>(
     selectedRegion
       ? [selectedRegion.center[1], selectedRegion.center[0]]
@@ -164,6 +189,7 @@ export function LiveMap({
     }
     return formatMeasurement(measurementDistanceM, measureUnit);
   }, [measurementDistanceM, measureUnit]);
+  const showFollowToggle = Boolean(filteredLiveState?.armed);
   const measureControl = (
     <div ref={measureShellRef} className="measure-shell">
       <button
@@ -255,10 +281,30 @@ export function LiveMap({
     selectedAlertIdRef.current = selectedAlertId;
     mapModeRef.current = mapMode;
     reviewModeRef.current = reviewMode;
+    configRef.current = config;
+    linkPulseActiveRef.current = linkPulseActive;
+    activeFlightRef.current = activeFlight;
+    enabledRegionsRef.current = enabledRegions;
+    selectedRegionRef.current = selectedRegion;
     measureEnabledRef.current = measureOpen;
     measurePointsRef.current = measurePoints;
     measureUnitRef.current = measureUnit;
-  }, [activeFlight, filteredAlerts, filteredLiveState, filteredTrack, mapMode, measureOpen, measurePoints, measureUnit, reviewMode, selectedAlertId]);
+  }, [
+    activeFlight,
+    config,
+    enabledRegions,
+    filteredAlerts,
+    filteredLiveState,
+    filteredTrack,
+    linkPulseActive,
+    mapMode,
+    measureOpen,
+    measurePoints,
+    measureUnit,
+    reviewMode,
+    selectedAlertId,
+    selectedRegion
+  ]);
 
   useEffect(() => {
     ensurePmtilesProtocol();
@@ -285,7 +331,6 @@ export function LiveMap({
     }
 
     setMapError(null);
-    didAutoFitTrack.current = false;
     fittedRegionIdRef.current = null;
     lastFocusKeyRef.current = null;
     lastSelectedRegionIdRef.current = null;
@@ -307,11 +352,15 @@ export function LiveMap({
 
         map.dragRotate.enable();
         map.touchZoomRotate.disableRotation();
+        map.doubleClickZoom.disable();
 
         const aircraftMarkerElement = document.createElement('div');
         aircraftMarkerElement.className = 'aircraft-marker';
+        const aircraftMarkerPulse = document.createElement('div');
+        aircraftMarkerPulse.className = 'aircraft-marker__pulse';
         const aircraftMarkerGlyph = document.createElement('div');
         aircraftMarkerGlyph.className = 'aircraft-marker__glyph';
+        aircraftMarkerElement.appendChild(aircraftMarkerPulse);
         aircraftMarkerElement.appendChild(aircraftMarkerGlyph);
         const aircraftMarker = new maplibregl.Marker({
           element: aircraftMarkerElement,
@@ -323,7 +372,14 @@ export function LiveMap({
         aircraftMarkerRef.current = aircraftMarker;
         aircraftMarkerGlyphRef.current = aircraftMarkerGlyph;
         appliedStyleKeyRef.current = styleKey;
-        syncAircraftMarker(aircraftMarker, aircraftMarkerGlyph, liveStateRef.current);
+        syncAircraftMarker(
+          aircraftMarker,
+          aircraftMarkerGlyph,
+          liveStateRef.current,
+          configRef.current,
+          activeFlightRef.current,
+          linkPulseActiveRef.current
+        );
 
         map.on('error', (event) => {
         const message =
@@ -334,15 +390,22 @@ export function LiveMap({
 
         map.on('style.load', () => {
           ensureSources(map);
-          applyOverlayAppearance(map, mapModeRef.current);
+          applyOverlayAppearance(map, mapModeRef.current, configRef.current.track_display);
         syncMapData(
           map,
           trackRef.current,
           alertsRef.current,
           selectedAlertIdRef.current,
-          enabledRegions
+          enabledRegionsRef.current
         );
-        syncAircraftMarker(aircraftMarkerRef.current, aircraftMarkerGlyphRef.current, liveStateRef.current);
+        syncAircraftMarker(
+          aircraftMarkerRef.current,
+          aircraftMarkerGlyphRef.current,
+          liveStateRef.current,
+          configRef.current,
+          activeFlightRef.current,
+          linkPulseActiveRef.current
+        );
         syncMeasureData(map, measurePointsRef.current);
           syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
           const currentCenter = map.getCenter();
@@ -403,6 +466,11 @@ export function LiveMap({
         setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
         syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
         syncScaleIndicator(map, setScaleIndicator);
+      });
+
+      map.on('dblclick', (event) => {
+        event.preventDefault();
+        resetMapView(map, selectedRegionRef.current, enabledRegionsRef.current);
       });
 
       const canvas = map.getCanvas();
@@ -494,47 +562,35 @@ export function LiveMap({
     }
 
     ensureSources(map);
-    applyOverlayAppearance(map, mapMode);
+    applyOverlayAppearance(map, mapMode, config.track_display);
     syncMapData(map, filteredTrack, filteredAlerts, selectedAlertId, enabledRegions);
     syncMeasureData(map, measurePoints);
     syncMeasureOverlay(map, measurePoints, measureUnit, setMeasureLabelScreen);
-  }, [enabledRegions, filteredAlerts, filteredTrack, mapMode, measurePoints, measureUnit, selectedAlertId]);
+  }, [
+    config,
+    enabledRegions,
+    filteredAlerts,
+    filteredTrack,
+    mapMode,
+    measurePoints,
+    measureUnit,
+    selectedAlertId
+  ]);
 
   useEffect(() => {
-    syncAircraftMarker(aircraftMarkerRef.current, aircraftMarkerGlyphRef.current, filteredLiveState);
-  }, [filteredLiveState]);
-
-  useEffect(() => {
-    if (filteredTrack.length === 0) {
-      didAutoFitTrack.current = false;
-    }
-  }, [filteredTrack.length]);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (
-      !map ||
-      ((!activeFlight && enabledRegions.length > 0) || filteredTrack.length === 0 || didAutoFitTrack.current)
-    ) {
-      return;
-    }
-
-    const last = filteredTrack[filteredTrack.length - 1];
-    if (!last) {
-      return;
-    }
-
-    map.easeTo({
-      center: [last[1], last[0]],
-      zoom: 14.3,
-      duration: 900
-    });
-    didAutoFitTrack.current = true;
-  }, [activeFlight, filteredTrack]);
+    syncAircraftMarker(
+      aircraftMarkerRef.current,
+      aircraftMarkerGlyphRef.current,
+      filteredLiveState,
+      config,
+      activeFlight,
+      linkPulseActive
+    );
+  }, [activeFlight, config, filteredLiveState, linkPulseActive]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || enabledRegions.length === 0 || (activeFlight && filteredTrack.length > 0)) {
+    if (!map || enabledRegions.length === 0 || activeFlight || reviewMode) {
       return;
     }
 
@@ -554,7 +610,29 @@ export function LiveMap({
       maxZoom: 15.1
     });
     fittedRegionIdRef.current = regionKey;
-  }, [activeFlight, enabledRegions, filteredTrack.length, selectedRegion]);
+  }, [activeFlight, enabledRegions, reviewMode, selectedRegion]);
+
+  useEffect(() => {
+    if (!activeFlight) {
+      setFollowEnabled(true);
+    }
+  }, [activeFlight]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !activeFlight || !followEnabled || !filteredLiveState?.armed) {
+      return;
+    }
+
+    if (!isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)) {
+      return;
+    }
+
+    map.easeTo({
+      center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
+      duration: 280
+    });
+  }, [activeFlight, filteredLiveState?.armed, filteredLiveState?.lat, filteredLiveState?.lon, followEnabled]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -629,19 +707,85 @@ export function LiveMap({
           {measureLabelScreen.label}
         </div>
       ) : null}
-      {scaleIndicator ? (
-        <div className="map-scale-indicator">
-          <span className="map-scale-indicator__label">Scale: {scaleIndicator.label}</span>
-          <div className="map-scale-indicator__bar-shell">
-            <div
-              className="map-scale-indicator__bar"
-              style={{ width: `${Math.max(scaleIndicator.widthPx, 24)}px` }}
-            />
+      <div className="map-control-wheel">
+        <button
+          className="map-control-wheel__button map-control-wheel__button--top"
+          onClick={() => mapRef.current?.zoomIn({ duration: 220 })}
+          aria-label="Zoom in"
+        >
+          +
+        </button>
+        <button
+          className="map-control-wheel__button map-control-wheel__button--bottom"
+          onClick={() => mapRef.current?.zoomOut({ duration: 220 })}
+          aria-label="Zoom out"
+        >
+          -
+        </button>
+        <button
+          className="map-control-wheel__button map-control-wheel__button--left"
+          onClick={() =>
+            mapRef.current?.easeTo({
+              bearing: (mapRef.current?.getBearing() ?? 0) - 20,
+              duration: 240
+            })
+          }
+          aria-label="Rotate left"
+        >
+          <RotateLeftIcon />
+        </button>
+        <button
+          className="map-control-wheel__button map-control-wheel__button--right"
+          onClick={() =>
+            mapRef.current?.easeTo({
+              bearing: (mapRef.current?.getBearing() ?? 0) + 20,
+              duration: 240
+            })
+          }
+          aria-label="Rotate right"
+        >
+          <RotateRightIcon />
+        </button>
+        {showFollowToggle ? (
+          <button
+            className={`map-control-wheel__follow ${
+              followEnabled ? 'map-control-wheel__follow--active' : ''
+            }`}
+            onClick={() => {
+              const nextFollow = !followEnabled;
+              setFollowEnabled(nextFollow);
+              if (
+                nextFollow &&
+                filteredLiveState &&
+                isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)
+              ) {
+                mapRef.current?.easeTo({
+                  center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
+                  duration: 320
+                });
+              }
+            }}
+            aria-label={followEnabled ? 'Disable follow mode' : 'Enable follow mode'}
+          >
+            <span className="map-control-wheel__follow-core" aria-hidden="true" />
+          </button>
+        ) : null}
+      </div>
+      <div className="map-bottom-strip">
+        {scaleIndicator ? (
+          <div className="map-scale-indicator">
+            <span className="map-scale-indicator__label">Scale: {scaleIndicator.label}</span>
+            <div className="map-scale-indicator__bar-shell">
+              <div
+                className="map-scale-indicator__bar"
+                style={{ width: `${Math.max(scaleIndicator.widthPx, 24)}px` }}
+              />
+            </div>
           </div>
+        ) : null}
+        <div className="map-center-tracker">
+          {centerCoordinates[0].toFixed(5)}, {centerCoordinates[1].toFixed(5)}
         </div>
-      ) : null}
-      <div className="map-center-tracker">
-        {centerCoordinates[0].toFixed(5)}, {centerCoordinates[1].toFixed(5)}
       </div>
     </div>
   );
@@ -830,17 +974,39 @@ function ensureSources(map: Map) {
 
 }
 
-function applyOverlayAppearance(map: Map, mapMode: MapMode) {
+function applyOverlayAppearance(
+  map: Map,
+  mapMode: MapMode,
+  trackDisplay: AppConfig['track_display']
+) {
   const satellite = mapMode === 'satellite';
   map.setPaintProperty(
     'sector-mask',
     'fill-opacity',
     ['coalesce', ['get', satellite ? 'mask_opacity_satellite' : 'mask_opacity_street'], 0.08]
   );
-  map.setPaintProperty('track-casing', 'line-width', satellite ? 6.2 : 5.2);
-  map.setPaintProperty('track-casing', 'line-opacity', satellite ? 0.62 : 0.42);
-  map.setPaintProperty('track-layer', 'line-width', satellite ? 3.6 : 2.8);
-  map.setPaintProperty('track-layer', 'line-color', satellite ? '#ffffff' : '#ededed');
+  const baseWidth = Math.max(trackDisplay.width_px, 1.2);
+  const lineColor = trackDisplay.color_hex || (satellite ? '#ffffff' : '#ededed');
+  map.setPaintProperty('track-casing', 'line-width', trackDisplay.enabled ? baseWidth + 2.4 : 0.2);
+  map.setPaintProperty('track-casing', 'line-opacity', trackDisplay.enabled ? (satellite ? 0.62 : 0.42) : 0);
+  map.setPaintProperty('track-layer', 'line-width', trackDisplay.enabled ? baseWidth : 0.2);
+  map.setPaintProperty('track-layer', 'line-color', lineColor);
+  map.setPaintProperty('track-layer', 'line-opacity', trackDisplay.enabled ? 0.96 : 0);
+  map.setLayoutProperty(
+    'track-layer',
+    'line-cap',
+    trackDisplay.style === 'dashed' ? 'butt' : 'round'
+  );
+  map.setLayoutProperty(
+    'track-layer',
+    'line-join',
+    trackDisplay.style === 'dashed' ? 'miter' : 'round'
+  );
+  map.setPaintProperty(
+    'track-layer',
+    'line-dasharray',
+    trackDisplay.style === 'dashed' ? [3.2, 2.2] : [1, 0.001]
+  );
   map.setPaintProperty('alerts-halo-layer', 'circle-opacity', satellite ? 0.34 : 0.22);
   map.setPaintProperty('coverage-mask-layer', 'fill-opacity', satellite ? 0.64 : 0.56);
   map.setPaintProperty('coverage-bounds-layer', 'line-opacity', satellite ? 0.6 : 0.5);
@@ -871,20 +1037,54 @@ function syncMapData(
 function syncAircraftMarker(
   marker: maplibregl.Marker | null,
   glyph: HTMLDivElement | null,
-  liveState: AircraftLiveState | null | undefined
+  liveState: AircraftLiveState | null | undefined,
+  config: AppConfig,
+  activeFlight: boolean,
+  linkPulseActive: boolean
 ) {
   if (!marker || !glyph) {
     return;
   }
+  const element = marker.getElement();
 
   if (!liveState || !isValidCoordinate(liveState.lat, liveState.lon)) {
-    marker.getElement().style.display = 'none';
+    element.style.display = 'none';
     return;
   }
 
-  marker.getElement().style.display = 'block';
+  element.style.display = 'block';
+  element.dataset.shape = config.aircraft_icon.shape;
+  element.style.setProperty('--aircraft-size', `${config.aircraft_icon.size_px}px`);
+  element.style.setProperty('--aircraft-fill', config.aircraft_icon.color_hex);
+  element.classList.toggle('aircraft-marker--pulsing', activeFlight && linkPulseActive);
   marker.setLngLat([liveState.lon as number, liveState.lat as number]);
   marker.setRotation(Math.round(liveState.heading_deg ?? 0));
+}
+
+function resetMapView(
+  map: Map,
+  selectedRegion: OfflineRegionManifest | null | undefined,
+  enabledRegions: OfflineRegionManifest[]
+) {
+  if (selectedRegion) {
+    const [west, south, east, north] = selectedRegion.bounds;
+    map.fitBounds([[west, south], [east, north]], {
+      padding: 72,
+      duration: 420,
+      maxZoom: 15.1
+    });
+    return;
+  }
+  if (enabledRegions.length > 0) {
+    const [west, south, east, north] = mergeRegionBounds(enabledRegions);
+    map.fitBounds([[west, south], [east, north]], {
+      padding: 72,
+      duration: 420,
+      maxZoom: 15.1
+    });
+    return;
+  }
+  map.easeTo({ center: [-121.493, 38.575], zoom: 12.8, bearing: 0, pitch: 0, duration: 420 });
 }
 
 function syncMeasureData(map: Map, points: Array<[number, number]>) {

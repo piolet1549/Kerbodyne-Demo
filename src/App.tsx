@@ -1,4 +1,5 @@
 import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import { save } from '@tauri-apps/plugin-dialog';
 import { AlertDetail } from './components/AlertDetail';
 import { FlightSavesPanel } from './components/FlightSavesPanel';
 import { LiveMap } from './components/LiveMap';
@@ -10,6 +11,7 @@ import {
   clearFocusedSession,
   completeActiveStream,
   deleteSession,
+  exportSessionTelemetry,
   focusSession,
   listOfflineRegions,
   listenToRuntimeEvents,
@@ -21,11 +23,21 @@ import {
 import type {
   AlertRecord,
   AppSnapshot,
+  HudMetricState,
   OfflineRegionCatalog,
   RuntimeEvent
 } from './lib/types';
 
 type OverlayPanel = 'flights' | 'settings' | null;
+type FlightNotificationSeverity = 'info' | 'caution' | 'warning';
+
+interface FlightNotificationRecord {
+  id: string;
+  message: string;
+  severity: FlightNotificationSeverity;
+  persistent: boolean;
+  closing?: boolean;
+}
 
 const emptySnapshot: AppSnapshot = {
   config: {
@@ -37,13 +49,30 @@ const emptySnapshot: AppSnapshot = {
     selected_region_id: null,
     enabled_region_ids: [],
     region_name_overrides: {},
-    default_map_mode: 'street_dark',
+    default_map_mode: 'satellite',
     default_fov_deg: 38,
     default_range_m: 250,
     stale_after_seconds: 10,
     class_display_names: {
       fire: 'Fire',
       smoke: 'Smoke'
+    },
+    aircraft_icon: {
+      size_px: 38,
+      color_hex: '#f7f7f7',
+      shape: 'compass'
+    },
+    track_display: {
+      enabled: true,
+      color_hex: '#f0f0f0',
+      width_px: 2.8,
+      style: 'solid'
+    },
+    flight_alerts: {
+      high_speed_warning_mps: 35,
+      low_speed_warning_mps: 9,
+      high_altitude_warning_m: 120,
+      low_battery_warning_percent: 20
     }
   },
   mode: 'idle',
@@ -99,10 +128,84 @@ function getRegionDisplayName(
   return override || region.name;
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function mixHexColors(first: string, second: string, weight: number) {
+  const normalized = clamp(weight, 0, 1);
+  const parse = (value: string) => {
+    const trimmed = value.replace('#', '');
+    const expanded =
+      trimmed.length === 3
+        ? trimmed
+            .split('')
+            .map((character) => `${character}${character}`)
+            .join('')
+        : trimmed;
+    return [
+      Number.parseInt(expanded.slice(0, 2), 16),
+      Number.parseInt(expanded.slice(2, 4), 16),
+      Number.parseInt(expanded.slice(4, 6), 16)
+    ];
+  };
+  const [r1, g1, b1] = parse(first);
+  const [r2, g2, b2] = parse(second);
+  const toHex = (value: number) => Math.round(value).toString(16).padStart(2, '0');
+  return `#${toHex(r1 + (r2 - r1) * normalized)}${toHex(g1 + (g2 - g1) * normalized)}${toHex(
+    b1 + (b2 - b1) * normalized
+  )}`;
+}
+
+function buildMetricState(
+  tone: HudMetricState['tone'],
+  color_hex?: string | null,
+  pulse = false
+): HudMetricState {
+  return { tone, color_hex: color_hex ?? null, pulse };
+}
+
+function findNearestFrameIndex(frames: AppSnapshot['review_frames'], timestamp: string) {
+  if (frames.length === 0) {
+    return 0;
+  }
+  const target = new Date(timestamp).getTime();
+  if (!Number.isFinite(target)) {
+    return frames.length - 1;
+  }
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  frames.forEach((frame, index) => {
+    const current = new Date(frame.recorded_at).getTime();
+    if (!Number.isFinite(current)) {
+      return;
+    }
+    const distance = Math.abs(current - target);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+  return bestIndex;
+}
+
+function sanitizeExportFileName(value: string) {
+  const sanitized = value
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return sanitized || 'flight-telemetry';
+}
+
 export function App() {
   const measureToolbarHostRef = useRef<HTMLDivElement | null>(null);
   const rawTelemetryLogRef = useRef<HTMLDivElement | null>(null);
   const regionMenuRef = useRef<HTMLDivElement | null>(null);
+  const notificationTimersRef = useRef<Record<string, number>>({});
+  const seenSystemStatusIdsRef = useRef<Set<string>>(new Set());
+  const armedAltitudeBaselineRef = useRef<number | null>(null);
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [offlineCatalog, setOfflineCatalog] = useState<OfflineRegionCatalog>({
     asset_origin: '',
@@ -123,6 +226,8 @@ export function App() {
   const [stopFlightName, setStopFlightName] = useState('');
   const [stopFlightDescription, setStopFlightDescription] = useState('');
   const [reviewFrameIndex, setReviewFrameIndex] = useState<number | null>(null);
+  const [flightNotifications, setFlightNotifications] = useState<FlightNotificationRecord[]>([]);
+  const [lowSpeedMonitoringEnabled, setLowSpeedMonitoringEnabled] = useState(false);
   const clearBannerRef = useRef<number | null>(null);
   const previousAlertCountRef = useRef(0);
   const previousFocusedSessionIdRef = useRef<string | null>(null);
@@ -218,6 +323,59 @@ export function App() {
     ? `${snapshot.focused_session_id ?? 'none'}:${effectiveReviewFrameIndex ?? 'none'}`
     : null;
 
+  function clearNotificationTimer(notificationId: string) {
+    const existing = notificationTimersRef.current[notificationId];
+    if (existing) {
+      window.clearTimeout(existing);
+      delete notificationTimersRef.current[notificationId];
+    }
+  }
+
+  function dismissFlightNotification(notificationId: string) {
+    clearNotificationTimer(notificationId);
+    setFlightNotifications((current) => {
+      const target = current.find((notification) => notification.id === notificationId);
+      if (!target) {
+        return current;
+      }
+      if (target.closing) {
+        return current;
+      }
+      return current.map((notification) =>
+        notification.id === notificationId ? { ...notification, closing: true } : notification
+      );
+    });
+    notificationTimersRef.current[notificationId] = window.setTimeout(() => {
+      setFlightNotifications((current) =>
+        current.filter((notification) => notification.id !== notificationId)
+      );
+      clearNotificationTimer(notificationId);
+    }, 360);
+  }
+
+  function upsertFlightNotification(notification: FlightNotificationRecord) {
+    setFlightNotifications((current) => {
+      const existing = current.find((entry) => entry.id === notification.id);
+      if (
+        existing &&
+        existing.message === notification.message &&
+        existing.severity === notification.severity &&
+        existing.persistent === notification.persistent &&
+        !existing.closing
+      ) {
+        return current;
+      }
+      const next = current.filter((entry) => entry.id !== notification.id);
+      return [{ ...notification, closing: false }, ...next].slice(0, 6);
+    });
+    clearNotificationTimer(notification.id);
+    if (!notification.persistent) {
+      notificationTimersRef.current[notification.id] = window.setTimeout(() => {
+        dismissFlightNotification(notification.id);
+      }, 10000);
+    }
+  }
+
   function showBanner(message: string) {
     setBannerMessage(message);
     if (clearBannerRef.current) {
@@ -258,13 +416,13 @@ export function App() {
     bootstrapApp()
       .then((nextSnapshot) => {
         const normalizedSnapshot =
-          nextSnapshot.config.default_map_mode === 'street_dark'
+          nextSnapshot.config.default_map_mode === 'satellite'
             ? nextSnapshot
             : {
                 ...nextSnapshot,
                 config: {
                   ...nextSnapshot.config,
-                  default_map_mode: 'street_dark' as const
+                  default_map_mode: 'satellite' as const
                 }
               };
         setSnapshot(normalizedSnapshot);
@@ -272,10 +430,10 @@ export function App() {
         setSelectedAlertId(null);
         setAlertDetailVisible(false);
         void refreshOfflineRegions();
-        if (nextSnapshot.config.default_map_mode !== 'street_dark') {
+        if (nextSnapshot.config.default_map_mode !== 'satellite') {
           void updateConfig({
             ...nextSnapshot.config,
-            default_map_mode: 'street_dark'
+            default_map_mode: 'satellite'
           }).catch(() => {
             // Leave the local override in place even if persisting fails.
           });
@@ -329,6 +487,8 @@ export function App() {
       if (clearBannerRef.current) {
         window.clearTimeout(clearBannerRef.current);
       }
+      Object.values(notificationTimersRef.current).forEach((timer) => window.clearTimeout(timer));
+      notificationTimersRef.current = {};
       if (unlisten) {
         void unlisten();
       }
@@ -416,6 +576,87 @@ export function App() {
   }, [rawTelemetryOpen, snapshot.raw_telemetry_packets]);
 
   useEffect(() => {
+    if (!activeFlight) {
+      seenSystemStatusIdsRef.current = new Set();
+      armedAltitudeBaselineRef.current = null;
+      setLowSpeedMonitoringEnabled(false);
+      Object.values(notificationTimersRef.current).forEach((timer) => window.clearTimeout(timer));
+      notificationTimersRef.current = {};
+      setFlightNotifications([]);
+      return;
+    }
+  }, [activeFlight]);
+
+  useEffect(() => {
+    if (!activeFlight) {
+      return;
+    }
+
+    if (!displayLiveState?.armed) {
+      armedAltitudeBaselineRef.current = null;
+      return;
+    }
+
+    if (armedAltitudeBaselineRef.current == null && displayLiveState.alt_msl_m != null) {
+      armedAltitudeBaselineRef.current = displayLiveState.alt_msl_m;
+    }
+  }, [activeFlight, displayLiveState?.alt_msl_m, displayLiveState?.armed]);
+
+  useEffect(() => {
+    if (!activeFlight || lowSpeedMonitoringEnabled || !displayLiveState?.armed) {
+      return;
+    }
+
+    const speed = displayLiveState.groundspeed_mps;
+    if (speed == null || speed <= snapshot.config.flight_alerts.low_speed_warning_mps) {
+      return;
+    }
+
+    const handle = window.setTimeout(() => {
+      setLowSpeedMonitoringEnabled(true);
+    }, 5000);
+
+    return () => window.clearTimeout(handle);
+  }, [
+    activeFlight,
+    displayLiveState?.armed,
+    displayLiveState?.groundspeed_mps,
+    lowSpeedMonitoringEnabled,
+    snapshot.config.flight_alerts.low_speed_warning_mps
+  ]);
+
+  useEffect(() => {
+    if (!activeFlight) {
+      return;
+    }
+
+    const unseenStatuses = snapshot.system_statuses.filter(
+      (status) => !seenSystemStatusIdsRef.current.has(status.id)
+    );
+    if (unseenStatuses.length === 0) {
+      return;
+    }
+
+    unseenStatuses.forEach((status) => {
+      seenSystemStatusIdsRef.current.add(status.id);
+      const normalized = status.status.trim().toUpperCase();
+      const severity: FlightNotificationSeverity = normalized.includes('ERROR') ||
+        normalized.includes('FAIL') ||
+        normalized.includes('WARN')
+        ? 'warning'
+        : normalized.includes('CAUTION')
+          ? 'caution'
+          : 'info';
+      upsertFlightNotification({
+        id: `status:${status.id}`,
+        message: status.message,
+        severity,
+        persistent: severity === 'warning'
+      });
+    });
+  }, [activeFlight, snapshot.system_statuses]);
+
+  useEffect(() => {
     if (!regionMenuOpen) {
       return;
     }
@@ -445,6 +686,189 @@ export function App() {
     }
     return { label: 'Ready', variant: 'connected' as const };
   }, [activeFlight, displayLiveState?.armed, flightHasReceivedConnection, snapshot.connection.status]);
+  const telemetryMetricStates = useMemo(() => {
+    const safeColor = '#f4f4f4';
+    const cautionColor = '#ffb347';
+    const warningColor = '#ff6b63';
+    const batteryPercent = displayLiveState?.battery?.percent ?? null;
+    const speed = displayLiveState?.groundspeed_mps ?? null;
+    const altitude = displayLiveState?.alt_msl_m ?? null;
+    const highSpeedWarning = snapshot.config.flight_alerts.high_speed_warning_mps;
+    const highSpeedCaution = highSpeedWarning - 5;
+    const lowSpeedWarning = snapshot.config.flight_alerts.low_speed_warning_mps;
+    const lowBatteryWarning = snapshot.config.flight_alerts.low_battery_warning_percent;
+    const lowBatteryCaution = lowBatteryWarning + 10;
+    const armedAltitude = armedAltitudeBaselineRef.current;
+
+    let speedState = buildMetricState('normal', safeColor, false);
+    if (speed != null) {
+      if (speed >= highSpeedWarning) {
+        speedState = buildMetricState('warning', warningColor, true);
+      } else if (speed >= highSpeedCaution) {
+        const ratio = clamp((speed - highSpeedCaution) / Math.max(highSpeedWarning - highSpeedCaution, 0.1), 0, 1);
+        speedState = buildMetricState('caution', mixHexColors(cautionColor, warningColor, ratio), true);
+      } else if (lowSpeedMonitoringEnabled && speed <= lowSpeedWarning) {
+        speedState = buildMetricState('warning', warningColor, true);
+      } else if (lowSpeedMonitoringEnabled && speed < lowSpeedWarning + 5) {
+        const ratio = clamp(1 - (speed - lowSpeedWarning) / 5, 0, 1);
+        speedState = buildMetricState('caution', mixHexColors(cautionColor, warningColor, ratio), false);
+      } else if (speed > highSpeedCaution - 5) {
+        const ratio = clamp((speed - (highSpeedCaution - 5)) / 5, 0, 1);
+        speedState = buildMetricState('normal', mixHexColors(safeColor, cautionColor, ratio), false);
+      }
+    }
+
+    let altitudeState = buildMetricState('normal', safeColor, false);
+    if (
+      altitude != null &&
+      armedAltitude != null &&
+      altitude - armedAltitude >= snapshot.config.flight_alerts.high_altitude_warning_m
+    ) {
+      altitudeState = buildMetricState('warning', warningColor, true);
+    }
+
+    let batteryState = buildMetricState('normal', safeColor, false);
+    if (batteryPercent != null) {
+      if (batteryPercent <= lowBatteryWarning) {
+        batteryState = buildMetricState('warning', warningColor, true);
+      } else if (batteryPercent <= lowBatteryCaution) {
+        const ratio = clamp(
+          1 - (batteryPercent - lowBatteryWarning) / Math.max(lowBatteryCaution - lowBatteryWarning, 1),
+          0,
+          1
+        );
+        batteryState = buildMetricState('caution', mixHexColors(cautionColor, warningColor, ratio), true);
+      } else if (batteryPercent <= lowBatteryCaution + 12) {
+        const ratio = clamp(1 - (batteryPercent - lowBatteryCaution) / 12, 0, 1);
+        batteryState = buildMetricState('normal', mixHexColors(safeColor, cautionColor, ratio), false);
+      }
+    }
+
+    const derivedNotifications: FlightNotificationRecord[] = [];
+    if (activeFlight) {
+      if (snapshot.connection.status === 'stale') {
+        derivedNotifications.push({
+          id: 'telemetry:link-stale',
+          message: 'Telemetry link is stale',
+          severity: 'warning',
+          persistent: true
+        });
+      }
+      if (speed != null) {
+        if (speed >= highSpeedWarning) {
+          derivedNotifications.push({
+            id: 'telemetry:speed-high-warning',
+            message: `High speed warning: ${speed.toFixed(1)} m/s`,
+            severity: 'warning',
+            persistent: true
+          });
+        } else if (speed >= highSpeedCaution) {
+          derivedNotifications.push({
+            id: 'telemetry:speed-high-caution',
+            message: `High speed caution: ${speed.toFixed(1)} m/s`,
+            severity: 'caution',
+            persistent: false
+          });
+        } else if (lowSpeedMonitoringEnabled && speed <= lowSpeedWarning) {
+          derivedNotifications.push({
+            id: 'telemetry:speed-low-warning',
+            message: `Low speed warning: ${speed.toFixed(1)} m/s`,
+            severity: 'warning',
+            persistent: true
+          });
+        }
+      }
+      if (
+        altitude != null &&
+        armedAltitude != null &&
+        altitude - armedAltitude >= snapshot.config.flight_alerts.high_altitude_warning_m
+      ) {
+        derivedNotifications.push({
+          id: 'telemetry:altitude-high-warning',
+          message: `High altitude warning: ${(altitude - armedAltitude).toFixed(1)} m above arm altitude`,
+          severity: 'warning',
+          persistent: true
+        });
+      }
+      if (batteryPercent != null) {
+        if (batteryPercent <= lowBatteryWarning) {
+          derivedNotifications.push({
+            id: 'telemetry:battery-low-warning',
+            message: `Low battery warning: ${batteryPercent.toFixed(0)}% remaining`,
+            severity: 'warning',
+            persistent: true
+          });
+        } else if (batteryPercent <= lowBatteryCaution) {
+          derivedNotifications.push({
+            id: 'telemetry:battery-low-caution',
+            message: `Low battery caution: ${batteryPercent.toFixed(0)}% remaining`,
+            severity: 'caution',
+            persistent: false
+          });
+        }
+      }
+    }
+
+    return {
+      speed: speedState,
+      altitude: altitudeState,
+      battery: batteryState,
+      notifications: derivedNotifications
+    };
+  }, [
+    activeFlight,
+    displayLiveState?.alt_msl_m,
+    displayLiveState?.battery?.percent,
+    displayLiveState?.groundspeed_mps,
+    lowSpeedMonitoringEnabled,
+    snapshot.config.flight_alerts.high_altitude_warning_m,
+    snapshot.config.flight_alerts.high_speed_warning_mps,
+    snapshot.config.flight_alerts.low_battery_warning_percent,
+    snapshot.config.flight_alerts.low_speed_warning_mps,
+    snapshot.connection.status
+  ]);
+  const reviewDetectionMarkers = useMemo(
+    () =>
+      reviewMode && reviewFrames.length > 0
+        ? deferredAlerts
+            .map((alert) => ({
+              id: alert.id,
+              index: findNearestFrameIndex(reviewFrames, alert.detected_at)
+            }))
+            .sort((first, second) => first.index - second.index)
+        : [],
+    [deferredAlerts, reviewFrames, reviewMode]
+  );
+  const reviewDetectionMarkerIndex = useMemo(
+    () => new Map(reviewDetectionMarkers.map((marker) => [marker.id, marker.index])),
+    [reviewDetectionMarkers]
+  );
+  const linkPulseActive =
+    activeFlight &&
+    flightHasReceivedConnection &&
+    snapshot.connection.status !== 'stale' &&
+    snapshot.connection.status !== 'listening';
+
+  useEffect(() => {
+    const telemetryIds = new Set(
+      flightNotifications
+        .filter((notification) => notification.id.startsWith('telemetry:'))
+        .map((notification) => notification.id)
+    );
+    const activeIds = new Set(
+      telemetryMetricStates.notifications.map((notification) => notification.id)
+    );
+
+    telemetryMetricStates.notifications.forEach((notification) => {
+      upsertFlightNotification(notification);
+    });
+
+    telemetryIds.forEach((notificationId) => {
+      if (!activeIds.has(notificationId)) {
+        dismissFlightNotification(notificationId);
+      }
+    });
+  }, [flightNotifications, telemetryMetricStates.notifications]);
 
   function togglePanel(panel: Exclude<OverlayPanel, null>) {
     if (panel === 'flights' && activeFlight) {
@@ -457,6 +881,12 @@ export function App() {
     setSelectedAlertId(alertId);
     setAlertDetailVisible(true);
     setActivePanel(null);
+    if (reviewMode) {
+      const markerIndex = reviewDetectionMarkerIndex.get(alertId);
+      if (markerIndex != null) {
+        setReviewFrameIndex(markerIndex);
+      }
+    }
   }
 
   function openDetectionPanel() {
@@ -464,8 +894,7 @@ export function App() {
     if (!firstAlert) {
       return;
     }
-    setSelectedAlertId(firstAlert.id);
-    setAlertDetailVisible(true);
+    handleSelectAlert(firstAlert.id);
   }
 
   function stepDetection(direction: -1 | 1) {
@@ -478,8 +907,7 @@ export function App() {
     if (!nextAlert) {
       return;
     }
-    setSelectedAlertId(nextAlert.id);
-    setAlertDetailVisible(true);
+    handleSelectAlert(nextAlert.id);
   }
 
   function handleFocusSession(sessionId: string) {
@@ -517,6 +945,25 @@ export function App() {
     });
   }
 
+  async function handleExportSession(sessionId: string) {
+    const session = snapshot.sessions.find((entry) => entry.id === sessionId);
+    const chosenPath = await save({
+      title: 'Export telemetry',
+      defaultPath: `${sanitizeExportFileName(session?.name ?? 'flight-telemetry')}.csv`,
+      filters: [
+        {
+          name: 'CSV',
+          extensions: ['csv']
+        }
+      ]
+    });
+    if (!chosenPath) {
+      return;
+    }
+    const exportPath = chosenPath.toLowerCase().endsWith('.csv') ? chosenPath : `${chosenPath}.csv`;
+    await exportSessionTelemetry(sessionId, exportPath);
+  }
+
   return (
     <div className="console-shell">
       <div className="map-shell">
@@ -532,6 +979,7 @@ export function App() {
           mapMode={mapMode}
           activeFlight={activeFlight}
           reviewMode={reviewMode}
+          linkPulseActive={linkPulseActive}
           measureToolbarHost={measureToolbarHostRef.current}
           focusTarget={mapFocusTarget}
           focusKey={mapFocusKey}
@@ -547,6 +995,21 @@ export function App() {
             >
               Dismiss
             </button>
+          </div>
+        ) : null}
+
+        {activeFlight && flightNotifications.length > 0 ? (
+          <div className="flight-notification-stack" role="status" aria-live="polite">
+            {flightNotifications.map((notification) => (
+              <div
+                key={notification.id}
+                className={`flight-notification flight-notification--${notification.severity} ${
+                  notification.closing ? 'flight-notification--closing' : ''
+                }`}
+              >
+                <span>{notification.message}</span>
+              </div>
+            ))}
           </div>
         ) : null}
 
@@ -651,7 +1114,16 @@ export function App() {
             mode={activeFlight ? 'live' : 'review'}
             reviewTimestamp={selectedReviewFrame?.recorded_at ?? null}
             liveConnectionState={liveHudStatus}
+            metricStates={activeFlight ? telemetryMetricStates : undefined}
             onOpenRawData={activeFlight ? () => setRawTelemetryOpen(true) : undefined}
+            onExportTelemetry={
+              reviewMode && focusedSession?.id
+                ? () =>
+                    void runCommand(() =>
+                      handleExportSession(focusedSession.id)
+                    )
+                : undefined
+            }
           />
         ) : null}
 
@@ -660,7 +1132,14 @@ export function App() {
             flightName={focusedSession?.name ?? 'Saved flight'}
             frames={reviewFrames}
             selectedIndex={effectiveReviewFrameIndex}
+            markers={reviewDetectionMarkers}
+            selectedMarkerId={selectedAlertId}
             onChange={setReviewFrameIndex}
+            onSelectMarker={(markerId, markerIndex) => {
+              setReviewFrameIndex(markerIndex);
+              setSelectedAlertId(markerId);
+              setAlertDetailVisible(true);
+            }}
             onRenameFlightName={(name) => {
               if (!focusedSession?.id) {
                 return;
@@ -709,13 +1188,15 @@ export function App() {
                   sessions={snapshot.sessions}
                   focusedSessionId={snapshot.focused_session_id}
                   activeSessionId={snapshot.active_session_id}
-                  statuses={snapshot.system_statuses}
                   onFocusSession={handleFocusSession}
                   onUpdateSession={(sessionId, name, description) =>
                     void runCommand(() => updateSessionDetails(sessionId, name, description))
                   }
                   onRequestDeleteSession={(sessionId, name) =>
                     setDeleteFlightTarget({ id: sessionId, name })
+                  }
+                  onExportSession={(sessionId) =>
+                    void runCommand(() => handleExportSession(sessionId))
                   }
                 />
               ) : null}
