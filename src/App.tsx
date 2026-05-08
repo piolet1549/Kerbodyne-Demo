@@ -1,5 +1,4 @@
 import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { save } from '@tauri-apps/plugin-dialog';
 import { AlertDetail } from './components/AlertDetail';
 import { FlightSavesPanel } from './components/FlightSavesPanel';
 import { LiveMap } from './components/LiveMap';
@@ -36,6 +35,7 @@ interface FlightNotificationRecord {
   message: string;
   severity: FlightNotificationSeverity;
   persistent: boolean;
+  placement?: 'default' | 'review-above-replay';
   closing?: boolean;
 }
 
@@ -189,16 +189,6 @@ function findNearestFrameIndex(frames: AppSnapshot['review_frames'], timestamp: 
   return bestIndex;
 }
 
-function sanitizeExportFileName(value: string) {
-  const sanitized = value
-    .trim()
-    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-  return sanitized || 'flight-telemetry';
-}
-
 export function App() {
   const measureToolbarHostRef = useRef<HTMLDivElement | null>(null);
   const rawTelemetryLogRef = useRef<HTMLDivElement | null>(null);
@@ -232,6 +222,7 @@ export function App() {
   const previousAlertCountRef = useRef(0);
   const previousFocusedSessionIdRef = useRef<string | null>(null);
   const previousActiveSessionIdRef = useRef<string | null>(null);
+  const lowSpeedLandingTimerRef = useRef<number | null>(null);
 
   const deferredAlerts = useDeferredValue(snapshot.alerts);
   const activeSession = useMemo(
@@ -356,35 +347,36 @@ export function App() {
   function upsertFlightNotification(notification: FlightNotificationRecord) {
     setFlightNotifications((current) => {
       const existing = current.find((entry) => entry.id === notification.id);
-      if (
-        existing &&
-        existing.message === notification.message &&
-        existing.severity === notification.severity &&
-        existing.persistent === notification.persistent &&
-        !existing.closing
-      ) {
+        if (
+          existing &&
+          existing.message === notification.message &&
+          existing.severity === notification.severity &&
+          existing.persistent === notification.persistent &&
+          existing.placement === notification.placement &&
+          !existing.closing
+        ) {
         return current;
       }
       const next = current.filter((entry) => entry.id !== notification.id);
       return [{ ...notification, closing: false }, ...next].slice(0, 6);
     });
-    clearNotificationTimer(notification.id);
-    if (!notification.persistent) {
-      notificationTimersRef.current[notification.id] = window.setTimeout(() => {
-        dismissFlightNotification(notification.id);
-      }, 10000);
+      clearNotificationTimer(notification.id);
+      if (!notification.persistent) {
+        notificationTimersRef.current[notification.id] = window.setTimeout(() => {
+          dismissFlightNotification(notification.id);
+        }, 5000);
+      }
     }
-  }
 
   function showBanner(message: string) {
     setBannerMessage(message);
     if (clearBannerRef.current) {
       window.clearTimeout(clearBannerRef.current);
     }
-    clearBannerRef.current = window.setTimeout(() => {
-      setBannerMessage(null);
-      clearBannerRef.current = null;
-    }, 6000);
+      clearBannerRef.current = window.setTimeout(() => {
+        setBannerMessage(null);
+        clearBannerRef.current = null;
+      }, 5000);
   }
 
   async function runCommand(command: () => Promise<void>) {
@@ -487,6 +479,9 @@ export function App() {
       if (clearBannerRef.current) {
         window.clearTimeout(clearBannerRef.current);
       }
+      if (lowSpeedLandingTimerRef.current) {
+        window.clearTimeout(lowSpeedLandingTimerRef.current);
+      }
       Object.values(notificationTimersRef.current).forEach((timer) => window.clearTimeout(timer));
       notificationTimersRef.current = {};
       if (unlisten) {
@@ -580,6 +575,10 @@ export function App() {
       seenSystemStatusIdsRef.current = new Set();
       armedAltitudeBaselineRef.current = null;
       setLowSpeedMonitoringEnabled(false);
+      if (lowSpeedLandingTimerRef.current) {
+        window.clearTimeout(lowSpeedLandingTimerRef.current);
+        lowSpeedLandingTimerRef.current = null;
+      }
       Object.values(notificationTimersRef.current).forEach((timer) => window.clearTimeout(timer));
       notificationTimersRef.current = {};
       setFlightNotifications([]);
@@ -624,6 +623,32 @@ export function App() {
     lowSpeedMonitoringEnabled,
     snapshot.config.flight_alerts.low_speed_warning_mps
   ]);
+
+  useEffect(() => {
+    if (!activeFlight || !lowSpeedMonitoringEnabled) {
+      if (lowSpeedLandingTimerRef.current) {
+        window.clearTimeout(lowSpeedLandingTimerRef.current);
+        lowSpeedLandingTimerRef.current = null;
+      }
+      return;
+    }
+
+    const speed = displayLiveState?.groundspeed_mps;
+    if (speed == null || speed >= 4) {
+      if (lowSpeedLandingTimerRef.current) {
+        window.clearTimeout(lowSpeedLandingTimerRef.current);
+        lowSpeedLandingTimerRef.current = null;
+      }
+      return;
+    }
+
+    if (!lowSpeedLandingTimerRef.current) {
+      lowSpeedLandingTimerRef.current = window.setTimeout(() => {
+        setLowSpeedMonitoringEnabled(false);
+        lowSpeedLandingTimerRef.current = null;
+      }, 3000);
+    }
+  }, [activeFlight, displayLiveState?.groundspeed_mps, lowSpeedMonitoringEnabled]);
 
   useEffect(() => {
     if (!activeFlight) {
@@ -746,14 +771,6 @@ export function App() {
 
     const derivedNotifications: FlightNotificationRecord[] = [];
     if (activeFlight) {
-      if (snapshot.connection.status === 'stale') {
-        derivedNotifications.push({
-          id: 'telemetry:link-stale',
-          message: 'Telemetry link is stale',
-          severity: 'warning',
-          persistent: true
-        });
-      }
       if (speed != null) {
         if (speed >= highSpeedWarning) {
           derivedNotifications.push({
@@ -870,6 +887,25 @@ export function App() {
     });
   }, [flightNotifications, telemetryMetricStates.notifications]);
 
+  useEffect(() => {
+    if (!reviewMode || !selectedAlertId || effectiveReviewFrameIndex == null) {
+      return;
+    }
+    const selectedMarkerFrame = reviewDetectionMarkerIndex.get(selectedAlertId);
+    if (selectedMarkerFrame == null) {
+      return;
+    }
+    if (selectedMarkerFrame !== effectiveReviewFrameIndex) {
+      setSelectedAlertId(null);
+      setAlertDetailVisible(false);
+    }
+  }, [
+    effectiveReviewFrameIndex,
+    reviewDetectionMarkerIndex,
+    reviewMode,
+    selectedAlertId
+  ]);
+
   function togglePanel(panel: Exclude<OverlayPanel, null>) {
     if (panel === 'flights' && activeFlight) {
       return;
@@ -926,6 +962,18 @@ export function App() {
     void runCommand(() => clearFocusedSession());
   }
 
+  function handleReviewFrameChange(index: number) {
+    setReviewFrameIndex(index);
+    if (!selectedAlertId) {
+      return;
+    }
+    const selectedMarkerFrame = reviewDetectionMarkerIndex.get(selectedAlertId);
+    if (selectedMarkerFrame == null || selectedMarkerFrame !== index) {
+      setSelectedAlertId(null);
+      setAlertDetailVisible(false);
+    }
+  }
+
   function openStopFlightPrompt() {
     setStopFlightName(activeSession?.name ?? '');
     setStopFlightDescription(activeSession?.description ?? '');
@@ -946,23 +994,24 @@ export function App() {
   }
 
   async function handleExportSession(sessionId: string) {
-    const session = snapshot.sessions.find((entry) => entry.id === sessionId);
-    const chosenPath = await save({
-      title: 'Export telemetry',
-      defaultPath: `${sanitizeExportFileName(session?.name ?? 'flight-telemetry')}.csv`,
-      filters: [
-        {
-          name: 'CSV',
-          extensions: ['csv']
-        }
-      ]
+    const exportPath = await exportSessionTelemetry(sessionId);
+    const exportFileName =
+      exportPath.split(/[\\/]/).filter(Boolean).pop() ?? 'Telemetry export.csv';
+    upsertFlightNotification({
+      id: `export:${sessionId}:${Date.now()}`,
+      message: `${exportFileName} saved to Downloads`,
+      severity: 'info',
+      persistent: false,
+      placement: reviewMode ? 'review-above-replay' : 'default'
     });
-    if (!chosenPath) {
-      return;
-    }
-    const exportPath = chosenPath.toLowerCase().endsWith('.csv') ? chosenPath : `${chosenPath}.csv`;
-    await exportSessionTelemetry(sessionId, exportPath);
   }
+
+  const elevatedNotifications = reviewMode
+    ? flightNotifications.filter((notification) => notification.placement === 'review-above-replay')
+    : [];
+  const baseNotifications = flightNotifications.filter(
+    (notification) => notification.placement !== 'review-above-replay' || !reviewMode
+  );
 
   return (
     <div className="console-shell">
@@ -998,9 +1047,28 @@ export function App() {
           </div>
         ) : null}
 
-        {activeFlight && flightNotifications.length > 0 ? (
+        {baseNotifications.length > 0 ? (
           <div className="flight-notification-stack" role="status" aria-live="polite">
-            {flightNotifications.map((notification) => (
+            {baseNotifications.map((notification) => (
+              <div
+                key={notification.id}
+                className={`flight-notification flight-notification--${notification.severity} ${
+                  notification.closing ? 'flight-notification--closing' : ''
+                }`}
+              >
+                <span>{notification.message}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {elevatedNotifications.length > 0 ? (
+          <div
+            className="flight-notification-stack flight-notification-stack--review-export"
+            role="status"
+            aria-live="polite"
+          >
+            {elevatedNotifications.map((notification) => (
               <div
                 key={notification.id}
                 className={`flight-notification flight-notification--${notification.severity} ${
@@ -1134,7 +1202,7 @@ export function App() {
             selectedIndex={effectiveReviewFrameIndex}
             markers={reviewDetectionMarkers}
             selectedMarkerId={selectedAlertId}
-            onChange={setReviewFrameIndex}
+            onChange={handleReviewFrameChange}
             onSelectMarker={(markerId, markerIndex) => {
               setReviewFrameIndex(markerIndex);
               setSelectedAlertId(markerId);
@@ -1205,14 +1273,15 @@ export function App() {
         ) : null}
       </div>
 
-      <SettingsDrawer
-        open={activePanel === 'settings'}
-        config={snapshot.config}
-        regions={offlineCatalog.regions}
-        regionsError={offlineRegionsError}
-        onClose={() => setActivePanel(null)}
-        onRefreshRegions={() => refreshOfflineRegions(true)}
-        onSave={async (config) => {
+        <SettingsDrawer
+          open={activePanel === 'settings'}
+          config={snapshot.config}
+          regions={offlineCatalog.regions}
+          assetOrigin={offlineCatalog.asset_origin}
+          regionsError={offlineRegionsError}
+          onClose={() => setActivePanel(null)}
+          onRefreshRegions={() => refreshOfflineRegions(true)}
+          onSave={async (config) => {
           await updateConfig(config);
         }}
       />

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type {
   AircraftIconShape,
   AppConfig,
+  MapMode,
   OfflineRegionManifest,
   TrackLineStyle
 } from '../lib/types';
@@ -30,25 +31,62 @@ const AIRCRAFT_ICON_OPTIONS: Array<{ value: AircraftIconShape; label: string }> 
   { value: 'compass', label: 'Compass' },
   { value: 'delta', label: 'Delta' },
   { value: 'dart', label: 'Dart' },
-  { value: 'kite', label: 'Kite' }
+  { value: 'kite', label: 'Kite' },
+  { value: 'spear', label: 'Spear' },
+  { value: 'wing', label: 'Wing' }
 ];
-
-type DisplayPanel = 'aircraft' | 'tail' | null;
+const DISPLAY_COLOR_OPTIONS = [
+  '#f4f4f4',
+  '#101010',
+  '#8a8a8a',
+  '#ff9a3d',
+  '#ff6b63',
+  '#ffd44d',
+  '#68de92',
+  '#2fb5aa',
+  '#69b7ff',
+  '#4b86ff',
+  '#8d74ff',
+  '#c26dff',
+  '#8a5a3c',
+  '#c57b42',
+  '#d64545'
+];
 
 interface SettingsDrawerProps {
   open: boolean;
   config: AppConfig;
   regions: OfflineRegionManifest[];
+  assetOrigin?: string | null;
   regionsError?: string | null;
   onClose: () => void;
   onRefreshRegions: () => Promise<void>;
   onSave: (config: AppConfig) => Promise<void>;
 }
 
+function buildRegionAssetUrl(
+  assetOrigin: string | null | undefined,
+  regionId: string,
+  relativePath: string | null | undefined
+) {
+  if (!assetOrigin || !relativePath) {
+    return null;
+  }
+  const normalizedOrigin = assetOrigin.replace(/\/+$/, '');
+  const encodedRegion = encodeURIComponent(regionId);
+  const encodedPath = relativePath
+    .split('/')
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+  return `${normalizedOrigin}/regions/${encodedRegion}/${encodedPath}`;
+}
+
 export function SettingsDrawer({
   open,
   config,
   regions,
+  assetOrigin,
   regionsError,
   onClose,
   onRefreshRegions,
@@ -57,7 +95,7 @@ export function SettingsDrawer({
   const [draft, setDraft] = useState<AppConfig>(config);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [displayPanel, setDisplayPanel] = useState<DisplayPanel>(null);
+  const [previewMapMode, setPreviewMapMode] = useState<MapMode>('satellite');
   const configFingerprint = JSON.stringify(config);
   const draftFingerprint = JSON.stringify(draft);
 
@@ -65,6 +103,10 @@ export function SettingsDrawer({
     setDraft(config);
     setError(null);
   }, [configFingerprint]);
+
+  useEffect(() => {
+    setPreviewMapMode(config.default_map_mode);
+  }, [config.default_map_mode, open]);
 
   useEffect(() => {
     if (!open || draftFingerprint === configFingerprint) {
@@ -170,22 +212,47 @@ export function SettingsDrawer({
     return override || region.name;
   }
 
-  function resetDisplayDefaults() {
+  function resetAlertDefaults() {
     setDraft((current) => ({
       ...current,
       default_fov_deg: DEFAULT_FOV_DEG,
       stale_after_seconds: DEFAULT_STALE_TIMEOUT_S,
-      aircraft_icon: { ...DEFAULT_AIRCRAFT_ICON },
-      track_display: { ...DEFAULT_TRACK_DISPLAY }
-    }));
-  }
-
-  function resetAlertDefaults() {
-    setDraft((current) => ({
-      ...current,
       flight_alerts: { ...DEFAULT_FLIGHT_ALERTS }
     }));
   }
+
+  const previewIconScale = Math.max(0.78, Math.min(1.22, draft.aircraft_icon.size_px / 38));
+  const previewAircraftSize = draft.aircraft_icon.size_px;
+  const previewAircraftRotation = -58;
+  const previewSceneWidth = 500;
+  const previewSceneHeight = 160;
+  const previewOffsetX = 100;
+  const previewTrackAnchorX = 34 + previewOffsetX;
+  const previewTrackAnchorY = 96;
+  const previewPathCurve = `M ${360 + previewOffsetX} 30
+    C ${328 + previewOffsetX} 52, ${298 + previewOffsetX} 132, ${252 + previewOffsetX} 108
+    S ${188 + previewOffsetX} 22, ${142 + previewOffsetX} 52
+    S ${86 + previewOffsetX} 120, ${previewTrackAnchorX} ${previewTrackAnchorY}`;
+  const previewTailWidth = `${Math.max(2, Math.min(8, draft.track_display.width_px * 1.25))}px`;
+  const previewRegion =
+    regions.find((region) => region.id === draft.selected_region_id) ??
+    regions.find((region) => draft.enabled_region_ids.includes(region.id)) ??
+    regions[0] ??
+    null;
+  const previewStreetImage = previewRegion
+    ? buildRegionAssetUrl(assetOrigin, previewRegion.id, previewRegion.street_image)
+    : null;
+  const previewSatelliteImage = previewRegion
+    ? buildRegionAssetUrl(assetOrigin, previewRegion.id, previewRegion.satellite_image)
+    : null;
+  const previewBackgroundImage =
+    previewMapMode === 'street_dark'
+      ? previewStreetImage ?? previewSatelliteImage
+      : previewSatelliteImage ?? previewStreetImage;
+  const previewBackgroundClass =
+    previewMapMode === 'street_dark'
+      ? 'settings-display-preview__bg--street'
+      : 'settings-display-preview__bg--satellite';
 
   return (
     <>
@@ -204,12 +271,312 @@ export function SettingsDrawer({
         </div>
 
         <div className="settings-modal__body">
+            <section className="settings-section">
+              <div className="settings-section__header">
+                <strong>Display</strong>
+              </div>
+
+              <div className="settings-display-grid settings-display-grid--expanded">
+                <div className="settings-subpanel settings-subpanel--display settings-subpanel--display-preview">
+                  <div className="settings-display-preview">
+                    <div
+                      className={`settings-display-preview__bg ${previewBackgroundClass}`}
+                      style={
+                        previewBackgroundImage
+                          ? { backgroundImage: `url("${previewBackgroundImage}")` }
+                          : undefined
+                      }
+                    />
+                    <div className="settings-display-preview__shade" />
+                    <div className="settings-display-preview__toolbar">
+                      <div className="map-mode-toggle settings-display-preview__toggle" role="tablist" aria-label="Preview basemap mode">
+                        <button
+                          className={previewMapMode === 'street_dark' ? 'secondary-button secondary-button--active' : 'secondary-button secondary-button--muted'}
+                          onClick={() => setPreviewMapMode('street_dark')}
+                          type="button"
+                        >
+                          Street
+                        </button>
+                        <button
+                          className={previewMapMode === 'satellite' ? 'secondary-button secondary-button--active' : 'secondary-button secondary-button--muted'}
+                          onClick={() => setPreviewMapMode('satellite')}
+                          type="button"
+                        >
+                          Satellite
+                        </button>
+                      </div>
+                    </div>
+                    {!previewBackgroundImage ? (
+                      <div className="settings-display-preview__empty">Preview imagery unavailable</div>
+                    ) : null}
+                    <div className="settings-display-preview__scene">
+                      <svg
+                        className="settings-display-preview__canvas"
+                        viewBox={`0 0 ${previewSceneWidth} ${previewSceneHeight}`}
+                        aria-hidden="true"
+                      >
+                        {draft.track_display.enabled ? (
+                          <path
+                            d={previewPathCurve}
+                            fill="none"
+                            stroke={draft.track_display.color_hex}
+                            strokeWidth={previewTailWidth}
+                            strokeLinecap="round"
+                            strokeDasharray={draft.track_display.style === 'dashed' ? '15 12' : undefined}
+                          />
+                        ) : null}
+                      </svg>
+                      <div
+                        className="settings-display-preview__aircraft"
+                        style={{
+                          left: `${(previewTrackAnchorX / previewSceneWidth) * 100}%`,
+                          top: `${(previewTrackAnchorY / previewSceneHeight) * 100}%`,
+                          transform: `translate(-50%, -92%) rotate(${previewAircraftRotation}deg)`
+                        }}
+                      >
+                        <div
+                          className="aircraft-marker"
+                          data-shape={draft.aircraft_icon.shape}
+                          style={{
+                            ['--aircraft-size' as string]: `${previewAircraftSize}px`,
+                            ['--aircraft-fill' as string]: draft.aircraft_icon.color_hex
+                          }}
+                        >
+                          <div className="aircraft-marker__glyph" />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="settings-subpanel settings-subpanel--display">
+                  <div className="settings-display-heading">
+                    <span className="settings-tool-card__label">Icon</span>
+                  </div>
+                  <div className="settings-display-controls">
+                    <div className="settings-display-precolor settings-display-precolor--icon">
+                      <div className="settings-display-field settings-display-field--full">
+                        <div className="settings-shape-grid settings-shape-grid--compact">
+                          {AIRCRAFT_ICON_OPTIONS.map((option) => (
+                            <button
+                              key={option.value}
+                              className={`settings-shape-button ${
+                                draft.aircraft_icon.shape === option.value
+                                  ? 'settings-shape-button--active'
+                                  : ''
+                              }`}
+                              onClick={() => patchAircraftIcon({ shape: option.value })}
+                            >
+                              <div
+                                className={`settings-shape-preview settings-shape-preview--${option.value}`}
+                                style={{
+                                  ['--shape-preview-color' as string]: draft.aircraft_icon.color_hex
+                                }}
+                              />
+                              <span>{option.label}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    <label className="settings-display-field settings-display-field--full settings-display-field--control-offset">
+                      <div className="settings-color-panel">
+                        <div className="settings-color-swatches">
+                          {DISPLAY_COLOR_OPTIONS.map((color) => (
+                            <button
+                              key={color}
+                              type="button"
+                              className={`settings-color-swatch ${
+                                draft.aircraft_icon.color_hex.toLowerCase() === color.toLowerCase()
+                                  ? 'settings-color-swatch--active'
+                                  : ''
+                              }`}
+                              style={{ ['--settings-swatch-color' as string]: color }}
+                              onClick={() => patchAircraftIcon({ color_hex: color })}
+                              aria-label={`Use ${color} for icon`}
+                            />
+                          ))}
+                          <label
+                            className={`settings-color-swatch settings-color-swatch--custom ${
+                              !DISPLAY_COLOR_OPTIONS.some(
+                                (color) =>
+                                  color.toLowerCase() === draft.aircraft_icon.color_hex.toLowerCase()
+                              )
+                                ? 'settings-color-swatch--active'
+                                : ''
+                            }`}
+                            aria-label="Choose custom icon color"
+                          >
+                            <input
+                              type="color"
+                              value={draft.aircraft_icon.color_hex}
+                              onChange={(event) =>
+                                patchAircraftIcon({ color_hex: event.target.value })
+                              }
+                            />
+                          </label>
+                        </div>
+                        <span className="settings-inline-value">{draft.aircraft_icon.color_hex}</span>
+                      </div>
+                    </label>
+
+                    <label className="settings-display-field settings-display-field--range settings-display-field--full settings-display-field--control-offset">
+                      <div className="settings-display-field__header">
+                        <span className="settings-display-field__label">Size</span>
+                        <button
+                          type="button"
+                          className="secondary-button secondary-button--muted settings-inline-reset"
+                          onClick={() =>
+                            patchAircraftIcon({ size_px: DEFAULT_AIRCRAFT_ICON.size_px })
+                          }
+                        >
+                          Reset
+                        </button>
+                      </div>
+                      <input
+                        type="range"
+                        min={26}
+                        max={56}
+                        step={1}
+                        value={draft.aircraft_icon.size_px}
+                        onChange={(event) =>
+                          patchAircraftIcon({ size_px: Number(event.target.value) })
+                        }
+                      />
+                      <span className="settings-inline-value">{draft.aircraft_icon.size_px}px</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div className="settings-subpanel settings-subpanel--display settings-subpanel--display-path">
+                  <div className="settings-display-heading">
+                    <span className="settings-tool-card__label">Path</span>
+                  </div>
+                  <div className="settings-display-controls settings-display-controls--path">
+                    <div className="settings-display-precolor settings-display-precolor--path">
+                      <label className="settings-display-field settings-display-field--full settings-display-field--path-toggle">
+                        <div className="settings-pill-row">
+                          <button
+                            className={`secondary-button secondary-button--muted ${
+                              draft.track_display.enabled ? 'secondary-button--active' : ''
+                            }`}
+                            onClick={() => patchTrackDisplay({ enabled: true })}
+                          >
+                            Enabled
+                          </button>
+                          <button
+                            className={`secondary-button secondary-button--muted ${
+                              !draft.track_display.enabled ? 'secondary-button--active' : ''
+                            }`}
+                            onClick={() => patchTrackDisplay({ enabled: false })}
+                          >
+                            Disabled
+                          </button>
+                        </div>
+                      </label>
+
+                      <label className="settings-display-field settings-display-field--full settings-display-field--path-toggle">
+                        <div className="settings-pill-row">
+                          <button
+                            className={`secondary-button secondary-button--muted ${
+                              draft.track_display.style === 'solid' ? 'secondary-button--active' : ''
+                            }`}
+                            onClick={() => patchTrackDisplay({ style: 'solid' })}
+                          >
+                            Solid
+                          </button>
+                          <button
+                            className={`secondary-button secondary-button--muted ${
+                              draft.track_display.style === 'dashed' ? 'secondary-button--active' : ''
+                            }`}
+                            onClick={() => patchTrackDisplay({ style: 'dashed' })}
+                          >
+                            Dashed
+                          </button>
+                        </div>
+                      </label>
+                    </div>
+
+                    <label className="settings-display-field settings-display-field--full settings-display-field--control-offset">
+                      <div className="settings-color-panel">
+                        <div className="settings-color-swatches">
+                          {DISPLAY_COLOR_OPTIONS.map((color) => (
+                            <button
+                              key={color}
+                              type="button"
+                              className={`settings-color-swatch ${
+                                draft.track_display.color_hex.toLowerCase() === color.toLowerCase()
+                                  ? 'settings-color-swatch--active'
+                                  : ''
+                              }`}
+                              style={{ ['--settings-swatch-color' as string]: color }}
+                              onClick={() => patchTrackDisplay({ color_hex: color })}
+                              aria-label={`Use ${color} for path`}
+                            />
+                          ))}
+                          <label
+                            className={`settings-color-swatch settings-color-swatch--custom ${
+                              !DISPLAY_COLOR_OPTIONS.some(
+                                (color) =>
+                                  color.toLowerCase() === draft.track_display.color_hex.toLowerCase()
+                              )
+                                ? 'settings-color-swatch--active'
+                                : ''
+                            }`}
+                            aria-label="Choose custom path color"
+                          >
+                            <input
+                              type="color"
+                              value={draft.track_display.color_hex}
+                              onChange={(event) =>
+                                patchTrackDisplay({ color_hex: event.target.value })
+                              }
+                            />
+                          </label>
+                        </div>
+                        <span className="settings-inline-value">{draft.track_display.color_hex}</span>
+                      </div>
+                    </label>
+
+                    <label className="settings-display-field settings-display-field--range settings-display-field--full settings-display-field--control-offset">
+                      <div className="settings-display-field__header">
+                        <span className="settings-display-field__label">Size</span>
+                        <button
+                          type="button"
+                          className="secondary-button secondary-button--muted settings-inline-reset"
+                          onClick={() =>
+                            patchTrackDisplay({ width_px: DEFAULT_TRACK_DISPLAY.width_px })
+                          }
+                        >
+                          Reset
+                        </button>
+                      </div>
+                      <input
+                        type="range"
+                        min={1.5}
+                        max={6}
+                        step={0.1}
+                        value={draft.track_display.width_px}
+                        onChange={(event) =>
+                          patchTrackDisplay({ width_px: Number(event.target.value) })
+                        }
+                      />
+                      <span className="settings-inline-value">
+                        {draft.track_display.width_px.toFixed(1)}px
+                      </span>
+                    </label>
+                  </div>
+                </div>
+            </div>
+          </section>
+
           <section className="settings-section">
             <div className="settings-section__header">
-              <strong>Display</strong>
+              <strong>Alerts</strong>
               <button
                 className="secondary-button secondary-button--muted"
-                onClick={resetDisplayDefaults}
+                onClick={resetAlertDefaults}
               >
                 Reset to default
               </button>
@@ -235,177 +602,6 @@ export function SettingsDrawer({
                   onChange={(event) => patch('stale_after_seconds', Number(event.target.value))}
                 />
               </label>
-            </div>
-
-            <div className="settings-display-grid">
-              <button
-                className={`settings-tool-card ${
-                  displayPanel === 'aircraft' ? 'settings-tool-card--active' : ''
-                }`}
-                onClick={() =>
-                  setDisplayPanel((current) => (current === 'aircraft' ? null : 'aircraft'))
-                }
-              >
-                <span className="settings-tool-card__label">Aircraft map icon</span>
-                <div
-                  className={`settings-shape-preview settings-shape-preview--${draft.aircraft_icon.shape}`}
-                  style={{ ['--shape-preview-color' as string]: draft.aircraft_icon.color_hex }}
-                />
-              </button>
-
-              <button
-                className={`settings-tool-card ${
-                  displayPanel === 'tail' ? 'settings-tool-card--active' : ''
-                }`}
-                onClick={() => setDisplayPanel((current) => (current === 'tail' ? null : 'tail'))}
-              >
-                <span className="settings-tool-card__label">Tail path</span>
-                <span
-                  className={`settings-tail-preview settings-tail-preview--${draft.track_display.style}`}
-                  style={{
-                    ['--tail-preview-color' as string]: draft.track_display.color_hex,
-                    ['--tail-preview-width' as string]: `${draft.track_display.width_px}px`,
-                    opacity: draft.track_display.enabled ? 1 : 0.35
-                  }}
-                />
-              </button>
-            </div>
-
-            {displayPanel === 'aircraft' ? (
-              <div className="settings-subpanel">
-                <div className="settings-form settings-form--two-column">
-                  <label>
-                    Size
-                    <input
-                      type="range"
-                      min={26}
-                      max={56}
-                      step={1}
-                      value={draft.aircraft_icon.size_px}
-                      onChange={(event) =>
-                        patchAircraftIcon({ size_px: Number(event.target.value) })
-                      }
-                    />
-                    <span className="settings-inline-value">{draft.aircraft_icon.size_px}px</span>
-                  </label>
-                  <label>
-                    Color
-                    <input
-                      type="color"
-                      value={draft.aircraft_icon.color_hex}
-                      onChange={(event) => patchAircraftIcon({ color_hex: event.target.value })}
-                    />
-                  </label>
-                </div>
-
-                <div className="settings-shape-grid">
-                  {AIRCRAFT_ICON_OPTIONS.map((option) => (
-                    <button
-                      key={option.value}
-                      className={`settings-shape-button ${
-                        draft.aircraft_icon.shape === option.value
-                          ? 'settings-shape-button--active'
-                          : ''
-                      }`}
-                      onClick={() => patchAircraftIcon({ shape: option.value })}
-                    >
-                      <div
-                        className={`settings-shape-preview settings-shape-preview--${option.value}`}
-                        style={{ ['--shape-preview-color' as string]: draft.aircraft_icon.color_hex }}
-                      />
-                      <span>{option.label}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-
-            {displayPanel === 'tail' ? (
-              <div className="settings-subpanel">
-                <div className="settings-form settings-form--two-column">
-                  <label>
-                    Tail display
-                    <div className="settings-pill-row">
-                      <button
-                        className={`secondary-button secondary-button--muted ${
-                          draft.track_display.enabled ? 'secondary-button--active' : ''
-                        }`}
-                        onClick={() => patchTrackDisplay({ enabled: true })}
-                      >
-                        Enabled
-                      </button>
-                      <button
-                        className={`secondary-button secondary-button--muted ${
-                          !draft.track_display.enabled ? 'secondary-button--active' : ''
-                        }`}
-                        onClick={() => patchTrackDisplay({ enabled: false })}
-                      >
-                        Disabled
-                      </button>
-                    </div>
-                  </label>
-                  <label>
-                    Style
-                    <div className="settings-pill-row">
-                      <button
-                        className={`secondary-button secondary-button--muted ${
-                          draft.track_display.style === 'solid' ? 'secondary-button--active' : ''
-                        }`}
-                        onClick={() => patchTrackDisplay({ style: 'solid' })}
-                      >
-                        Solid
-                      </button>
-                      <button
-                        className={`secondary-button secondary-button--muted ${
-                          draft.track_display.style === 'dashed' ? 'secondary-button--active' : ''
-                        }`}
-                        onClick={() => patchTrackDisplay({ style: 'dashed' })}
-                      >
-                        Dashed
-                      </button>
-                    </div>
-                  </label>
-                  <label>
-                    Thickness
-                    <input
-                      type="range"
-                      min={1.5}
-                      max={6}
-                      step={0.1}
-                      value={draft.track_display.width_px}
-                      onChange={(event) =>
-                        patchTrackDisplay({ width_px: Number(event.target.value) })
-                      }
-                    />
-                    <span className="settings-inline-value">
-                      {draft.track_display.width_px.toFixed(1)}px
-                    </span>
-                  </label>
-                  <label>
-                    Color
-                    <input
-                      type="color"
-                      value={draft.track_display.color_hex}
-                      onChange={(event) => patchTrackDisplay({ color_hex: event.target.value })}
-                    />
-                  </label>
-                </div>
-              </div>
-            ) : null}
-          </section>
-
-          <section className="settings-section">
-            <div className="settings-section__header">
-              <strong>Alerts</strong>
-              <button
-                className="secondary-button secondary-button--muted"
-                onClick={resetAlertDefaults}
-              >
-                Reset to default
-              </button>
-            </div>
-
-            <div className="settings-form settings-form--two-column">
               <label>
                 High speed warning (m/s)
                 <input
@@ -469,7 +665,7 @@ export function SettingsDrawer({
 
           <section className="settings-section">
             <div className="settings-section__header">
-              <strong>Offline maps</strong>
+              <strong>Maps</strong>
               <button
                 className="secondary-button secondary-button--muted"
                 onClick={async () => {

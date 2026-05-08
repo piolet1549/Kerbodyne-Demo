@@ -88,9 +88,15 @@ export function ReplayTimeline({
         />
       </div>
 
-      <div className="replay-timeline__slider-shell">
+      <div
+        className={`replay-timeline__slider-shell ${
+          selectedMarkerId ? 'replay-timeline__slider-shell--marker-active' : ''
+        }`}
+      >
         <input
-          className="replay-timeline__slider"
+          className={`replay-timeline__slider ${
+            selectedMarkerId ? 'replay-timeline__slider--marker-active' : ''
+          }`}
           type="range"
           min={0}
           max={Math.max(frames.length - 1, 0)}

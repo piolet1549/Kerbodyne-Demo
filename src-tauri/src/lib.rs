@@ -111,11 +111,11 @@ async fn delete_session(
 
 #[tauri::command]
 async fn export_session_telemetry(
+    app: AppHandle,
     state: State<'_, Arc<AppRuntime>>,
     session_id: String,
-    output_path: Option<String>,
 ) -> Result<String, String> {
-    state.export_session_telemetry(session_id, output_path).await
+    state.export_session_telemetry(&app, session_id).await
 }
 
 pub fn run() {

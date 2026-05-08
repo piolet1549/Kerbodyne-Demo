@@ -77,6 +77,8 @@ pub enum AircraftIconShape {
     Delta,
     Dart,
     Kite,
+    Spear,
+    Wing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

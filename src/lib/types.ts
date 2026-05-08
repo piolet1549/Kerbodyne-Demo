@@ -1,6 +1,6 @@
 export type RuntimeMode = 'idle' | 'live';
 export type MapMode = 'street_dark' | 'satellite';
-export type AircraftIconShape = 'compass' | 'delta' | 'dart' | 'kite';
+export type AircraftIconShape = 'compass' | 'delta' | 'dart' | 'kite' | 'spear' | 'wing';
 export type TrackLineStyle = 'solid' | 'dashed';
 
 export type ConnectionStatus =

@@ -464,10 +464,10 @@ impl AppRuntime {
 
     pub async fn export_session_telemetry(
         &self,
+        app: &AppHandle,
         session_id: String,
-        output_path: Option<String>,
     ) -> Result<String, String> {
-        let _session = self
+        let session = self
             .sessions
             .read()
             .await
@@ -476,12 +476,18 @@ impl AppRuntime {
             .cloned()
             .ok_or_else(|| "Flight not found.".to_string())?;
         let replay_events = self.db.load_replay_events(&session_id)?;
-        let path = output_path
-            .map(PathBuf::from)
-            .ok_or_else(|| "No export path selected.".to_string())?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
+        let downloads_dir = app
+            .path()
+            .download_dir()
+            .map_err(|error| error.to_string())?;
+        fs::create_dir_all(&downloads_dir).map_err(|error| error.to_string())?;
+        let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+        let file_name = format!(
+            "{}-telemetry-{}.csv",
+            sanitize_file_component(&session.name),
+            timestamp
+        );
+        let path = downloads_dir.join(file_name);
         let mut rows = String::from(
             "recorded_at,message_id,aircraft_id,armed,lat,lon,alt_msl_m,groundspeed_mps,heading_deg,flight_time_s,battery_voltage_v,battery_percent,extras_json,raw_json\n",
         );
@@ -1381,6 +1387,29 @@ fn write_csv_row(target: &mut String, fields: &[String]) {
         target.push_str(&escape_csv_field(field));
     }
     target.push('\n');
+}
+
+fn sanitize_file_component(value: &str) -> String {
+    let sanitized: String = value
+        .trim()
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            control if control.is_control() => '-',
+            other => other,
+        })
+        .collect();
+    let compact = sanitized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .replace("--", "-");
+    let trimmed = compact.trim_matches('-');
+    if trimmed.is_empty() {
+        "flight".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn review_frames_from_replay(frames: Vec<ReplayFrame>) -> Vec<ReviewTelemetryFrame> {
