@@ -157,6 +157,31 @@ function mixHexColors(first: string, second: string, weight: number) {
   )}`;
 }
 
+function readNumberExtra(extras: Record<string, unknown> | null | undefined, key: string) {
+  const value = extras?.[key];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function readBooleanExtra(extras: Record<string, unknown> | null | undefined, key: string) {
+  const value = extras?.[key];
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+  return null;
+}
+
 function buildMetricState(
   tone: HudMetricState['tone'],
   color_hex?: string | null,
@@ -208,6 +233,7 @@ export function App() {
   const [bannerMessage, setBannerMessage] = useState<string | null>(null);
   const [stopFlightOpen, setStopFlightOpen] = useState(false);
   const [rawTelemetryOpen, setRawTelemetryOpen] = useState(false);
+  const [expandedHudOpen, setExpandedHudOpen] = useState(false);
   const [deleteFlightTarget, setDeleteFlightTarget] = useState<{
     id: string;
     name: string;
@@ -223,6 +249,7 @@ export function App() {
   const previousFocusedSessionIdRef = useRef<string | null>(null);
   const previousActiveSessionIdRef = useRef<string | null>(null);
   const lowSpeedLandingTimerRef = useRef<number | null>(null);
+  const cpuThrottleTimerRef = useRef<number | null>(null);
 
   const deferredAlerts = useDeferredValue(snapshot.alerts);
   const activeSession = useMemo(
@@ -273,6 +300,12 @@ export function App() {
     [effectiveReviewFrameIndex, reviewFrames]
   );
   const displayLiveState = reviewMode ? selectedReviewFrame?.live_state ?? null : snapshot.live_state;
+  const liveExtras = (displayLiveState?.extras ?? null) as Record<string, unknown> | null;
+  const cpuTempC = readNumberExtra(liveExtras, 'cpu_temp_c');
+  const cpuPercent = readNumberExtra(liveExtras, 'cpu_pct');
+  const cpuMhz = readNumberExtra(liveExtras, 'cpu_mhz');
+  const npuTempC = readNumberExtra(liveExtras, 'npu_temp_c');
+  const visionActive = readBooleanExtra(liveExtras, 'vision_active');
   const displayTrack = useMemo(() => {
     if (!reviewMode) {
       return snapshot.track;
@@ -556,6 +589,11 @@ export function App() {
   useEffect(() => {
     if (!activeFlight) {
       setRawTelemetryOpen(false);
+      setExpandedHudOpen(false);
+      if (cpuThrottleTimerRef.current) {
+        window.clearTimeout(cpuThrottleTimerRef.current);
+        cpuThrottleTimerRef.current = null;
+      }
     }
   }, [activeFlight]);
 
@@ -651,6 +689,55 @@ export function App() {
   }, [activeFlight, displayLiveState?.groundspeed_mps, lowSpeedMonitoringEnabled]);
 
   useEffect(() => {
+    const notificationId = 'telemetry:cpu-throttle-warning';
+    const clearThrottleTimer = () => {
+      if (cpuThrottleTimerRef.current) {
+        window.clearTimeout(cpuThrottleTimerRef.current);
+        cpuThrottleTimerRef.current = null;
+      }
+    };
+
+    if (!activeFlight) {
+      clearThrottleTimer();
+      dismissFlightNotification(notificationId);
+      return;
+    }
+
+    if (cpuMhz != null && cpuMhz < 2400) {
+      const throttledMessage = `CPU throttling detected: ${(cpuMhz / 1000).toFixed(2)} GHz`;
+      const existingWarning = flightNotifications.find(
+        (notification) => notification.id === notificationId && !notification.closing
+      );
+
+      if (existingWarning) {
+        upsertFlightNotification({
+          id: notificationId,
+          message: throttledMessage,
+          severity: 'warning',
+          persistent: true
+        });
+        return;
+      }
+
+      if (!cpuThrottleTimerRef.current) {
+        cpuThrottleTimerRef.current = window.setTimeout(() => {
+          upsertFlightNotification({
+            id: notificationId,
+            message: throttledMessage,
+            severity: 'warning',
+            persistent: true
+          });
+          cpuThrottleTimerRef.current = null;
+        }, 5000);
+      }
+      return;
+    }
+
+    clearThrottleTimer();
+    dismissFlightNotification(notificationId);
+  }, [activeFlight, cpuMhz, flightNotifications]);
+
+  useEffect(() => {
     if (!activeFlight) {
       return;
     }
@@ -711,6 +798,21 @@ export function App() {
     }
     return { label: 'Ready', variant: 'connected' as const };
   }, [activeFlight, displayLiveState?.armed, flightHasReceivedConnection, snapshot.connection.status]);
+  const expandedHudStatus = useMemo(() => {
+    if (!activeFlight) {
+      return null;
+    }
+    if (snapshot.connection.status === 'stale') {
+      return { label: 'Vision telemetry stale', variant: 'stale' as const };
+    }
+    if (!flightHasReceivedConnection) {
+      return { label: 'Awaiting vision telemetry', variant: 'waiting' as const };
+    }
+    if (visionActive) {
+      return { label: 'Vision pipeline active', variant: 'connected' as const };
+    }
+    return { label: 'Vision pipeline inactive', variant: 'waiting' as const };
+  }, [activeFlight, flightHasReceivedConnection, snapshot.connection.status, visionActive]);
   const telemetryMetricStates = useMemo(() => {
     const safeColor = '#f4f4f4';
     const cautionColor = '#ffb347';
@@ -1183,7 +1285,21 @@ export function App() {
             reviewTimestamp={selectedReviewFrame?.recorded_at ?? null}
             liveConnectionState={liveHudStatus}
             metricStates={activeFlight ? telemetryMetricStates : undefined}
+            expandedHud={
+              activeFlight && expandedHudStatus
+                ? {
+                    open: expandedHudOpen,
+                    cpuTempC,
+                    cpuPercent,
+                    npuTempC,
+                    status: expandedHudStatus
+                  }
+                : null
+            }
             onOpenRawData={activeFlight ? () => setRawTelemetryOpen(true) : undefined}
+            onToggleExpandedHud={
+              activeFlight ? () => setExpandedHudOpen((current) => !current) : undefined
+            }
             onExportTelemetry={
               reviewMode && focusedSession?.id
                 ? () =>
@@ -1277,7 +1393,6 @@ export function App() {
           open={activePanel === 'settings'}
           config={snapshot.config}
           regions={offlineCatalog.regions}
-          assetOrigin={offlineCatalog.asset_origin}
           regionsError={offlineRegionsError}
           onClose={() => setActivePanel(null)}
           onRefreshRegions={() => refreshOfflineRegions(true)}
@@ -1440,6 +1555,7 @@ export function App() {
           </section>
         </>
       ) : null}
+
     </div>
   );
 }

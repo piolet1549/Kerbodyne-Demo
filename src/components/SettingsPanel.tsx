@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react';
+import previewSatelliteStatic from '../assets/settings-preview-satellite.png';
+import previewStreetStatic from '../assets/settings-preview-street.png';
 import type {
   AircraftIconShape,
   AppConfig,
@@ -57,36 +59,16 @@ interface SettingsDrawerProps {
   open: boolean;
   config: AppConfig;
   regions: OfflineRegionManifest[];
-  assetOrigin?: string | null;
   regionsError?: string | null;
   onClose: () => void;
   onRefreshRegions: () => Promise<void>;
   onSave: (config: AppConfig) => Promise<void>;
 }
 
-function buildRegionAssetUrl(
-  assetOrigin: string | null | undefined,
-  regionId: string,
-  relativePath: string | null | undefined
-) {
-  if (!assetOrigin || !relativePath) {
-    return null;
-  }
-  const normalizedOrigin = assetOrigin.replace(/\/+$/, '');
-  const encodedRegion = encodeURIComponent(regionId);
-  const encodedPath = relativePath
-    .split('/')
-    .filter(Boolean)
-    .map((segment) => encodeURIComponent(segment))
-    .join('/');
-  return `${normalizedOrigin}/regions/${encodedRegion}/${encodedPath}`;
-}
-
 export function SettingsDrawer({
   open,
   config,
   regions,
-  assetOrigin,
   regionsError,
   onClose,
   onRefreshRegions,
@@ -234,21 +216,10 @@ export function SettingsDrawer({
     S ${188 + previewOffsetX} 22, ${142 + previewOffsetX} 52
     S ${86 + previewOffsetX} 120, ${previewTrackAnchorX} ${previewTrackAnchorY}`;
   const previewTailWidth = `${Math.max(2, Math.min(8, draft.track_display.width_px * 1.25))}px`;
-  const previewRegion =
-    regions.find((region) => region.id === draft.selected_region_id) ??
-    regions.find((region) => draft.enabled_region_ids.includes(region.id)) ??
-    regions[0] ??
-    null;
-  const previewStreetImage = previewRegion
-    ? buildRegionAssetUrl(assetOrigin, previewRegion.id, previewRegion.street_image)
-    : null;
-  const previewSatelliteImage = previewRegion
-    ? buildRegionAssetUrl(assetOrigin, previewRegion.id, previewRegion.satellite_image)
-    : null;
   const previewBackgroundImage =
     previewMapMode === 'street_dark'
-      ? previewStreetImage ?? previewSatelliteImage
-      : previewSatelliteImage ?? previewStreetImage;
+      ? previewStreetStatic
+      : previewSatelliteStatic;
   const previewBackgroundClass =
     previewMapMode === 'street_dark'
       ? 'settings-display-preview__bg--street'

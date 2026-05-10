@@ -619,10 +619,20 @@ export function LiveMap({
 
   useEffect(() => {
     if (followAvailable !== previousFollowAvailabilityRef.current) {
+      if (
+        followAvailable &&
+        filteredLiveState &&
+        isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)
+      ) {
+        mapRef.current?.easeTo({
+          center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
+          duration: 320
+        });
+      }
       setFollowEnabled(false);
       previousFollowAvailabilityRef.current = followAvailable;
     }
-  }, [followAvailable]);
+  }, [filteredLiveState, followAvailable]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -754,34 +764,30 @@ export function LiveMap({
         >
           <RotateRightIcon />
         </button>
-        <button
-          className={`map-control-wheel__follow ${
-            followAvailable ? 'map-control-wheel__follow--available' : 'map-control-wheel__follow--unavailable'
-          } ${followEnabled ? 'map-control-wheel__follow--active' : ''}`}
-          onClick={() => {
-            if (!followAvailable) {
-              return;
-            }
-            const nextFollow = !followEnabled;
-            setFollowEnabled(nextFollow);
-            if (
-              nextFollow &&
-              filteredLiveState &&
-              isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)
-            ) {
-              mapRef.current?.easeTo({
-                center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
-                duration: 320
-              });
-            }
-          }}
-          aria-label={followEnabled ? 'Disable follow mode' : 'Enable follow mode'}
-          disabled={!followAvailable}
-        >
-          {followAvailable ? (
+        {followAvailable ? (
+          <button
+            className={`map-control-wheel__follow map-control-wheel__follow--available ${
+              followEnabled ? 'map-control-wheel__follow--active' : ''
+            }`}
+            onClick={() => {
+              const nextFollow = !followEnabled;
+              setFollowEnabled(nextFollow);
+              if (
+                nextFollow &&
+                filteredLiveState &&
+                isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)
+              ) {
+                mapRef.current?.easeTo({
+                  center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
+                  duration: 320
+                });
+              }
+            }}
+            aria-label={followEnabled ? 'Disable follow mode' : 'Enable follow mode'}
+          >
             <span className="map-control-wheel__follow-core" aria-hidden="true" />
-          ) : null}
-        </button>
+          </button>
+        ) : null}
       </div>
       <div className="map-bottom-strip">
         {scaleIndicator ? (
