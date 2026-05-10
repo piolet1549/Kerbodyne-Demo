@@ -799,20 +799,20 @@ export function App() {
     return { label: 'Ready', variant: 'connected' as const };
   }, [activeFlight, displayLiveState?.armed, flightHasReceivedConnection, snapshot.connection.status]);
   const expandedHudStatus = useMemo(() => {
-    if (!activeFlight) {
+    if (!activeFlight && !reviewMode) {
       return null;
     }
-    if (snapshot.connection.status === 'stale') {
+    if (activeFlight && snapshot.connection.status === 'stale') {
       return { label: 'Vision telemetry stale', variant: 'stale' as const };
     }
-    if (!flightHasReceivedConnection) {
+    if (activeFlight && !flightHasReceivedConnection) {
       return { label: 'Awaiting vision telemetry', variant: 'waiting' as const };
     }
     if (visionActive) {
       return { label: 'Vision pipeline active', variant: 'connected' as const };
     }
     return { label: 'Vision pipeline inactive', variant: 'waiting' as const };
-  }, [activeFlight, flightHasReceivedConnection, snapshot.connection.status, visionActive]);
+  }, [activeFlight, flightHasReceivedConnection, reviewMode, snapshot.connection.status, visionActive]);
   const telemetryMetricStates = useMemo(() => {
     const safeColor = '#f4f4f4';
     const cautionColor = '#ffb347';
@@ -1286,9 +1286,9 @@ export function App() {
             liveConnectionState={liveHudStatus}
             metricStates={activeFlight ? telemetryMetricStates : undefined}
             expandedHud={
-              activeFlight && expandedHudStatus
+              expandedHudStatus
                 ? {
-                    open: expandedHudOpen,
+                    open: activeFlight ? expandedHudOpen : reviewMode,
                     cpuTempC,
                     cpuPercent,
                     npuTempC,

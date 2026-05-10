@@ -2724,6 +2724,10 @@ button {
   background: #ffffff;
 }
 
+.map-control-wheel__follow--unavailable .map-control-wheel__follow-core {
+  background: #1b1b1b;
+}
+
 .map-control-wheel__follow--active {
   background: #f2f2f2;
   border-color: #f2f2f2;
@@ -3047,4 +3051,20 @@ button {
   .settings-color-swatches {
     grid-template-columns: repeat(auto-fit, minmax(24px, 24px));
   }
+}
+
+.map-control-wheel > .map-control-wheel__follow {
+  position: absolute !important;
+  left: 0 !important;
+  top: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  inset: auto !important;
+  transform: none !important;
+  margin: 0 !important;
+  margin: auto !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  z-index: 3 !important;
 }

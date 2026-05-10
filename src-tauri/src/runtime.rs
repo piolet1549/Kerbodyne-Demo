@@ -612,7 +612,7 @@ impl AppRuntime {
         }
 
         if should_save {
-            self.load_session_data(Some(session_id)).await?;
+            self.load_session_data(None).await?;
         } else {
             self.delete_session_internal(&session_id).await?;
             self.load_session_data(None).await?;

@@ -102,7 +102,7 @@ export function TelemetryHud({
   const expandedHudClassName = [
     'telemetry-hud',
     'telemetry-hud--expanded',
-    expandedHud ? `telemetry-hud--status-${expandedHud.status.variant}` : ''
+    mode === 'live' && expandedHud ? `telemetry-hud--status-${expandedHud.status.variant}` : ''
   ]
     .filter(Boolean)
     .join(' ');
@@ -202,7 +202,7 @@ export function TelemetryHud({
         ) : null}
       </div>
 
-      {mode === 'live' && expandedHud?.open ? (
+      {((mode === 'live' && expandedHud?.open) || (mode === 'review' && expandedHud)) ? (
         <div
           className={expandedHudClassName}
           title={expandedHud.status.label}
