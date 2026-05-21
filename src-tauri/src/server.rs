@@ -280,6 +280,9 @@ async fn handle_asset_request(
     if request.uri().path() == "/__preview__/live.mjpg" {
         return handle_live_preview_request(runtime, request).await;
     }
+    if request.uri().path() == "/__preview__/live.jpg" {
+        return handle_live_preview_frame_request(runtime, request).await;
+    }
 
     let asset_path = match runtime.resolve_offline_asset_path(request.uri().path()).await {
         Ok(Some(path)) => path,
@@ -443,6 +446,39 @@ async fn handle_live_preview_request(
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "multipart/x-mixed-replace; boundary=frame")
         .body(body)
+        .unwrap_or_else(|_| Response::new(Body::empty()));
+    with_cors(response)
+}
+
+async fn handle_live_preview_frame_request(
+    runtime: Arc<AppRuntime>,
+    request: Request<Body>,
+) -> Response<Body> {
+    if request.method() == Method::HEAD {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "image/jpeg")
+            .header("Cache-Control", "no-store, no-cache, must-revalidate")
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+        return with_cors(response);
+    }
+
+    let Some(frame) = runtime.latest_preview_frame().await else {
+        let response = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("Cache-Control", "no-store, no-cache, must-revalidate")
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+        return with_cors(response);
+    };
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "image/jpeg")
+        .header(CONTENT_LENGTH, frame.len().to_string())
+        .header("Cache-Control", "no-store, no-cache, must-revalidate")
+        .body(Body::from(frame))
         .unwrap_or_else(|_| Response::new(Body::empty()));
     with_cors(response)
 }

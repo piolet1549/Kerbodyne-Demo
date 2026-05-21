@@ -133,6 +133,7 @@ pub struct AppRuntime {
     focused_session_id: RwLock<Option<String>>,
     active_tasks: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
     preview_frame_sender: watch::Sender<Option<Vec<u8>>>,
+    latest_preview_frame: RwLock<Option<Vec<u8>>>,
     video_runtime: Mutex<VideoRuntimeState>,
     video_dir: PathBuf,
     gstreamer_path: RwLock<Option<PathBuf>>,
@@ -187,6 +188,7 @@ impl AppRuntime {
             focused_session_id: RwLock::new(focused_session_id),
             active_tasks: Mutex::new(Vec::new()),
             preview_frame_sender,
+            latest_preview_frame: RwLock::new(None),
             video_runtime: Mutex::new(VideoRuntimeState::default()),
             video_dir,
             gstreamer_path: RwLock::new(None),
@@ -197,7 +199,10 @@ impl AppRuntime {
         match spawn_offline_asset_server(self.clone()) {
             Ok(asset_origin) => {
                 *self.asset_server_origin.blocking_write() = asset_origin;
-                let preview_url = format!("{}/__preview__/live.mjpg", self.asset_server_origin.blocking_read().clone());
+                let preview_url = format!(
+                    "{}/__preview__/live.jpg",
+                    self.asset_server_origin.blocking_read().clone()
+                );
                 self.video_preview.blocking_write().preview_url = Some(preview_url);
             }
             Err(error) => {
@@ -836,6 +841,10 @@ impl AppRuntime {
         self.preview_frame_sender.subscribe()
     }
 
+    pub async fn latest_preview_frame(&self) -> Option<Vec<u8>> {
+        self.latest_preview_frame.read().await.clone()
+    }
+
     async fn start_video_subsystem(
         &self,
         app: &AppHandle,
@@ -949,6 +958,7 @@ impl AppRuntime {
             preview_url,
             ..VideoPreviewState::default()
         };
+        *self.latest_preview_frame.write().await = None;
         let _ = self.preview_frame_sender.send(None);
         Ok(())
     }
@@ -1129,6 +1139,7 @@ impl AppRuntime {
             runtime.last_preview_frame_at = Some(Utc::now());
             runtime.recording.is_some()
         };
+        *self.latest_preview_frame.write().await = Some(frame.clone());
         let _ = self.preview_frame_sender.send(Some(frame));
         {
             let mut preview = self.video_preview.write().await;

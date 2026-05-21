@@ -13,9 +13,13 @@ interface ReplayTimelineProps {
   markers: ReplayTimelineMarker[];
   selectedMarkerId?: string | null;
   hasRecordings?: boolean;
+  playbackActive: boolean;
+  playbackSpeed: number;
   onChange: (index: number) => void;
   onSelectMarker: (markerId: string, index: number) => void;
   onRenameFlightName: (name: string) => void;
+  onTogglePlayback: () => void;
+  onAdjustPlaybackSpeed: (direction: -1 | 1) => void;
   onOpenRecordings?: () => void;
 }
 
@@ -33,9 +37,13 @@ export function ReplayTimeline({
   markers,
   selectedMarkerId,
   hasRecordings,
+  playbackActive,
+  playbackSpeed,
   onChange,
   onSelectMarker,
   onRenameFlightName,
+  onTogglePlayback,
+  onAdjustPlaybackSpeed,
   onOpenRecordings
 }: ReplayTimelineProps) {
   const [draftFlightName, setDraftFlightName] = useState(flightName);
@@ -90,15 +98,47 @@ export function ReplayTimeline({
           }}
           aria-label="Flight name"
         />
-        {hasRecordings && onOpenRecordings ? (
-          <button
-            type="button"
-            className="secondary-button secondary-button--muted replay-timeline__recordings-button"
-            onClick={onOpenRecordings}
-          >
-            View recordings
-          </button>
-        ) : null}
+        <div className="replay-timeline__controls">
+          <div className="replay-timeline__playback-controls">
+            <button
+              type="button"
+              className="secondary-button secondary-button--muted replay-timeline__playback-button"
+              onClick={() => onAdjustPlaybackSpeed(-1)}
+              disabled={playbackSpeed <= 0.5}
+              aria-label="Decrease replay speed"
+            >
+              -
+            </button>
+            <button
+              type="button"
+              className={`secondary-button replay-timeline__playback-button ${
+                playbackActive ? 'secondary-button--active' : ''
+              }`}
+              onClick={onTogglePlayback}
+            >
+              {playbackActive ? 'Pause' : 'Play'}
+            </button>
+            <span className="replay-timeline__speed">{playbackSpeed}x</span>
+            <button
+              type="button"
+              className="secondary-button secondary-button--muted replay-timeline__playback-button"
+              onClick={() => onAdjustPlaybackSpeed(1)}
+              disabled={playbackSpeed >= 4}
+              aria-label="Increase replay speed"
+            >
+              +
+            </button>
+          </div>
+          {hasRecordings && onOpenRecordings ? (
+            <button
+              type="button"
+              className="secondary-button secondary-button--muted replay-timeline__recordings-button"
+              onClick={onOpenRecordings}
+            >
+              View recordings
+            </button>
+          ) : null}
+        </div>
       </div>
 
       <div

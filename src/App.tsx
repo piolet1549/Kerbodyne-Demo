@@ -258,6 +258,8 @@ export function App() {
   const [stopFlightName, setStopFlightName] = useState('');
   const [stopFlightDescription, setStopFlightDescription] = useState('');
   const [reviewFrameIndex, setReviewFrameIndex] = useState<number | null>(null);
+  const [reviewPlaybackActive, setReviewPlaybackActive] = useState(false);
+  const [reviewPlaybackSpeed, setReviewPlaybackSpeed] = useState(1);
   const [lastIdleMapView, setLastIdleMapView] = useState<{
     center: [number, number];
     zoom: number;
@@ -322,7 +324,35 @@ export function App() {
       effectiveReviewFrameIndex != null ? reviewFrames[effectiveReviewFrameIndex] ?? null : null,
     [effectiveReviewFrameIndex, reviewFrames]
   );
+  const reviewArmedAltitudeBaseline = useMemo(() => {
+    if (!reviewMode) {
+      return null;
+    }
+    return (
+      reviewFrames.find(
+        (frame) => frame.live_state.armed && frame.live_state.alt_msl_m != null
+      )?.live_state.alt_msl_m ?? null
+    );
+  }, [reviewFrames, reviewMode]);
   const displayLiveState = reviewMode ? selectedReviewFrame?.live_state ?? null : snapshot.live_state;
+  const displayAltitudeMsl = displayLiveState?.alt_msl_m ?? null;
+  const displayAltitudeAgl = useMemo(() => {
+    if (!displayLiveState?.armed) {
+      return 0;
+    }
+    const baseline = snapshot.active_session_id
+      ? armedAltitudeBaselineRef.current
+      : reviewArmedAltitudeBaseline;
+    if (baseline == null || displayAltitudeMsl == null) {
+      return 0;
+    }
+    return displayAltitudeMsl - baseline;
+  }, [
+    displayAltitudeMsl,
+    displayLiveState?.armed,
+    reviewArmedAltitudeBaseline,
+    snapshot.active_session_id
+  ]);
   const liveExtras = (displayLiveState?.extras ?? null) as Record<string, unknown> | null;
   const cpuTempC = readNumberExtra(liveExtras, 'cpu_temp_c');
   const cpuPercent = readNumberExtra(liveExtras, 'cpu_pct');
@@ -1070,6 +1100,48 @@ export function App() {
     snapshot.connection.status !== 'listening';
 
   useEffect(() => {
+    if (!reviewMode || !reviewPlaybackActive || effectiveReviewFrameIndex == null || reviewFrames.length < 2) {
+      return;
+    }
+
+    if (effectiveReviewFrameIndex >= reviewFrames.length - 1) {
+      setReviewPlaybackActive(false);
+      return;
+    }
+
+    const currentTimestamp = new Date(
+      reviewFrames[effectiveReviewFrameIndex].recorded_at
+    ).getTime();
+    const nextTimestamp = new Date(
+      reviewFrames[effectiveReviewFrameIndex + 1].recorded_at
+    ).getTime();
+    const deltaMs = Number.isFinite(currentTimestamp) && Number.isFinite(nextTimestamp)
+      ? Math.max(16, Math.round(Math.max(nextTimestamp - currentTimestamp, 16) / reviewPlaybackSpeed))
+      : Math.max(16, Math.round(1000 / reviewPlaybackSpeed));
+
+    const timer = window.setTimeout(() => {
+      setReviewFrameIndex((current) => {
+        const baseIndex = current ?? effectiveReviewFrameIndex;
+        return Math.min(baseIndex + 1, reviewFrames.length - 1);
+      });
+    }, deltaMs);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    effectiveReviewFrameIndex,
+    reviewFrames,
+    reviewMode,
+    reviewPlaybackActive,
+    reviewPlaybackSpeed
+  ]);
+
+  useEffect(() => {
+    if (!reviewMode) {
+      setReviewPlaybackActive(false);
+    }
+  }, [reviewMode]);
+
+  useEffect(() => {
     const telemetryIds = new Set(
       flightNotifications
         .filter((notification) => notification.id.startsWith('telemetry:'))
@@ -1155,6 +1227,7 @@ export function App() {
     setSelectedAlertId(null);
     setAlertDetailVisible(false);
     setReviewFrameIndex(null);
+    setReviewPlaybackActive(false);
     setReviewVideoOpen(false);
     void runCommand(async () => {
       await focusSession(sessionId);
@@ -1165,6 +1238,7 @@ export function App() {
   function handleClearReview() {
     setSelectedAlertId(null);
     setAlertDetailVisible(false);
+    setReviewPlaybackActive(false);
     setReviewVideoOpen(false);
     void runCommand(() => clearFocusedSession());
   }
@@ -1179,6 +1253,23 @@ export function App() {
       setSelectedAlertId(null);
       setAlertDetailVisible(false);
     }
+  }
+
+  function handleToggleReviewPlayback() {
+    if (!reviewMode || reviewFrames.length === 0) {
+      return;
+    }
+    if (!reviewPlaybackActive && effectiveReviewFrameIndex != null && effectiveReviewFrameIndex >= reviewFrames.length - 1) {
+      setReviewFrameIndex(0);
+    }
+    setReviewPlaybackActive((current) => !current);
+  }
+
+  function handleAdjustReviewPlaybackSpeed(direction: -1 | 1) {
+    const speeds = [0.5, 1, 2, 4];
+    const currentIndex = speeds.findIndex((speed) => speed === reviewPlaybackSpeed);
+    const nextIndex = Math.max(0, Math.min((currentIndex >= 0 ? currentIndex : 1) + direction, speeds.length - 1));
+    setReviewPlaybackSpeed(speeds[nextIndex]);
   }
 
   function openStopFlightPrompt() {
@@ -1528,6 +1619,8 @@ export function App() {
             liveState={displayLiveState}
             mode={activeFlight ? 'live' : 'review'}
             reviewTimestamp={selectedReviewFrame?.recorded_at ?? null}
+            altitudeAglM={displayAltitudeAgl}
+            altitudeMslM={displayAltitudeMsl}
             liveConnectionState={liveHudStatus}
             metricStates={activeFlight ? telemetryMetricStates : undefined}
             expandedHud={
@@ -1564,6 +1657,8 @@ export function App() {
             markers={reviewDetectionMarkers}
             selectedMarkerId={selectedAlertId}
             hasRecordings={reviewHasVideoClips}
+            playbackActive={reviewPlaybackActive}
+            playbackSpeed={reviewPlaybackSpeed}
             onChange={handleReviewFrameChange}
             onSelectMarker={(markerId, markerIndex) => {
               setReviewFrameIndex(markerIndex);
@@ -1578,6 +1673,8 @@ export function App() {
                 updateSessionDetails(focusedSession.id, name, focusedSession.description ?? null)
               );
             }}
+            onTogglePlayback={handleToggleReviewPlayback}
+            onAdjustPlaybackSpeed={handleAdjustReviewPlaybackSpeed}
             onOpenRecordings={() => setReviewVideoOpen(true)}
           />
         ) : null}

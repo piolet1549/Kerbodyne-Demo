@@ -20,6 +20,8 @@ interface TelemetryHudProps {
   liveState?: AircraftLiveState | null;
   mode: 'live' | 'review';
   reviewTimestamp?: string | null;
+  altitudeAglM?: number | null;
+  altitudeMslM?: number | null;
   liveConnectionState?: HudStatus | null;
   metricStates?: {
     altitude?: HudMetricState;
@@ -84,6 +86,8 @@ export function TelemetryHud({
   liveState,
   mode,
   reviewTimestamp,
+  altitudeAglM,
+  altitudeMslM,
   liveConnectionState,
   metricStates,
   expandedHud,
@@ -145,12 +149,9 @@ export function TelemetryHud({
 
         <div className="telemetry-hud__grid">
           <div>
-            <span className="telemetry-hud__label">Altitude</span>
-            <strong
-              className={metricClasses(metricStates?.altitude)}
-              style={metricStyle(metricStates?.altitude)}
-            >
-              {renderValue(liveState?.alt_msl_m, ' m')}
+            <span className="telemetry-hud__label">Heading</span>
+            <strong className="telemetry-hud__metric-value">
+              {renderWholeValue(liveState?.heading_deg, ' deg')}
             </strong>
           </div>
           <div>
@@ -163,10 +164,20 @@ export function TelemetryHud({
             </strong>
           </div>
           <div>
-            <span className="telemetry-hud__label">Heading</span>
-            <strong className="telemetry-hud__metric-value">
-              {renderWholeValue(liveState?.heading_deg, ' deg')}
+            <span className="telemetry-hud__label">Altitude</span>
+            <strong
+              className={metricClasses(metricStates?.altitude)}
+              style={metricStyle(metricStates?.altitude)}
+            >
+              {renderValue(altitudeAglM ?? 0, ' m AGL')}
             </strong>
+            <span
+              className={`telemetry-hud__subvalue ${
+                metricStates?.altitude?.pulse ? 'telemetry-hud__subvalue--pulse' : ''
+              }`}
+            >
+              {renderValue(altitudeMslM, ' m MSL')}
+            </span>
           </div>
           <div>
             <span className="telemetry-hud__label">Battery</span>

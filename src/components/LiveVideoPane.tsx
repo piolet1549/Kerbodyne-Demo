@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react';
 import type { VideoPreviewState } from '../lib/types';
 
 interface LiveVideoPaneProps {
@@ -26,9 +27,74 @@ function statusLabel(status: VideoPreviewState['status']) {
 }
 
 export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
-  const hasStream = Boolean(video.preview_url) && !matchesErrorIdle(video.status);
+  const [frameUrl, setFrameUrl] = useState<string | null>(null);
+  const frameUrlRef = useRef<string | null>(null);
   const waitingForFeed = matchesErrorIdle(video.status) || video.status === 'waiting_for_stream' || video.status === 'waiting_for_keyframe';
   const WrapperTag = dominant ? 'div' : 'button';
+
+  useEffect(() => {
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const revokeFrameUrl = (url: string | null) => {
+      if (url) {
+        URL.revokeObjectURL(url);
+      }
+    };
+
+    const schedulePoll = (delay = 66) => {
+      timeoutId = window.setTimeout(() => {
+        void pollFrame();
+      }, delay);
+    };
+
+    async function pollFrame() {
+      if (cancelled || !video.preview_url) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`${video.preview_url}?t=${Date.now()}`, {
+          cache: 'no-store'
+        });
+        if (cancelled) {
+          return;
+        }
+        if (response.status === 200) {
+          const blob = await response.blob();
+          if (cancelled) {
+            return;
+          }
+          const nextUrl = URL.createObjectURL(blob);
+          const previousUrl = frameUrlRef.current;
+          frameUrlRef.current = nextUrl;
+          setFrameUrl(nextUrl);
+          revokeFrameUrl(previousUrl);
+        }
+      } catch {
+        // Swallow transient frame fetch errors and keep polling.
+      }
+
+      if (!cancelled) {
+        schedulePoll();
+      }
+    }
+
+    if (video.preview_url) {
+      schedulePoll(0);
+    }
+
+    return () => {
+      cancelled = true;
+      if (timeoutId != null) {
+        window.clearTimeout(timeoutId);
+      }
+      const previousUrl = frameUrlRef.current;
+      frameUrlRef.current = null;
+      setFrameUrl(null);
+      revokeFrameUrl(previousUrl);
+    };
+  }, [video.preview_url]);
 
   return (
     <WrapperTag
@@ -43,8 +109,8 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
           }
         : {})}
     >
-      {hasStream && video.preview_url ? (
-        <img className="live-video-pane__image" src={video.preview_url} alt="Live aircraft video feed" />
+      {frameUrl ? (
+        <img className="live-video-pane__image" src={frameUrl} alt="Live aircraft video feed" />
       ) : (
         <div className="live-video-pane__empty" />
       )}
