@@ -1,7 +1,8 @@
 use std::{
     collections::VecDeque,
+    env,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -1849,8 +1850,33 @@ fn resolve_gstreamer_executable(app: &AppHandle) -> Option<PathBuf> {
     })
 }
 
-fn spawn_preview_process(gst_launch: &PathBuf) -> Result<Child, String> {
-    Command::new(gst_launch)
+fn configure_gstreamer_command(command: &mut Command, gst_launch: &Path) {
+    if let Some(gst_root) = gst_launch.parent().and_then(|bin_dir| bin_dir.parent()) {
+        let bin_dir = gst_root.join("bin");
+        let plugin_dir = gst_root.join("lib").join("gstreamer-1.0");
+        let scanner_path = gst_root
+            .join("libexec")
+            .join("gstreamer-1.0")
+            .join("gst-plugin-scanner.exe");
+
+        let existing_path = env::var_os("PATH").unwrap_or_default();
+        let mut joined_paths = vec![bin_dir.clone()];
+        joined_paths.extend(env::split_paths(&existing_path));
+        if let Ok(path_value) = env::join_paths(joined_paths) {
+            command.env("PATH", path_value);
+        }
+        command.env("GST_PLUGIN_SYSTEM_PATH_1_0", plugin_dir);
+        if scanner_path.is_file() {
+            command.env("GST_PLUGIN_SCANNER_1_0", scanner_path);
+        }
+        command.current_dir(gst_root);
+    }
+}
+
+fn spawn_preview_process(gst_launch: &Path) -> Result<Child, String> {
+    let mut command = Command::new(gst_launch);
+    configure_gstreamer_command(&mut command, gst_launch);
+    command
         .args([
             "-q",
             "udpsrc",
@@ -1888,8 +1914,10 @@ fn spawn_preview_process(gst_launch: &PathBuf) -> Result<Child, String> {
         .map_err(|error| error.to_string())
 }
 
-fn spawn_recording_process(gst_launch: &PathBuf) -> Result<Child, String> {
-    Command::new(gst_launch)
+fn spawn_recording_process(gst_launch: &Path) -> Result<Child, String> {
+    let mut command = Command::new(gst_launch);
+    configure_gstreamer_command(&mut command, gst_launch);
+    command
         .args([
             "-q",
             "udpsrc",
@@ -1919,11 +1947,13 @@ fn spawn_recording_process(gst_launch: &PathBuf) -> Result<Child, String> {
 }
 
 async fn remux_h264_to_mp4(
-    gst_launch: &PathBuf,
-    input_path: &PathBuf,
-    output_path: &PathBuf,
+    gst_launch: &Path,
+    input_path: &Path,
+    output_path: &Path,
 ) -> Result<(), String> {
-    let status = Command::new(gst_launch)
+    let mut command = Command::new(gst_launch);
+    configure_gstreamer_command(&mut command, gst_launch);
+    let status = command
         .args([
             "-q",
             "filesrc",
