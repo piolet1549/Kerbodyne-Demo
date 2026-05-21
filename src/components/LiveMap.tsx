@@ -14,13 +14,14 @@ import type {
   AlertRecord,
   AppConfig,
   MapMode,
-  OfflineRegionManifest
+  OfflineRegionManifest,
+  TrackPointRecord
 } from '../lib/types';
 
 interface LiveMapProps {
   config: AppConfig;
   liveState?: AircraftLiveState | null;
-  track: Array<[number, number]>;
+  track: TrackPointRecord[];
   alerts: AlertRecord[];
   selectedAlertId?: string | null;
   enabledRegions: OfflineRegionManifest[];
@@ -30,9 +31,13 @@ interface LiveMapProps {
   activeFlight: boolean;
   reviewMode: boolean;
   linkPulseActive: boolean;
+  compactFlightView?: boolean;
+  forceFollow?: boolean;
+  preferredInitialView?: { center: [number, number]; zoom: number; bearing: number } | null;
   measureToolbarHost?: HTMLElement | null;
   focusTarget?: [number, number] | null;
   focusKey?: string | null;
+  onViewStateChange?: (view: { center: [number, number]; zoom: number; bearing: number }) => void;
   onSelectAlert: (alertId: string) => void;
 }
 
@@ -80,9 +85,13 @@ export function LiveMap({
   activeFlight,
   reviewMode,
   linkPulseActive,
+  compactFlightView = false,
+  forceFollow = false,
+  preferredInitialView,
   measureToolbarHost,
   focusTarget,
   focusKey,
+  onViewStateChange,
   onSelectAlert
 }: LiveMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -104,6 +113,7 @@ export function LiveMap({
   const activeFlightRef = useRef(activeFlight);
   const enabledRegionsRef = useRef(enabledRegions);
   const selectedRegionRef = useRef(selectedRegion);
+  const onViewStateChangeRef = useRef(onViewStateChange);
   const previousFollowAvailabilityRef = useRef(false);
   const measureEnabledRef = useRef(false);
   const measurePointsRef = useRef<Array<[number, number]>>([]);
@@ -189,6 +199,7 @@ export function LiveMap({
     return formatMeasurement(measurementDistanceM, measureUnit);
   }, [measurementDistanceM, measureUnit]);
   const followAvailable = activeFlight && Boolean(filteredLiveState?.armed);
+  const effectiveFollowEnabled = forceFollow || followEnabled;
   const measureControl = (
     <div ref={measureShellRef} className="measure-shell">
       <button
@@ -285,6 +296,7 @@ export function LiveMap({
     activeFlightRef.current = activeFlight;
     enabledRegionsRef.current = enabledRegions;
     selectedRegionRef.current = selectedRegion;
+    onViewStateChangeRef.current = onViewStateChange;
     measureEnabledRef.current = measureOpen;
     measurePointsRef.current = measurePoints;
     measureUnitRef.current = measureUnit;
@@ -302,7 +314,8 @@ export function LiveMap({
     measureUnit,
     reviewMode,
     selectedAlertId,
-    selectedRegion
+    selectedRegion,
+    onViewStateChange
   ]);
 
   useEffect(() => {
@@ -325,6 +338,14 @@ export function LiveMap({
   }, [measureMenuOpen]);
 
   useEffect(() => {
+    if (!compactFlightView) {
+      return;
+    }
+    setMeasureOpen(false);
+    setMeasureMenuOpen(false);
+  }, [compactFlightView]);
+
+  useEffect(() => {
     if (!containerRef.current) {
       return undefined;
     }
@@ -334,19 +355,20 @@ export function LiveMap({
     lastFocusKeyRef.current = null;
     lastSelectedRegionIdRef.current = null;
 
-    const initialView = computeInitialView(selectedRegion, enabledRegions, containerRef.current);
+    const initialView = preferredInitialView ?? computeInitialView(selectedRegion, enabledRegions, containerRef.current);
 
       try {
         setMapLoadingLabel(buildMapLoadingLabel(mapMode));
         const map = new maplibregl.Map({
           container: containerRef.current,
           style,
-        center: initialView.center,
-        zoom: initialView.zoom,
-        pitch: 0,
-        pitchWithRotate: false,
-        attributionControl: false,
-        renderWorldCopies: false
+          center: initialView.center,
+          zoom: initialView.zoom,
+          bearing: initialView.bearing,
+          pitch: 0,
+          pitchWithRotate: false,
+          attributionControl: false,
+          renderWorldCopies: false
         });
 
         map.dragRotate.enable();
@@ -395,7 +417,8 @@ export function LiveMap({
           trackRef.current,
           alertsRef.current,
           selectedAlertIdRef.current,
-          enabledRegionsRef.current
+          enabledRegionsRef.current,
+          configRef.current.stale_after_seconds
         );
         syncAircraftMarker(
           aircraftMarkerRef.current,
@@ -465,6 +488,15 @@ export function LiveMap({
         setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
         syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
         syncScaleIndicator(map, setScaleIndicator);
+      });
+
+      map.on('moveend', () => {
+        const currentCenter = map.getCenter();
+        onViewStateChangeRef.current?.({
+          center: [currentCenter.lng, currentCenter.lat],
+          zoom: map.getZoom(),
+          bearing: map.getBearing()
+        });
       });
 
       map.on('dblclick', (event) => {
@@ -562,7 +594,14 @@ export function LiveMap({
 
     ensureSources(map);
     applyOverlayAppearance(map, mapMode, config.track_display);
-    syncMapData(map, filteredTrack, filteredAlerts, selectedAlertId, enabledRegions);
+    syncMapData(
+      map,
+      filteredTrack,
+      filteredAlerts,
+      selectedAlertId,
+      enabledRegions,
+      config.stale_after_seconds
+    );
     syncMeasureData(map, measurePoints);
     syncMeasureOverlay(map, measurePoints, measureUnit, setMeasureLabelScreen);
   }, [
@@ -636,7 +675,7 @@ export function LiveMap({
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !activeFlight || !followEnabled || !filteredLiveState?.armed) {
+    if (!map || !activeFlight || !effectiveFollowEnabled || !filteredLiveState?.armed) {
       return;
     }
 
@@ -648,7 +687,48 @@ export function LiveMap({
       center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
       duration: 280
     });
-  }, [activeFlight, filteredLiveState?.armed, filteredLiveState?.lat, filteredLiveState?.lon, followEnabled]);
+  }, [
+    activeFlight,
+    effectiveFollowEnabled,
+    filteredLiveState?.armed,
+    filteredLiveState?.lat,
+    filteredLiveState?.lon
+  ]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (
+      !map ||
+      !forceFollow ||
+      !activeFlight ||
+      !filteredLiveState?.armed ||
+      !isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)
+    ) {
+      return;
+    }
+
+    map.easeTo({
+      center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
+      duration: 240
+    });
+  }, [activeFlight, filteredLiveState, forceFollow]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    const handle = window.requestAnimationFrame(() => {
+      map.resize();
+      const currentCenter = map.getCenter();
+      setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
+      syncScaleIndicator(map, setScaleIndicator);
+      syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
+    });
+
+    return () => window.cancelAnimationFrame(handle);
+  }, [compactFlightView]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -699,7 +779,7 @@ export function LiveMap({
   }, [focusKey, focusTarget]);
 
   return (
-    <div className="map-stage">
+    <div className={`map-stage ${compactFlightView ? 'map-stage--compact' : ''}`}>
       <div ref={containerRef} className="map-canvas" />
       {mapError ? (
         <div className="map-fallback">
@@ -711,8 +791,12 @@ export function LiveMap({
       {coverageUnavailable ? (
         <div className="map-coverage-indicator">Outside imported map coverage</div>
       ) : null}
-      {measureToolbarHost && measureControl ? createPortal(measureControl, measureToolbarHost) : measureControl}
-      {measureLabelScreen ? (
+      {!compactFlightView
+        ? measureToolbarHost && measureControl
+          ? createPortal(measureControl, measureToolbarHost)
+          : measureControl
+        : null}
+      {!compactFlightView && measureLabelScreen ? (
         <div
           className="measure-map-label"
           style={{
@@ -723,6 +807,7 @@ export function LiveMap({
           {measureLabelScreen.label}
         </div>
       ) : null}
+      {!compactFlightView ? (
       <div className="map-control-wheel">
         <button
           className="map-control-wheel__button map-control-wheel__button--top"
@@ -764,33 +849,37 @@ export function LiveMap({
         >
           <RotateRightIcon />
         </button>
-        <button
-          className={`map-control-wheel__follow ${
-            followAvailable ? 'map-control-wheel__follow--available' : 'map-control-wheel__follow--unavailable'
-          } ${followEnabled ? 'map-control-wheel__follow--active' : ''}`}
-          onClick={() => {
-            if (!followAvailable) {
-              return;
-            }
-            const nextFollow = !followEnabled;
-            setFollowEnabled(nextFollow);
-            if (
-              nextFollow &&
-              filteredLiveState &&
-              isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)
-            ) {
-              mapRef.current?.easeTo({
-                center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
-                duration: 320
-              });
-            }
-          }}
-          aria-label={followEnabled ? 'Disable follow mode' : 'Enable follow mode'}
-          disabled={!followAvailable}
-        >
-          <span className="map-control-wheel__follow-core" aria-hidden="true" />
-        </button>
+        {followAvailable ? (
+          <button
+            className={`map-control-wheel__follow ${
+              followAvailable ? 'map-control-wheel__follow--available' : 'map-control-wheel__follow--unavailable'
+            } ${followEnabled ? 'map-control-wheel__follow--active' : ''}`}
+            onClick={() => {
+              if (!followAvailable) {
+                return;
+              }
+              const nextFollow = !followEnabled;
+              setFollowEnabled(nextFollow);
+              if (
+                nextFollow &&
+                filteredLiveState &&
+                isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)
+              ) {
+                mapRef.current?.easeTo({
+                  center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
+                  duration: 320
+                });
+              }
+            }}
+            aria-label={followEnabled ? 'Disable follow mode' : 'Enable follow mode'}
+            disabled={!followAvailable}
+          >
+            <span className="map-control-wheel__follow-core" aria-hidden="true" />
+          </button>
+        ) : null}
       </div>
+      ) : null}
+      {!compactFlightView ? (
       <div className="map-bottom-strip">
         {scaleIndicator ? (
           <div className="map-scale-indicator">
@@ -807,6 +896,7 @@ export function LiveMap({
           {centerCoordinates[0].toFixed(5)}, {centerCoordinates[1].toFixed(5)}
         </div>
       </div>
+      ) : null}
     </div>
   );
 }
@@ -838,8 +928,8 @@ function isValidCoordinate(
   return !(Math.abs(lat) < 0.000001 && Math.abs(lon) < 0.000001);
 }
 
-function isValidTrackPoint(point: [number, number]) {
-  return isValidCoordinate(point[0], point[1]);
+function isValidTrackPoint(point: TrackPointRecord) {
+  return isValidCoordinate(point.lat, point.lon);
 }
 
 function isValidAlertRecord(alert: AlertRecord) {
@@ -945,6 +1035,7 @@ function ensureSources(map: Map) {
       id: 'track-casing',
       type: 'line',
       source: SOURCE_TRACK,
+      filter: ['==', ['get', 'kind'], 'segment'],
       paint: {
         'line-width': 5.4,
         'line-color': '#050505',
@@ -955,10 +1046,33 @@ function ensureSources(map: Map) {
       id: 'track-layer',
       type: 'line',
       source: SOURCE_TRACK,
+      filter: ['==', ['get', 'kind'], 'segment'],
       paint: {
         'line-width': 2.8,
         'line-color': '#f0f0f0',
         'line-opacity': 0.94
+      }
+    });
+    map.addLayer({
+      id: 'track-gap-casing',
+      type: 'line',
+      source: SOURCE_TRACK,
+      filter: ['==', ['get', 'kind'], 'gap'],
+      paint: {
+        'line-width': 5.4,
+        'line-color': '#050505',
+        'line-opacity': 0.66
+      }
+    });
+    map.addLayer({
+      id: 'track-gap-layer',
+      type: 'line',
+      source: SOURCE_TRACK,
+      filter: ['==', ['get', 'kind'], 'gap'],
+      paint: {
+        'line-width': 2.8,
+        'line-color': '#ff6b63',
+        'line-opacity': 0.96
       }
     });
   }
@@ -1012,6 +1126,10 @@ function applyOverlayAppearance(
   map.setPaintProperty('track-layer', 'line-width', trackDisplay.enabled ? baseWidth : 0.2);
   map.setPaintProperty('track-layer', 'line-color', lineColor);
   map.setPaintProperty('track-layer', 'line-opacity', trackDisplay.enabled ? 0.96 : 0);
+  map.setPaintProperty('track-gap-casing', 'line-width', trackDisplay.enabled ? baseWidth + 2.8 : 0.2);
+  map.setPaintProperty('track-gap-casing', 'line-opacity', trackDisplay.enabled ? 0.72 : 0);
+  map.setPaintProperty('track-gap-layer', 'line-width', trackDisplay.enabled ? baseWidth + 0.4 : 0.2);
+  map.setPaintProperty('track-gap-layer', 'line-opacity', trackDisplay.enabled ? 0.96 : 0);
   map.setLayoutProperty(
     'track-layer',
     'line-cap',
@@ -1027,6 +1145,10 @@ function applyOverlayAppearance(
     'line-dasharray',
     trackDisplay.style === 'dashed' ? [3.2, 2.2] : [1, 0.001]
   );
+  map.setLayoutProperty('track-gap-layer', 'line-cap', 'round');
+  map.setLayoutProperty('track-gap-layer', 'line-join', 'round');
+  map.setLayoutProperty('track-gap-casing', 'line-cap', 'round');
+  map.setLayoutProperty('track-gap-casing', 'line-join', 'round');
   map.setPaintProperty('alerts-halo-layer', 'circle-opacity', satellite ? 0.34 : 0.22);
   map.setPaintProperty('coverage-mask-layer', 'fill-opacity', satellite ? 0.64 : 0.56);
   map.setPaintProperty('coverage-bounds-layer', 'line-opacity', satellite ? 0.6 : 0.5);
@@ -1034,12 +1156,13 @@ function applyOverlayAppearance(
 
 function syncMapData(
   map: Map,
-  track: Array<[number, number]>,
+  track: TrackPointRecord[],
   alerts: AlertRecord[],
   selectedAlertId?: string | null,
-  enabledRegions: OfflineRegionManifest[] = []
+  enabledRegions: OfflineRegionManifest[] = [],
+  staleAfterSeconds = 10
 ) {
-  (map.getSource(SOURCE_TRACK) as GeoJSONSource).setData(buildTrackGeoJson(track));
+  (map.getSource(SOURCE_TRACK) as GeoJSONSource).setData(buildTrackGeoJson(track, staleAfterSeconds));
   (map.getSource(SOURCE_ALERTS) as GeoJSONSource).setData(
     buildAlertsGeoJson(alerts, selectedAlertId)
   );
@@ -1129,7 +1252,8 @@ function computeInitialView(
   if (!targetRegion) {
     return {
       center: [-121.493, 38.575] as [number, number],
-      zoom: 12.8
+      zoom: 12.8,
+      bearing: 0
     };
   }
 
@@ -1151,7 +1275,8 @@ function computeInitialView(
   const zoomLat = Math.log2(usableHeight / 512 / latFraction);
   return {
     center: (selectedRegion ?? targetRegion).center as [number, number],
-    zoom: Math.max(9.8, Math.min(15.1, Math.min(zoomLng, zoomLat) - 0.2))
+    zoom: Math.max(9.8, Math.min(15.1, Math.min(zoomLng, zoomLat) - 0.2)),
+    bearing: 0
   };
 }
 

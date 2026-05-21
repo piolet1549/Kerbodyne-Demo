@@ -227,23 +227,168 @@ export function buildCoverageBoundsGeoJson(enabledRegions) {
   };
 }
 
-export function buildTrackGeoJson(track) {
+export function buildTrackGeoJson(track, staleAfterSeconds = 10) {
+  const normalizedTrack = Array.isArray(track)
+    ? track.filter(
+        (point) =>
+          point &&
+          Number.isFinite(point.lat) &&
+          Number.isFinite(point.lon) &&
+          typeof point.recorded_at === 'string'
+      )
+    : [];
+  if (normalizedTrack.length < 2) {
+    return {
+      type: 'FeatureCollection',
+      features: []
+    };
+  }
+
+  const features = [];
+  let currentSegment = [normalizedTrack[0]];
+
+  for (let index = 1; index < normalizedTrack.length; index += 1) {
+    const previous = normalizedTrack[index - 1];
+    const current = normalizedTrack[index];
+    const elapsedSeconds = Math.max(
+      0,
+      (Date.parse(current.recorded_at) - Date.parse(previous.recorded_at)) / 1000
+    );
+    const staleGap = Number.isFinite(elapsedSeconds) && elapsedSeconds > staleAfterSeconds;
+
+    if (staleGap) {
+      features.push(...buildTrackSegmentFeatures(currentSegment));
+      features.push(...buildGapMarkerFeatures(previous, current));
+      currentSegment = [current];
+      continue;
+    }
+
+    currentSegment.push(current);
+  }
+
+  features.push(...buildTrackSegmentFeatures(currentSegment));
+
   return {
     type: 'FeatureCollection',
-    features:
-      track.length > 1
-        ? [
-            {
-              type: 'Feature',
-              properties: {},
-              geometry: {
-                type: 'LineString',
-                coordinates: track.map(([lat, lon]) => [lon, lat])
-              }
-            }
-          ]
-        : []
+    features
   };
+}
+
+function buildTrackSegmentFeatures(segment) {
+  if (!segment || segment.length < 2) {
+    return [];
+  }
+  const coordinates = segment.map((point) => [point.lon, point.lat]);
+  const smoothed = smoothPolyline(coordinates, 2);
+  return [
+    {
+      type: 'Feature',
+      properties: {
+        kind: 'segment'
+      },
+      geometry: {
+        type: 'LineString',
+        coordinates: smoothed
+      }
+    }
+  ];
+}
+
+function smoothPolyline(points, iterations = 1) {
+  if (!Array.isArray(points) || points.length < 3) {
+    return points;
+  }
+
+  let next = points.slice();
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    if (next.length < 3) {
+      return next;
+    }
+    const smoothed = [next[0]];
+    for (let index = 0; index < next.length - 1; index += 1) {
+      const start = next[index];
+      const end = next[index + 1];
+      if (index === 0) {
+        smoothed.push(interpolateCoordinate(start, end, 0.28));
+      } else if (index === next.length - 2) {
+        smoothed.push(interpolateCoordinate(start, end, 0.72));
+      } else {
+        smoothed.push(interpolateCoordinate(start, end, 0.25));
+        smoothed.push(interpolateCoordinate(start, end, 0.75));
+      }
+    }
+    smoothed.push(next[next.length - 1]);
+    next = smoothed;
+  }
+  return next;
+}
+
+function interpolateCoordinate(start, end, ratio) {
+  return [
+    start[0] + (end[0] - start[0]) * ratio,
+    start[1] + (end[1] - start[1]) * ratio
+  ];
+}
+
+function buildGapMarkerFeatures(startPoint, endPoint) {
+  const centers = buildGapMarkerCenters(startPoint, endPoint);
+  const features = [];
+
+  centers.forEach(([lat, lon]) => {
+    const sizeM = 16;
+    const diagOneStart = projectCoordinate(lat, lon, 45, sizeM);
+    const diagOneEnd = projectCoordinate(lat, lon, 225, sizeM);
+    const diagTwoStart = projectCoordinate(lat, lon, 135, sizeM);
+    const diagTwoEnd = projectCoordinate(lat, lon, 315, sizeM);
+    features.push({
+      type: 'Feature',
+      properties: {
+        kind: 'gap'
+      },
+      geometry: {
+        type: 'MultiLineString',
+        coordinates: [
+          [diagOneStart, diagOneEnd],
+          [diagTwoStart, diagTwoEnd]
+        ]
+      }
+    });
+  });
+
+  return features;
+}
+
+function buildGapMarkerCenters(startPoint, endPoint) {
+  const distance = haversineDistanceM(
+    startPoint.lat,
+    startPoint.lon,
+    endPoint.lat,
+    endPoint.lon
+  );
+  const markerCount = Math.max(1, Math.min(4, Math.round(distance / 90)));
+  const centers = [];
+
+  for (let index = 0; index < markerCount; index += 1) {
+    const ratio = markerCount === 1 ? 0.5 : (index + 1) / (markerCount + 1);
+    centers.push([
+      startPoint.lat + (endPoint.lat - startPoint.lat) * ratio,
+      startPoint.lon + (endPoint.lon - startPoint.lon) * ratio
+    ]);
+  }
+
+  return centers;
+}
+
+function haversineDistanceM(startLat, startLon, endLat, endLon) {
+  const lat1 = toRadians(startLat);
+  const lat2 = toRadians(endLat);
+  const latDiff = toRadians(endLat - startLat);
+  const lonDiff = toRadians(endLon - startLon);
+  const a =
+    Math.sin(latDiff / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(lonDiff / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return EARTH_RADIUS_M * c;
 }
 
 export function buildAlertsGeoJson(alerts, selectedAlertId) {

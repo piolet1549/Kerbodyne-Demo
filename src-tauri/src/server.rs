@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use hyper::{
+    body::Bytes,
     header::{
         HeaderValue, ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
         ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, CONTENT_LENGTH,
@@ -276,6 +277,10 @@ async fn handle_asset_request(
         );
     }
 
+    if request.uri().path() == "/__preview__/live.mjpg" {
+        return handle_live_preview_request(runtime, request).await;
+    }
+
     let asset_path = match runtime.resolve_offline_asset_path(request.uri().path()).await {
         Ok(Some(path)) => path,
         Ok(None) => {
@@ -394,6 +399,52 @@ async fn handle_asset_request(
     };
 
     response
+}
+
+async fn handle_live_preview_request(
+    runtime: Arc<AppRuntime>,
+    request: Request<Body>,
+) -> Response<Body> {
+    if request.method() == Method::HEAD {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "multipart/x-mixed-replace; boundary=frame")
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+        return with_cors(response);
+    }
+
+    let mut receiver = runtime.subscribe_preview_frames();
+    let (mut sender, body) = Body::channel();
+
+    spawn(async move {
+        loop {
+            let frame = receiver.borrow().clone();
+            if let Some(frame) = frame {
+                let mut chunk = format!(
+                    "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                    frame.len()
+                )
+                .into_bytes();
+                chunk.extend_from_slice(&frame);
+                chunk.extend_from_slice(b"\r\n");
+                if sender.send_data(Bytes::from(chunk)).await.is_err() {
+                    break;
+                }
+            }
+
+            if receiver.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "multipart/x-mixed-replace; boundary=frame")
+        .body(body)
+        .unwrap_or_else(|_| Response::new(Body::empty()));
+    with_cors(response)
 }
 
 fn parse_range_header(

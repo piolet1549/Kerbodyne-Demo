@@ -41,6 +41,10 @@ export interface FlightAlertConfig {
   low_battery_warning_percent: number;
 }
 
+export interface VideoConfig {
+  auto_record_live: boolean;
+}
+
 export interface HudMetricState {
   tone: 'normal' | 'caution' | 'warning';
   color_hex?: string | null;
@@ -64,6 +68,7 @@ export interface AppConfig {
   aircraft_icon: AircraftIconConfig;
   track_display: TrackDisplayConfig;
   flight_alerts: FlightAlertConfig;
+  video: VideoConfig;
 }
 
 export interface OfflineRegionManifest {
@@ -152,6 +157,46 @@ export interface MissionSession {
   storage_bytes: number;
 }
 
+export interface TrackPointRecord {
+  lat: number;
+  lon: number;
+  recorded_at: string;
+  alt_msl_m?: number | null;
+  heading_deg?: number | null;
+  groundspeed_mps?: number | null;
+}
+
+export interface SessionVideoClip {
+  id: string;
+  session_id: string;
+  file_path: string;
+  started_at: string;
+  ended_at?: string | null;
+  duration_ms: number;
+  width: number;
+  height: number;
+  fps: number;
+  codec: string;
+  bytes: number;
+}
+
+export type VideoPreviewStatus =
+  | 'idle'
+  | 'waiting_for_stream'
+  | 'waiting_for_keyframe'
+  | 'live'
+  | 'recording'
+  | 'stale'
+  | 'error';
+
+export interface VideoPreviewState {
+  status: VideoPreviewStatus;
+  preview_url?: string | null;
+  recording_active: boolean;
+  current_clip_id?: string | null;
+  message?: string | null;
+}
+
 export interface ConnectionHealth {
   status: ConnectionStatus;
   port: number;
@@ -176,8 +221,10 @@ export interface AppSnapshot {
   alerts: AlertRecord[];
   system_statuses: SystemStatusRecord[];
   sessions: MissionSession[];
-  track: Array<[number, number]>;
+  track: TrackPointRecord[];
   review_frames: ReviewTelemetryFrame[];
+  review_video_clips: SessionVideoClip[];
+  video_preview: VideoPreviewState;
   raw_telemetry_packets: string[];
   warnings: string[];
 }

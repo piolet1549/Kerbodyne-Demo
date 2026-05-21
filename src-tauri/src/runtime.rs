@@ -3,6 +3,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -10,8 +11,11 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
-    sync::{Mutex, RwLock},
+    process::{Child, ChildStdout, Command},
+    sync::{watch, Mutex, RwLock},
     time::{sleep, Duration},
 };
 use uuid::Uuid;
@@ -25,8 +29,8 @@ use crate::{
         LEGACY_TELEMETRY_PORT, LegacyAlertPacket, LegacySystemStatusPacket,
         LegacyTelemetryPacket, MapAlertSector, MissionSession, OfflineRegionCatalog,
         OfflineRegionManifest, ReplayFrame, ReviewTelemetryFrame, RuntimeEvent,
-        RuntimeMode, SCHEMA_VERSION, SystemStatusPayload, SystemStatusRecord,
-        TelemetryPayload, WireEnvelope,
+        RuntimeMode, SCHEMA_VERSION, SessionVideoClip, SystemStatusPayload, SystemStatusRecord,
+        TelemetryPayload, TrackPointRecord, VideoPreviewState, VideoPreviewStatus, WireEnvelope,
     },
     offline_maps,
     server::{
@@ -41,6 +45,31 @@ const MAX_RECENT_MESSAGE_IDS: usize = 256;
 const MAX_WARNINGS: usize = 12;
 const MAX_SESSION_HISTORY: usize = 200;
 const MAX_RAW_TELEMETRY_PACKETS: usize = 160;
+const LIVE_VIDEO_RTP_PORT: u16 = 5600;
+const PREVIEW_VIDEO_PORT: u16 = 5602;
+const RECORD_VIDEO_PORT: u16 = 5603;
+const VIDEO_STALE_AFTER_SECS: i64 = 3;
+
+struct RecordingRunState {
+    clip_id: String,
+    session_id: String,
+    started_at: String,
+    temp_h264_path: PathBuf,
+    mp4_path: PathBuf,
+    child: Child,
+    writer_handle: tauri::async_runtime::JoinHandle<Result<u64, String>>,
+}
+
+#[derive(Default)]
+struct VideoRuntimeState {
+    ingest_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    preview_stdout_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    preview_child: Option<Child>,
+    recording: Option<RecordingRunState>,
+    stream_available: Arc<AtomicBool>,
+    last_packet_at: Option<DateTime<Utc>>,
+    last_preview_frame_at: Option<DateTime<Utc>>,
+}
 
 #[derive(Clone, Debug)]
 pub enum IngestSource {
@@ -90,9 +119,11 @@ pub struct AppRuntime {
     alerts: RwLock<Vec<AlertRecord>>,
     system_statuses: RwLock<Vec<SystemStatusRecord>>,
     sessions: RwLock<Vec<MissionSession>>,
-    track: RwLock<Vec<(f64, f64)>>,
+    track: RwLock<Vec<TrackPointRecord>>,
     session_has_armed_telemetry: RwLock<bool>,
     review_frames: RwLock<Vec<ReviewTelemetryFrame>>,
+    review_video_clips: RwLock<Vec<SessionVideoClip>>,
+    video_preview: RwLock<VideoPreviewState>,
     raw_telemetry_packets: RwLock<Vec<String>>,
     warnings: RwLock<Vec<String>>,
     recent_message_ids: Mutex<VecDeque<String>>,
@@ -100,6 +131,10 @@ pub struct AppRuntime {
     current_session_source: RwLock<Option<String>>,
     focused_session_id: RwLock<Option<String>>,
     active_tasks: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
+    preview_frame_sender: watch::Sender<Option<Vec<u8>>>,
+    video_runtime: Mutex<VideoRuntimeState>,
+    video_dir: PathBuf,
+    gstreamer_path: RwLock<Option<PathBuf>>,
 }
 
 impl AppRuntime {
@@ -111,6 +146,9 @@ impl AppRuntime {
         fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
         let media_dir = data_dir.join("alerts");
         fs::create_dir_all(&media_dir).map_err(|error| error.to_string())?;
+        let video_dir = data_dir.join("recordings");
+        fs::create_dir_all(&video_dir).map_err(|error| error.to_string())?;
+        let (preview_frame_sender, _) = watch::channel(None);
 
         let database = Database::open(&data_dir.join("kerbodyne.db"))?;
         let mut config = database.load_config()?.unwrap_or_default();
@@ -138,6 +176,8 @@ impl AppRuntime {
             track: RwLock::new(track),
             session_has_armed_telemetry: RwLock::new(false),
             review_frames: RwLock::new(Vec::new()),
+            review_video_clips: RwLock::new(Vec::new()),
+            video_preview: RwLock::new(VideoPreviewState::default()),
             raw_telemetry_packets: RwLock::new(Vec::new()),
             warnings: RwLock::new(Vec::new()),
             recent_message_ids: Mutex::new(VecDeque::new()),
@@ -145,6 +185,10 @@ impl AppRuntime {
             current_session_source: RwLock::new(None),
             focused_session_id: RwLock::new(focused_session_id),
             active_tasks: Mutex::new(Vec::new()),
+            preview_frame_sender,
+            video_runtime: Mutex::new(VideoRuntimeState::default()),
+            video_dir,
+            gstreamer_path: RwLock::new(None),
         }))
     }
 
@@ -152,6 +196,8 @@ impl AppRuntime {
         match spawn_offline_asset_server(self.clone()) {
             Ok(asset_origin) => {
                 *self.asset_server_origin.blocking_write() = asset_origin;
+                let preview_url = format!("{}/__preview__/live.mjpg", self.asset_server_origin.blocking_read().clone());
+                self.video_preview.blocking_write().preview_url = Some(preview_url);
             }
             Err(error) => {
                 eprintln!("Kerbodyne offline asset server failed to start: {error}");
@@ -165,7 +211,9 @@ impl AppRuntime {
         tauri::async_runtime::spawn(async move {
             loop {
                 sleep(Duration::from_secs(2)).await;
-                if runtime.refresh_connection_health().await {
+                let connection_changed = runtime.refresh_connection_health().await;
+                let video_changed = runtime.refresh_video_health().await;
+                if connection_changed || video_changed {
                     let _ = runtime.emit_snapshot(&app).await;
                 }
             }
@@ -186,6 +234,8 @@ impl AppRuntime {
             sessions: self.sessions.read().await.clone(),
             track: self.track.read().await.clone(),
             review_frames: self.review_frames.read().await.clone(),
+            review_video_clips: self.review_video_clips.read().await.clone(),
+            video_preview: self.video_preview.read().await.clone(),
             raw_telemetry_packets: self.raw_telemetry_packets.read().await.clone(),
             warnings: self.warnings.read().await.clone(),
         }
@@ -363,7 +413,8 @@ impl AppRuntime {
             })?;
 
         self.prepare_for_new_manual_stream(app).await?;
-        self.begin_session(DEFAULT_AIRCRAFT_ID, LEGACY_SOURCE_LABEL)
+        let session_id = self
+            .begin_session(DEFAULT_AIRCRAFT_ID, LEGACY_SOURCE_LABEL)
             .await?;
 
         let runtime = app.state::<Arc<AppRuntime>>().inner().clone();
@@ -388,8 +439,32 @@ impl AppRuntime {
             };
         }
 
+        if let Err(error) = self.start_video_subsystem(app, &session_id).await {
+            if !error.contains("Live video runtime unavailable") {
+                self.push_warning(app, error).await;
+            }
+        } else if self.config.read().await.video.auto_record_live {
+            if let Err(error) = self.start_video_recording(app).await {
+                self.push_warning(app, error).await;
+            }
+        }
+
         self.emit_snapshot(app).await?;
         Ok(())
+    }
+
+    pub async fn start_video_recording(&self, app: &AppHandle) -> Result<(), String> {
+        let session_id = self
+            .current_session_id
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "No active flight to record.".to_string())?;
+        self.start_video_recording_for_session(app, &session_id).await
+    }
+
+    pub async fn stop_video_recording(&self, app: &AppHandle) -> Result<(), String> {
+        self.stop_video_recording_internal(app).await
     }
 
     pub async fn focus_session(&self, app: &AppHandle, session_id: String) -> Result<(), String> {
@@ -589,6 +664,8 @@ impl AppRuntime {
             }
         }
 
+        self.stop_video_subsystem(app).await?;
+
         self.end_current_session().await?;
         *self.session_has_armed_telemetry.write().await = false;
         self.raw_telemetry_packets.write().await.clear();
@@ -608,7 +685,12 @@ impl AppRuntime {
             });
         }
         {
+            let preview_url = self.video_preview.read().await.preview_url.clone();
             *self.live_state.write().await = None;
+            *self.video_preview.write().await = VideoPreviewState {
+                preview_url,
+                ..VideoPreviewState::default()
+            };
         }
 
         if should_save {
@@ -639,12 +721,17 @@ impl AppRuntime {
             Some(id) => review_frames_from_replay(self.db.load_replay_events(id)?),
             None => Vec::new(),
         };
+        let review_video_clips = match session_id.as_deref() {
+            Some(id) => self.db.load_video_clips_for_session(id)?,
+            None => Vec::new(),
+        };
 
         *self.focused_session_id.write().await = session_id;
         *self.alerts.write().await = alerts;
         *self.system_statuses.write().await = system_statuses;
         *self.track.write().await = track;
         *self.review_frames.write().await = review_frames;
+        *self.review_video_clips.write().await = review_video_clips;
         if self.current_session_id.read().await.is_none() {
             *self.live_state.write().await = None;
         }
@@ -658,6 +745,7 @@ impl AppRuntime {
                 handle.abort();
             }
         }
+        let _ = self.stop_video_subsystem(app).await;
 
         self.end_current_session().await?;
         *self.live_state.write().await = None;
@@ -667,6 +755,7 @@ impl AppRuntime {
         self.system_statuses.write().await.clear();
         *self.session_has_armed_telemetry.write().await = false;
         self.review_frames.write().await.clear();
+        self.review_video_clips.write().await.clear();
         self.raw_telemetry_packets.write().await.clear();
         *self.mode.write().await = RuntimeMode::Idle;
         let port = self.config.read().await.listen_port;
@@ -702,6 +791,360 @@ impl AppRuntime {
         }
 
         false
+    }
+
+    async fn refresh_video_health(&self) -> bool {
+        let (last_packet_at, last_preview_frame_at, recording_active) = {
+            let runtime = self.video_runtime.lock().await;
+            (
+                runtime.last_packet_at,
+                runtime.last_preview_frame_at,
+                runtime.recording.is_some(),
+            )
+        };
+
+        let mut preview = self.video_preview.write().await;
+        let next_status = if matches!(preview.status, VideoPreviewStatus::Error | VideoPreviewStatus::Idle) {
+            preview.status.clone()
+        } else if let Some(last_packet) = last_packet_at {
+            if (Utc::now() - last_packet).num_seconds() > VIDEO_STALE_AFTER_SECS {
+                VideoPreviewStatus::Stale
+            } else if last_preview_frame_at.is_some() {
+                if recording_active {
+                    VideoPreviewStatus::Recording
+                } else {
+                    VideoPreviewStatus::Live
+                }
+            } else {
+                VideoPreviewStatus::WaitingForKeyframe
+            }
+        } else {
+            VideoPreviewStatus::WaitingForStream
+        };
+
+        if preview.status != next_status {
+            preview.status = next_status.clone();
+            preview.message = Some(video_status_message(&next_status).to_string());
+            return true;
+        }
+
+        false
+    }
+
+    pub fn subscribe_preview_frames(&self) -> watch::Receiver<Option<Vec<u8>>> {
+        self.preview_frame_sender.subscribe()
+    }
+
+    async fn start_video_subsystem(
+        &self,
+        app: &AppHandle,
+        _session_id: &str,
+    ) -> Result<(), String> {
+        self.stop_video_subsystem(app).await?;
+
+        let gst_launch = resolve_gstreamer_executable(app)
+            .ok_or_else(|| "Live video runtime unavailable: gst-launch-1.0.exe not found in bundled resources or PATH.".to_string())?;
+        *self.gstreamer_path.write().await = Some(gst_launch.clone());
+
+        let mut preview_child = spawn_preview_process(&gst_launch)?;
+        let preview_stdout = preview_child
+            .stdout
+            .take()
+            .ok_or_else(|| "Unable to capture preview process output.".to_string())?;
+
+        {
+            let preview_url = self.video_preview.read().await.preview_url.clone();
+            *self.video_preview.write().await = VideoPreviewState {
+                status: VideoPreviewStatus::WaitingForStream,
+                preview_url,
+                recording_active: false,
+                current_clip_id: None,
+                message: Some(video_status_message(&VideoPreviewStatus::WaitingForStream).to_string()),
+            };
+        }
+        let _ = self.preview_frame_sender.send(None);
+
+        let runtime_for_preview = app.state::<Arc<AppRuntime>>().inner().clone();
+        let app_for_preview = app.clone();
+        let preview_stdout_handle = tauri::async_runtime::spawn(async move {
+            let result = stream_preview_jpegs(runtime_for_preview.clone(), &app_for_preview, preview_stdout).await;
+            if let Err(error) = result {
+                runtime_for_preview
+                    .push_warning(&app_for_preview, format!("Live video preview failed: {error}"))
+                    .await;
+                {
+                    let mut preview = runtime_for_preview.video_preview.write().await;
+                    let preview_url = preview.preview_url.clone();
+                    *preview = VideoPreviewState {
+                        status: VideoPreviewStatus::Error,
+                        preview_url,
+                        recording_active: false,
+                        current_clip_id: None,
+                        message: Some("Live video preview failed".into()),
+                    };
+                }
+                let _ = runtime_for_preview.emit_snapshot(&app_for_preview).await;
+            }
+        });
+
+        let runtime_for_fanout = app.state::<Arc<AppRuntime>>().inner().clone();
+        let app_for_fanout = app.clone();
+        let ingest_handle = tauri::async_runtime::spawn(async move {
+            if let Err(error) = run_video_fanout(runtime_for_fanout.clone(), app_for_fanout.clone()).await {
+                runtime_for_fanout
+                    .push_warning(&app_for_fanout, format!("Live video ingest failed: {error}"))
+                    .await;
+                {
+                    let mut preview = runtime_for_fanout.video_preview.write().await;
+                    let preview_url = preview.preview_url.clone();
+                    *preview = VideoPreviewState {
+                        status: VideoPreviewStatus::Error,
+                        preview_url,
+                        recording_active: false,
+                        current_clip_id: None,
+                        message: Some("Live video ingest failed".into()),
+                    };
+                }
+                let _ = runtime_for_fanout.emit_snapshot(&app_for_fanout).await;
+            }
+        });
+
+        {
+            let mut runtime = self.video_runtime.lock().await;
+            runtime.preview_child = Some(preview_child);
+            runtime.preview_stdout_handle = Some(preview_stdout_handle);
+            runtime.ingest_handle = Some(ingest_handle);
+            runtime.last_packet_at = None;
+            runtime.last_preview_frame_at = None;
+            runtime.stream_available.store(false, Ordering::Relaxed);
+        }
+
+        self.emit_snapshot(app).await?;
+        Ok(())
+    }
+
+    async fn stop_video_subsystem(&self, app: &AppHandle) -> Result<(), String> {
+        let _ = self.stop_video_recording_internal(app).await;
+
+        let mut runtime = self.video_runtime.lock().await;
+        if let Some(handle) = runtime.ingest_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = runtime.preview_stdout_handle.take() {
+            handle.abort();
+        }
+        if let Some(child) = runtime.preview_child.as_mut() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        runtime.preview_child = None;
+        runtime.last_packet_at = None;
+        runtime.last_preview_frame_at = None;
+        runtime.stream_available.store(false, Ordering::Relaxed);
+        drop(runtime);
+
+        let preview_url = self.video_preview.read().await.preview_url.clone();
+        *self.video_preview.write().await = VideoPreviewState {
+            preview_url,
+            ..VideoPreviewState::default()
+        };
+        let _ = self.preview_frame_sender.send(None);
+        Ok(())
+    }
+
+    async fn start_video_recording_for_session(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let gst_launch = self
+            .gstreamer_path
+            .read()
+            .await
+            .clone()
+            .or_else(|| resolve_gstreamer_executable(app))
+            .ok_or_else(|| "Live video runtime unavailable: gst-launch-1.0.exe not found.".to_string())?;
+
+        let mut runtime = self.video_runtime.lock().await;
+        if runtime.recording.is_some() {
+            return Ok(());
+        }
+
+        let session_dir = self.video_dir.join(session_id);
+        fs::create_dir_all(&session_dir).map_err(|error| error.to_string())?;
+        let clip_id = Uuid::new_v4().to_string();
+        let started_at = Utc::now().to_rfc3339();
+        let temp_h264_path = session_dir.join(format!("{clip_id}.h264"));
+        let mp4_path = session_dir.join(format!("{clip_id}.mp4"));
+
+        let mut child = spawn_recording_process(&gst_launch)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Unable to capture recording process output.".to_string())?;
+        let temp_h264_path_for_writer = temp_h264_path.clone();
+        let writer_handle = tauri::async_runtime::spawn(async move {
+            let mut output = File::create(&temp_h264_path_for_writer)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut reader = stdout;
+            let mut bytes_written = 0u64;
+            let mut buffer = [0u8; 65536];
+            loop {
+                let read = reader.read(&mut buffer).await.map_err(|error| error.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                output
+                    .write_all(&buffer[..read])
+                    .await
+                    .map_err(|error| error.to_string())?;
+                bytes_written = bytes_written.saturating_add(read as u64);
+            }
+            output.flush().await.map_err(|error| error.to_string())?;
+            Ok(bytes_written)
+        });
+
+        runtime.recording = Some(RecordingRunState {
+            clip_id: clip_id.clone(),
+            session_id: session_id.to_string(),
+            started_at,
+            temp_h264_path,
+            mp4_path,
+            child,
+            writer_handle,
+        });
+        drop(runtime);
+
+        {
+            let mut preview = self.video_preview.write().await;
+            preview.recording_active = true;
+            preview.current_clip_id = Some(clip_id);
+            if matches!(preview.status, VideoPreviewStatus::Live | VideoPreviewStatus::WaitingForKeyframe) {
+                preview.status = VideoPreviewStatus::Recording;
+                preview.message = Some(video_status_message(&VideoPreviewStatus::Recording).into());
+            }
+        }
+        self.emit_snapshot(app).await?;
+        Ok(())
+    }
+
+    async fn stop_video_recording_internal(&self, app: &AppHandle) -> Result<(), String> {
+        let recording = {
+            let mut runtime = self.video_runtime.lock().await;
+            runtime.recording.take()
+        };
+
+        let Some(mut recording) = recording else {
+            return Ok(());
+        };
+
+        let _ = recording.child.kill().await;
+        let _ = recording.child.wait().await;
+        let bytes_written = match recording.writer_handle.await {
+            Ok(result) => result?,
+            Err(error) => return Err(error.to_string()),
+        };
+
+        let ended_at = Utc::now().to_rfc3339();
+        let duration_ms = (parse_timestamp(&ended_at).unwrap_or_else(|_| Utc::now())
+            - parse_timestamp(&recording.started_at).unwrap_or_else(|_| Utc::now()))
+            .num_milliseconds()
+            .max(0) as u64;
+
+        if bytes_written > 0 {
+            let gst_launch = self
+                .gstreamer_path
+                .read()
+                .await
+                .clone()
+                .or_else(|| resolve_gstreamer_executable(app))
+                .ok_or_else(|| "Live video runtime unavailable while finalizing recording.".to_string())?;
+            remux_h264_to_mp4(&gst_launch, &recording.temp_h264_path, &recording.mp4_path).await?;
+
+            let clip_bytes = fs::metadata(&recording.mp4_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(bytes_written);
+            let clip = SessionVideoClip {
+                id: recording.clip_id.clone(),
+                session_id: recording.session_id.clone(),
+                file_path: recording.mp4_path.to_string_lossy().to_string(),
+                started_at: recording.started_at.clone(),
+                ended_at: Some(ended_at),
+                duration_ms,
+                width: 1920,
+                height: 1080,
+                fps: 60.0,
+                codec: "h264".into(),
+                bytes: clip_bytes,
+            };
+            self.db.upsert_session_video_clip(&clip)?;
+            *self.sessions.write().await = self.db.load_sessions(MAX_SESSION_HISTORY)?;
+            if self.focused_session_id.read().await.as_deref() == Some(recording.session_id.as_str()) {
+                *self.review_video_clips.write().await =
+                    self.db.load_video_clips_for_session(&recording.session_id)?;
+            }
+        }
+
+        let _ = fs::remove_file(&recording.temp_h264_path);
+
+        {
+            let mut preview = self.video_preview.write().await;
+            preview.recording_active = false;
+            preview.current_clip_id = None;
+            if preview.status == VideoPreviewStatus::Recording {
+                preview.status = VideoPreviewStatus::Live;
+                preview.message = Some(video_status_message(&VideoPreviewStatus::Live).into());
+            }
+        }
+        self.emit_snapshot(app).await?;
+        Ok(())
+    }
+
+    async fn note_video_packet(&self, app: &AppHandle) {
+        let mut should_emit = false;
+        {
+            let mut runtime = self.video_runtime.lock().await;
+            runtime.last_packet_at = Some(Utc::now());
+            runtime.stream_available.store(true, Ordering::Relaxed);
+        }
+        {
+            let mut preview = self.video_preview.write().await;
+            if matches!(preview.status, VideoPreviewStatus::WaitingForStream | VideoPreviewStatus::Stale) {
+                preview.status = VideoPreviewStatus::WaitingForKeyframe;
+                preview.message = Some(video_status_message(&VideoPreviewStatus::WaitingForKeyframe).into());
+                should_emit = true;
+            }
+        }
+        if should_emit {
+            let _ = self.emit_snapshot(app).await;
+        }
+    }
+
+    async fn publish_preview_frame(&self, app: &AppHandle, frame: Vec<u8>) {
+        let mut should_emit = false;
+        let recording_active = {
+            let mut runtime = self.video_runtime.lock().await;
+            runtime.last_preview_frame_at = Some(Utc::now());
+            runtime.recording.is_some()
+        };
+        let _ = self.preview_frame_sender.send(Some(frame));
+        {
+            let mut preview = self.video_preview.write().await;
+            let next_status = if recording_active {
+                VideoPreviewStatus::Recording
+            } else {
+                VideoPreviewStatus::Live
+            };
+            if preview.status != next_status {
+                preview.status = next_status.clone();
+                preview.message = Some(video_status_message(&next_status).into());
+                should_emit = true;
+            }
+        }
+        if should_emit {
+            let _ = self.emit_snapshot(app).await;
+        }
     }
 
     pub async fn ingest_json(
@@ -1242,9 +1685,12 @@ impl AppRuntime {
     }
 
     async fn delete_session_internal(&self, session_id: &str) -> Result<(), String> {
-        let image_paths = self.db.delete_session(session_id)?;
+        let (image_paths, video_paths) = self.db.delete_session(session_id)?;
         for image_path in image_paths {
             let _ = fs::remove_file(&image_path);
+        }
+        for video_path in video_paths {
+            let _ = fs::remove_file(&video_path);
         }
 
         let mut sessions = self.sessions.write().await;
@@ -1288,11 +1734,26 @@ impl AppRuntime {
         let mut track = self.track.write().await;
         let should_store = track
             .last()
-            .map(|(last_lat, last_lon)| distance_m(*last_lat, *last_lon, lat, lon) >= 12.0)
+            .map(|last_point| {
+                let distance = distance_m(last_point.lat, last_point.lon, lat, lon);
+                let elapsed_s = parse_timestamp(recorded_at)
+                    .ok()
+                    .zip(parse_timestamp(&last_point.recorded_at).ok())
+                    .map(|(current, previous)| (current - previous).num_milliseconds().max(0) as f64 / 1000.0)
+                    .unwrap_or(0.0);
+                distance >= 1.5 || elapsed_s >= 1.0
+            })
             .unwrap_or(true);
 
         if should_store {
-            track.push((lat, lon));
+            track.push(TrackPointRecord {
+                lat,
+                lon,
+                recorded_at: recorded_at.to_string(),
+                alt_msl_m: Some(alt_msl_m),
+                heading_deg,
+                groundspeed_mps,
+            });
             self.db.insert_track_point(
                 session_id,
                 recorded_at,
@@ -1355,6 +1816,199 @@ impl AppRuntime {
         fs::write(&path, bytes).map_err(|error| error.to_string())?;
         Ok(Some(path.to_string_lossy().to_string()))
     }
+}
+
+fn video_status_message(status: &VideoPreviewStatus) -> &'static str {
+    match status {
+        VideoPreviewStatus::Idle => "Video idle",
+        VideoPreviewStatus::WaitingForStream => "Waiting for video stream",
+        VideoPreviewStatus::WaitingForKeyframe => "Waiting for keyframe",
+        VideoPreviewStatus::Live => "Live video",
+        VideoPreviewStatus::Recording => "Recording live video",
+        VideoPreviewStatus::Stale => "Video stream stale",
+        VideoPreviewStatus::Error => "Video unavailable",
+    }
+}
+
+fn resolve_gstreamer_executable(app: &AppHandle) -> Option<PathBuf> {
+    let bundled = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|path| path.join("gstreamer").join("bin").join("gst-launch-1.0.exe"));
+    if let Some(path) = bundled {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|path| path.join("gst-launch-1.0.exe"))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+fn spawn_preview_process(gst_launch: &PathBuf) -> Result<Child, String> {
+    Command::new(gst_launch)
+        .args([
+            "-q",
+            "udpsrc",
+            "port=5602",
+            "caps=application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000",
+            "!",
+            "rtpjitterbuffer",
+            "latency=15",
+            "drop-on-latency=true",
+            "do-lost=true",
+            "!",
+            "rtph264depay",
+            "!",
+            "h264parse",
+            "config-interval=-1",
+            "!",
+            "avdec_h264",
+            "!",
+            "videoconvert",
+            "!",
+            "videorate",
+            "!",
+            "video/x-raw,framerate=20/1",
+            "!",
+            "jpegenc",
+            "quality=80",
+            "!",
+            "fdsink",
+            "fd=1",
+            "sync=false",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())
+}
+
+fn spawn_recording_process(gst_launch: &PathBuf) -> Result<Child, String> {
+    Command::new(gst_launch)
+        .args([
+            "-q",
+            "udpsrc",
+            "port=5603",
+            "caps=application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000",
+            "!",
+            "rtpjitterbuffer",
+            "latency=15",
+            "drop-on-latency=true",
+            "do-lost=true",
+            "!",
+            "rtph264depay",
+            "!",
+            "h264parse",
+            "config-interval=-1",
+            "!",
+            "video/x-h264,stream-format=byte-stream,alignment=au",
+            "!",
+            "fdsink",
+            "fd=1",
+            "sync=false",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())
+}
+
+async fn remux_h264_to_mp4(
+    gst_launch: &PathBuf,
+    input_path: &PathBuf,
+    output_path: &PathBuf,
+) -> Result<(), String> {
+    let status = Command::new(gst_launch)
+        .args([
+            "-q",
+            "filesrc",
+            &format!("location={}", input_path.to_string_lossy()),
+            "!",
+            "h264parse",
+            "!",
+            "mp4mux",
+            "faststart=true",
+            "!",
+            "filesink",
+            &format!("location={}", output_path.to_string_lossy()),
+        ])
+        .status()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Unable to finalize recorded video clip.".into())
+    }
+}
+
+async fn run_video_fanout(runtime: Arc<AppRuntime>, app: AppHandle) -> Result<(), String> {
+    let inbound = UdpSocket::bind(("0.0.0.0", LIVE_VIDEO_RTP_PORT))
+        .await
+        .map_err(|error| error.to_string())?;
+    let outbound = UdpSocket::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| error.to_string())?;
+    let preview_target = format!("127.0.0.1:{PREVIEW_VIDEO_PORT}");
+    let recording_target = format!("127.0.0.1:{RECORD_VIDEO_PORT}");
+    let mut buffer = vec![0u8; 65536];
+
+    loop {
+        let (size, _) = inbound.recv_from(&mut buffer).await.map_err(|error| error.to_string())?;
+        runtime.note_video_packet(&app).await;
+        let packet = &buffer[..size];
+        let _ = outbound.send_to(packet, &preview_target).await;
+        let _ = outbound.send_to(packet, &recording_target).await;
+    }
+}
+
+async fn stream_preview_jpegs(
+    runtime: Arc<AppRuntime>,
+    app: &AppHandle,
+    mut stdout: ChildStdout,
+) -> Result<(), String> {
+    let mut read_buffer = [0u8; 65536];
+    let mut buffer = Vec::<u8>::new();
+
+    loop {
+        let read = stdout
+            .read(&mut read_buffer)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&read_buffer[..read]);
+
+        while let Some(frame) = extract_next_jpeg_frame(&mut buffer) {
+            runtime.publish_preview_frame(app, frame).await;
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_next_jpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let start = buffer
+        .windows(2)
+        .position(|window| window == [0xFF, 0xD8])?;
+    if start > 0 {
+        buffer.drain(0..start);
+    }
+    let end = buffer
+        .windows(2)
+        .position(|window| window == [0xFF, 0xD9])?;
+    if end + 2 <= buffer.len() {
+        let frame = buffer.drain(0..end + 2).collect::<Vec<_>>();
+        return Some(frame);
+    }
+    None
 }
 
 fn sanitize_extension(extension: &str) -> &str {

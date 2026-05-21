@@ -3068,3 +3068,316 @@ button {
   justify-content: center !important;
   z-index: 3 !important;
 }
+
+.flight-surface-layout {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+.flight-surface {
+  position: absolute;
+  overflow: hidden;
+}
+
+.flight-surface--hidden {
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.flight-surface--dominant {
+  inset: 0;
+}
+
+.flight-surface--corner {
+  right: 18px;
+  bottom: 18px;
+  width: min(620px, 50vw);
+  height: min(348px, 36vw);
+  border: 1px solid var(--panel-border);
+  border-radius: 22px;
+  background: rgba(6, 6, 6, 0.96);
+  box-shadow: var(--shadow);
+  z-index: 6;
+}
+
+.flight-surface--corner .map-stage,
+.flight-surface--corner .map-canvas,
+.flight-surface--corner .live-video-pane,
+.flight-surface--corner .live-video-pane__image,
+.flight-surface--corner .live-video-pane__empty {
+  width: 100%;
+  height: 100%;
+}
+
+.flight-surface--corner .map-stage,
+.flight-surface--corner .live-video-pane {
+  border-radius: inherit;
+}
+
+.flight-surface__swap-hitbox {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.live-video-pane {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+  border: none;
+  background:
+    radial-gradient(circle at center, rgba(255, 255, 255, 0.08), transparent 52%),
+    #020202;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.live-video-pane__image,
+.live-video-pane__empty {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.live-video-pane__image {
+  object-fit: cover;
+  background: #020202;
+}
+
+.live-video-pane__empty {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent 60%),
+    #020202;
+}
+
+.live-video-pane__overlay {
+  position: absolute;
+  inset: auto 14px 14px 14px;
+  display: flex;
+  justify-content: flex-start;
+  pointer-events: none;
+}
+
+.live-video-pane__overlay--centered {
+  inset: 50% 18px auto 18px;
+  justify-content: center;
+  transform: translateY(-50%);
+}
+
+.live-video-pane__status {
+  display: inline-flex;
+  align-items: center;
+  max-width: min(360px, 100%);
+  padding: 10px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  background: rgba(6, 6, 6, 0.88);
+  box-shadow: var(--shadow);
+  color: #f3f3f3;
+  font-size: 0.84rem;
+  letter-spacing: 0.02em;
+}
+
+.live-video-pane__overlay--centered .live-video-pane__status {
+  padding: 12px 18px;
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+.live-video-pane__status--recording {
+  border-color: rgba(255, 123, 69, 0.45);
+  color: #ffd6c8;
+}
+
+.live-video-pane__status--stale,
+.live-video-pane__status--error {
+  border-color: rgba(255, 123, 69, 0.45);
+  color: #ffd6c8;
+}
+
+.flight-detections-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.flight-detections-button__count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.08);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.flight-detections-button--flash {
+  animation: flight-detections-flash 0.95s ease-in-out infinite;
+}
+
+.flight-detections-button--empty .flight-detections-button__count {
+  opacity: 0.72;
+}
+
+.flight-notification__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.flight-notification--interactive {
+  cursor: pointer;
+}
+
+.alert-detail-modal {
+  position: fixed;
+  inset: 50% auto auto 50%;
+  z-index: 50;
+  transform: translate(-50%, -50%);
+}
+
+.alert-detail-modal .alert-detail-card {
+  position: static;
+  right: auto;
+  bottom: auto;
+  width: min(420px, calc(100vw - 36px));
+}
+
+.replay-timeline__header {
+  position: relative;
+  min-height: 44px;
+}
+
+.replay-timeline__recordings-button {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.review-video-modal {
+  width: min(1080px, calc(100vw - 32px));
+}
+
+.review-video-modal__body {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr);
+  gap: 16px;
+  min-height: min(68vh, 620px);
+}
+
+.review-video-modal__clips {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.review-video-modal__clip {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.review-video-modal__clip--active {
+  border-color: var(--selected-border);
+  background: var(--selected-bg);
+}
+
+.review-video-modal__clip span {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.review-video-modal__player {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.03);
+  overflow: hidden;
+}
+
+.review-video-modal__video {
+  width: 100%;
+  height: 100%;
+  min-height: min(58vh, 520px);
+  background: #000;
+}
+
+.review-video-modal__empty {
+  color: var(--muted);
+}
+
+@keyframes flight-detections-flash {
+  0%,
+  100% {
+    border-color: rgba(255, 166, 79, 0.58);
+    box-shadow: 0 0 0 rgba(255, 166, 79, 0);
+  }
+  50% {
+    border-color: rgba(255, 108, 96, 0.9);
+    box-shadow: 0 0 18px rgba(255, 108, 96, 0.28);
+  }
+}
+
+@media (max-width: 900px) {
+  .flight-surface--corner {
+    width: min(520px, 56vw);
+    height: min(308px, 38vw);
+  }
+
+  .review-video-modal__body {
+    grid-template-columns: 1fr;
+    min-height: auto;
+  }
+
+  .replay-timeline__recordings-button {
+    position: static;
+    transform: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .flight-surface--corner {
+    right: 12px;
+    bottom: 12px;
+    width: min(56vw, 300px);
+    height: min(34vw, 184px);
+    border-radius: 18px;
+  }
+
+  .live-video-pane__overlay {
+    inset: auto 10px 10px 10px;
+  }
+
+  .review-video-modal__video {
+    min-height: 280px;
+  }
+}

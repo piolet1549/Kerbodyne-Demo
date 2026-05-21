@@ -12,9 +12,11 @@ interface ReplayTimelineProps {
   selectedIndex: number;
   markers: ReplayTimelineMarker[];
   selectedMarkerId?: string | null;
+  hasRecordings?: boolean;
   onChange: (index: number) => void;
   onSelectMarker: (markerId: string, index: number) => void;
   onRenameFlightName: (name: string) => void;
+  onOpenRecordings?: () => void;
 }
 
 function formatElapsed(milliseconds: number) {
@@ -30,9 +32,11 @@ export function ReplayTimeline({
   selectedIndex,
   markers,
   selectedMarkerId,
+  hasRecordings,
   onChange,
   onSelectMarker,
-  onRenameFlightName
+  onRenameFlightName,
+  onOpenRecordings
 }: ReplayTimelineProps) {
   const [draftFlightName, setDraftFlightName] = useState(flightName);
 
@@ -86,6 +90,15 @@ export function ReplayTimeline({
           }}
           aria-label="Flight name"
         />
+        {hasRecordings && onOpenRecordings ? (
+          <button
+            type="button"
+            className="secondary-button secondary-button--muted replay-timeline__recordings-button"
+            onClick={onOpenRecordings}
+          >
+            View recordings
+          </button>
+        ) : null}
       </div>
 
       <div

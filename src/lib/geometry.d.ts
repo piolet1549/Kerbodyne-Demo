@@ -1,4 +1,4 @@
-import type { AircraftLiveState, AlertRecord } from './types';
+import type { AircraftLiveState, AlertRecord, TrackPointRecord } from './types';
 
 export function buildAlertSectorsGeoJson(
   alerts: AlertRecord[],
@@ -6,7 +6,8 @@ export function buildAlertSectorsGeoJson(
 ): any;
 
 export function buildTrackGeoJson(
-  track: Array<[number, number]>
+  track: TrackPointRecord[],
+  staleAfterSeconds?: number
 ): any;
 
 export function buildAlertsGeoJson(

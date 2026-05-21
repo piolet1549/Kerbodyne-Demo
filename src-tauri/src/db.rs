@@ -3,7 +3,8 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use crate::models::{
-    AlertRecord, AppConfig, MapAlertSector, MissionSession, ReplayFrame, SystemStatusRecord,
+    AlertRecord, AppConfig, MapAlertSector, MissionSession, ReplayFrame, SessionVideoClip,
+    SystemStatusRecord, TrackPointRecord,
 };
 
 pub struct Database {
@@ -95,6 +96,20 @@ impl Database {
                     heading_deg REAL,
                     extras_json TEXT NOT NULL,
                     raw_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS session_video_clips (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    width INTEGER NOT NULL DEFAULT 0,
+                    height INTEGER NOT NULL DEFAULT 0,
+                    fps REAL NOT NULL DEFAULT 0,
+                    codec TEXT NOT NULL DEFAULT 'h264',
+                    bytes INTEGER NOT NULL DEFAULT 0
                 );
                 "#,
             )
@@ -441,11 +456,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn load_track(&self, session_id: &str) -> Result<Vec<(f64, f64)>, String> {
+    pub fn load_track(&self, session_id: &str) -> Result<Vec<TrackPointRecord>, String> {
         let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
         let mut statement = connection
             .prepare(
-                "SELECT lat, lon
+                "SELECT recorded_at, lat, lon, alt_msl_m, heading_deg, groundspeed_mps
                  FROM track_points
                  WHERE session_id = ?1
                  ORDER BY id ASC",
@@ -453,7 +468,16 @@ impl Database {
             .map_err(|error| error.to_string())?;
 
         let rows = statement
-            .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([session_id], |row| {
+                Ok(TrackPointRecord {
+                    recorded_at: row.get(0)?,
+                    lat: row.get(1)?,
+                    lon: row.get(2)?,
+                    alt_msl_m: row.get(3)?,
+                    heading_deg: row.get(4)?,
+                    groundspeed_mps: row.get(5)?,
+                })
+            })
             .map_err(|error| error.to_string())?;
 
         rows.collect::<Result<Vec<_>, _>>()
@@ -499,7 +523,79 @@ impl Database {
             .map_err(|error| error.to_string())
     }
 
-    pub fn delete_session(&self, session_id: &str) -> Result<Vec<String>, String> {
+    pub fn upsert_session_video_clip(&self, clip: &SessionVideoClip) -> Result<(), String> {
+        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        connection
+            .execute(
+                "INSERT INTO session_video_clips (
+                    id, session_id, file_path, started_at, ended_at, duration_ms, width, height, fps, codec, bytes
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    file_path = excluded.file_path,
+                    started_at = excluded.started_at,
+                    ended_at = excluded.ended_at,
+                    duration_ms = excluded.duration_ms,
+                    width = excluded.width,
+                    height = excluded.height,
+                    fps = excluded.fps,
+                    codec = excluded.codec,
+                    bytes = excluded.bytes",
+                params![
+                    &clip.id,
+                    &clip.session_id,
+                    &clip.file_path,
+                    &clip.started_at,
+                    &clip.ended_at,
+                    clip.duration_ms as i64,
+                    clip.width as i64,
+                    clip.height as i64,
+                    clip.fps,
+                    &clip.codec,
+                    clip.bytes as i64
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn load_video_clips_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionVideoClip>, String> {
+        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, session_id, file_path, started_at, ended_at, duration_ms, width, height, fps, codec, bytes
+                 FROM session_video_clips
+                 WHERE session_id = ?1
+                 ORDER BY started_at ASC",
+            )
+            .map_err(|error| error.to_string())?;
+
+        let rows = statement
+            .query_map([session_id], |row| {
+                Ok(SessionVideoClip {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    file_path: row.get(2)?,
+                    started_at: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    duration_ms: row.get::<_, i64>(5)?.max(0) as u64,
+                    width: row.get::<_, i64>(6)?.max(0) as u32,
+                    height: row.get::<_, i64>(7)?.max(0) as u32,
+                    fps: row.get(8)?,
+                    codec: row.get(9)?,
+                    bytes: row.get::<_, i64>(10)?.max(0) as u64,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> Result<(Vec<String>, Vec<String>), String> {
         let mut connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
         let transaction = connection.transaction().map_err(|error| error.to_string())?;
 
@@ -507,6 +603,16 @@ impl Database {
             .prepare("SELECT image_path FROM alerts WHERE session_id = ?1 AND image_path IS NOT NULL")
             .map_err(|error| error.to_string())?;
         let image_paths = statement
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+
+        let mut statement = transaction
+            .prepare("SELECT file_path FROM session_video_clips WHERE session_id = ?1")
+            .map_err(|error| error.to_string())?;
+        let video_paths = statement
             .query_map([session_id], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
@@ -529,11 +635,14 @@ impl Database {
             .execute("DELETE FROM replay_events WHERE session_id = ?1", params![session_id])
             .map_err(|error| error.to_string())?;
         transaction
+            .execute("DELETE FROM session_video_clips WHERE session_id = ?1", params![session_id])
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
             .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
 
-        Ok(image_paths)
+        Ok((image_paths, video_paths))
     }
 
 }
@@ -572,12 +681,30 @@ fn session_storage_bytes(connection: &Connection, session_id: &str) -> Result<u6
         }
     }
 
+    let mut video_bytes = 0u64;
+    let mut statement = connection.prepare(
+        "SELECT file_path, bytes FROM session_video_clips WHERE session_id = ?1",
+    )?;
+    let video_entries = statement.query_map([session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for entry in video_entries {
+        let (file_path, bytes) = entry?;
+        if bytes > 0 {
+            video_bytes = video_bytes.saturating_add(bytes as u64);
+        } else if let Ok(metadata) = std::fs::metadata(&file_path) {
+            video_bytes = video_bytes.saturating_add(metadata.len());
+        }
+    }
+
     let db_bytes = replay_bytes
         .saturating_add(alert_json_bytes)
         .saturating_add(status_bytes)
         .saturating_add(track_bytes);
 
-    Ok((db_bytes.max(0) as u64).saturating_add(image_bytes))
+    Ok((db_bytes.max(0) as u64)
+        .saturating_add(image_bytes)
+        .saturating_add(video_bytes))
 }
 
 fn ignore_duplicate_column(result: Result<usize, SqlError>) -> Result<(), String> {

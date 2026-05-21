@@ -2,7 +2,9 @@ import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState
 import { AlertDetail } from './components/AlertDetail';
 import { FlightSavesPanel } from './components/FlightSavesPanel';
 import { LiveMap } from './components/LiveMap';
+import { LiveVideoPane } from './components/LiveVideoPane';
 import { ReplayTimeline } from './components/ReplayTimeline';
+import { ReviewVideoModal } from './components/ReviewVideoModal';
 import { SettingsDrawer } from './components/SettingsPanel';
 import { TelemetryHud } from './components/TelemetryHud';
 import {
@@ -15,17 +17,13 @@ import {
   listOfflineRegions,
   listenToRuntimeEvents,
   selectOfflineRegion,
+  startVideoRecording,
   startLiveIngest,
+  stopVideoRecording,
   updateSessionDetails,
   updateConfig
 } from './lib/runtime';
-import type {
-  AlertRecord,
-  AppSnapshot,
-  HudMetricState,
-  OfflineRegionCatalog,
-  RuntimeEvent
-} from './lib/types';
+import type { AlertRecord, AppSnapshot, HudMetricState, OfflineRegionCatalog, RuntimeEvent } from './lib/types';
 
 type OverlayPanel = 'flights' | 'settings' | null;
 type FlightNotificationSeverity = 'info' | 'caution' | 'warning';
@@ -36,6 +34,9 @@ interface FlightNotificationRecord {
   severity: FlightNotificationSeverity;
   persistent: boolean;
   placement?: 'default' | 'review-above-replay';
+  actionLabel?: string;
+  dismissLabel?: string;
+  actionType?: 'open-detections' | 'dismiss-detection';
   closing?: boolean;
 }
 
@@ -73,6 +74,9 @@ const emptySnapshot: AppSnapshot = {
       low_speed_warning_mps: 9,
       high_altitude_warning_m: 120,
       low_battery_warning_percent: 20
+    },
+    video: {
+      auto_record_live: false
     }
   },
   mode: 'idle',
@@ -91,6 +95,14 @@ const emptySnapshot: AppSnapshot = {
   sessions: [],
   track: [],
   review_frames: [],
+  review_video_clips: [],
+  video_preview: {
+    status: 'idle',
+    preview_url: null,
+    recording_active: false,
+    current_clip_id: null,
+    message: null
+  },
   raw_telemetry_packets: [],
   warnings: []
 };
@@ -230,10 +242,14 @@ export function App() {
   const [selectedAlertId, setSelectedAlertId] = useState<string | null>(null);
   const [activePanel, setActivePanel] = useState<OverlayPanel>(null);
   const [alertDetailVisible, setAlertDetailVisible] = useState(false);
+  const [activeFlightLayout, setActiveFlightLayout] = useState<'video-dominant' | 'map-dominant'>(
+    'video-dominant'
+  );
   const [bannerMessage, setBannerMessage] = useState<string | null>(null);
   const [stopFlightOpen, setStopFlightOpen] = useState(false);
   const [rawTelemetryOpen, setRawTelemetryOpen] = useState(false);
   const [expandedHudOpen, setExpandedHudOpen] = useState(false);
+  const [reviewVideoOpen, setReviewVideoOpen] = useState(false);
   const [deleteFlightTarget, setDeleteFlightTarget] = useState<{
     id: string;
     name: string;
@@ -242,12 +258,19 @@ export function App() {
   const [stopFlightName, setStopFlightName] = useState('');
   const [stopFlightDescription, setStopFlightDescription] = useState('');
   const [reviewFrameIndex, setReviewFrameIndex] = useState<number | null>(null);
+  const [lastIdleMapView, setLastIdleMapView] = useState<{
+    center: [number, number];
+    zoom: number;
+    bearing: number;
+  } | null>(null);
   const [flightNotifications, setFlightNotifications] = useState<FlightNotificationRecord[]>([]);
+  const [unacknowledgedDetectionIds, setUnacknowledgedDetectionIds] = useState<string[]>([]);
   const [lowSpeedMonitoringEnabled, setLowSpeedMonitoringEnabled] = useState(false);
   const clearBannerRef = useRef<number | null>(null);
   const previousAlertCountRef = useRef(0);
   const previousFocusedSessionIdRef = useRef<string | null>(null);
   const previousActiveSessionIdRef = useRef<string | null>(null);
+  const previousActiveFlightRef = useRef(false);
   const lowSpeedLandingTimerRef = useRef<number | null>(null);
   const cpuThrottleTimerRef = useRef<number | null>(null);
 
@@ -319,7 +342,18 @@ export function App() {
       .flatMap((frame) => {
         const lat = frame.live_state.lat;
         const lon = frame.live_state.lon;
-        return hasValidPosition(lat, lon) ? ([[lat, lon]] as [number, number][]) : [];
+        return hasValidPosition(lat, lon)
+          ? [
+              {
+                lat: lat as number,
+                lon: lon as number,
+                recorded_at: frame.recorded_at,
+                alt_msl_m: frame.live_state.alt_msl_m ?? null,
+                heading_deg: frame.live_state.heading_deg ?? null,
+                groundspeed_mps: frame.live_state.groundspeed_mps ?? null
+              }
+            ]
+          : [];
       });
   }, [effectiveReviewFrameIndex, reviewFrames, reviewMode, snapshot.track]);
   const selectedAlert = useMemo<AlertRecord | null>(
@@ -341,7 +375,7 @@ export function App() {
     }
     const lastTrackPoint =
       displayTrack[displayTrack.length - 1] ?? snapshot.track[snapshot.track.length - 1];
-    return lastTrackPoint ?? null;
+    return lastTrackPoint ? [lastTrackPoint.lat, lastTrackPoint.lon] : null;
   }, [displayTrack, reviewMode, selectedReviewFrame, snapshot.track]);
   const mapFocusKey = reviewMode
     ? `${snapshot.focused_session_id ?? 'none'}:${effectiveReviewFrameIndex ?? 'none'}`
@@ -386,6 +420,9 @@ export function App() {
           existing.severity === notification.severity &&
           existing.persistent === notification.persistent &&
           existing.placement === notification.placement &&
+          existing.actionLabel === notification.actionLabel &&
+          existing.dismissLabel === notification.dismissLabel &&
+          existing.actionType === notification.actionType &&
           !existing.closing
         ) {
         return current;
@@ -400,6 +437,21 @@ export function App() {
         }, 5000);
       }
     }
+
+  function handleFlightNotificationAction(notification: FlightNotificationRecord, action: 'open' | 'dismiss') {
+    if (notification.actionType === 'open-detections' && action === 'open') {
+      setUnacknowledgedDetectionIds([]);
+      openDetectionPanel();
+      dismissFlightNotification(notification.id);
+      return;
+    }
+    if (notification.actionType === 'dismiss-detection') {
+      if (action === 'dismiss' || action === 'open') {
+        setUnacknowledgedDetectionIds([]);
+        dismissFlightNotification(notification.id);
+      }
+    }
+  }
 
   function showBanner(message: string) {
     setBannerMessage(message);
@@ -472,14 +524,33 @@ export function App() {
       startTransition(() => {
         if (event.type === 'snapshot') {
           setSnapshot(event.snapshot);
+          const previousAlertCount = previousAlertCountRef.current;
+          const newAlertCount = Math.max(0, event.snapshot.alerts.length - previousAlertCount);
+          const newAlerts = newAlertCount > 0 ? event.snapshot.alerts.slice(0, newAlertCount) : [];
+          const mostRecentNewAlert = newAlerts[0] ?? null;
+
+          if (Boolean(event.snapshot.active_session_id) && mostRecentNewAlert) {
+            setUnacknowledgedDetectionIds((current) => {
+              const next = new Set(current);
+              newAlerts.forEach((alert) => next.add(alert.id));
+              return [...next];
+            });
+            upsertFlightNotification({
+              id: 'active-flight-detection',
+              message: `${mostRecentNewAlert.class_label} detection received`,
+              severity: 'warning',
+              persistent: true,
+              actionLabel: 'Open',
+              dismissLabel: 'Dismiss',
+              actionType: 'open-detections'
+            });
+          }
+
           setSelectedAlertId((current) => {
-            const mostRecent = findMostRecentAlert(event.snapshot.alerts);
-            const hasNewAlert =
-              Boolean(event.snapshot.active_session_id) &&
-              event.snapshot.alerts.length > previousAlertCountRef.current;
             previousAlertCountRef.current = event.snapshot.alerts.length;
 
-            if (hasNewAlert && mostRecent) {
+            const mostRecent = findMostRecentAlert(event.snapshot.alerts);
+            if (!Boolean(event.snapshot.active_session_id) && mostRecent && event.snapshot.alerts.length > previousAlertCount) {
               setAlertDetailVisible(true);
               return mostRecent.id;
             }
@@ -494,6 +565,7 @@ export function App() {
 
           if (event.snapshot.alerts.length === 0) {
             setAlertDetailVisible(false);
+            setUnacknowledgedDetectionIds([]);
           }
         }
         if (event.type === 'warning') {
@@ -578,8 +650,37 @@ export function App() {
   const showTelemetryHud = activeFlight || reviewMode;
   const panelOpen = activePanel === 'flights';
   const hasDetections = hasFlightContext && deferredAlerts.length > 0;
+  const activeFlightHasDetections = activeFlight && deferredAlerts.length > 0;
+  const activeFlightDetectionFlash = activeFlight && unacknowledgedDetectionIds.length > 0;
+  const reviewHasVideoClips = reviewMode && snapshot.review_video_clips.length > 0;
   const flightHasReceivedConnection = Boolean(snapshot.connection.last_packet_at);
   const flightHasArmedTelemetry = snapshot.active_session_has_armed_telemetry;
+  const videoDominant = activeFlight && activeFlightLayout === 'video-dominant';
+  const mapIsCornerPane = activeFlight && videoDominant;
+  const videoIsCornerPane = activeFlight && !videoDominant;
+  const toolbarVideoMode = activeFlight && videoDominant;
+  const videoPreview = snapshot.video_preview;
+  const feedUnavailable =
+    videoPreview.status === 'idle' ||
+    videoPreview.status === 'waiting_for_stream' ||
+    videoPreview.status === 'waiting_for_keyframe' ||
+    videoPreview.status === 'error';
+  const recordButtonDisabled = !videoPreview.recording_active && feedUnavailable;
+  useEffect(() => {
+    if (activeFlight && !previousActiveFlightRef.current) {
+      setActiveFlightLayout('video-dominant');
+      setReviewVideoOpen(false);
+      setAlertDetailVisible(false);
+      setSelectedAlertId(null);
+      setUnacknowledgedDetectionIds([]);
+    }
+    if (!activeFlight && previousActiveFlightRef.current) {
+      setActiveFlightLayout('video-dominant');
+      setUnacknowledgedDetectionIds([]);
+      dismissFlightNotification('active-flight-detection');
+    }
+    previousActiveFlightRef.current = activeFlight;
+  }, [activeFlight]);
   useEffect(() => {
     if (activeFlight && activePanel === 'flights') {
       setActivePanel(null);
@@ -1032,6 +1133,8 @@ export function App() {
     if (!firstAlert) {
       return;
     }
+    setUnacknowledgedDetectionIds([]);
+    dismissFlightNotification('active-flight-detection');
     handleSelectAlert(firstAlert.id);
   }
 
@@ -1052,6 +1155,7 @@ export function App() {
     setSelectedAlertId(null);
     setAlertDetailVisible(false);
     setReviewFrameIndex(null);
+    setReviewVideoOpen(false);
     void runCommand(async () => {
       await focusSession(sessionId);
       setActivePanel(null);
@@ -1061,6 +1165,7 @@ export function App() {
   function handleClearReview() {
     setSelectedAlertId(null);
     setAlertDetailVisible(false);
+    setReviewVideoOpen(false);
     void runCommand(() => clearFocusedSession());
   }
 
@@ -1095,6 +1200,26 @@ export function App() {
     });
   }
 
+  function swapFlightSurfaces() {
+    if (!activeFlight) {
+      return;
+    }
+    setActiveFlightLayout((current) =>
+      current === 'video-dominant' ? 'map-dominant' : 'video-dominant'
+    );
+  }
+
+  async function handleToggleRecording() {
+    if (!activeFlight) {
+      return;
+    }
+    if (snapshot.video_preview.recording_active) {
+      await stopVideoRecording();
+      return;
+    }
+    await startVideoRecording();
+  }
+
   async function handleExportSession(sessionId: string) {
     const exportPath = await exportSessionTelemetry(sessionId);
     const exportFileName =
@@ -1114,28 +1239,82 @@ export function App() {
   const baseNotifications = flightNotifications.filter(
     (notification) => notification.placement !== 'review-above-replay' || !reviewMode
   );
+  const mapElement = (
+    <LiveMap
+      config={snapshot.config}
+      liveState={displayLiveState}
+      track={displayTrack}
+      alerts={deferredAlerts}
+      selectedAlertId={selectedAlertId}
+      enabledRegions={mapRegionReady ? enabledRegions : []}
+      selectedRegion={mapRegionReady ? selectedRegion : null}
+      assetOrigin={mapRegionReady ? offlineCatalog.asset_origin : null}
+      mapMode={mapMode}
+      activeFlight={activeFlight}
+      reviewMode={reviewMode}
+      linkPulseActive={linkPulseActive}
+      compactFlightView={mapIsCornerPane}
+      forceFollow={mapIsCornerPane}
+      preferredInitialView={activeFlight ? lastIdleMapView : null}
+      measureToolbarHost={!mapIsCornerPane ? measureToolbarHostRef.current : null}
+      focusTarget={mapFocusTarget}
+      focusKey={mapFocusKey}
+      onViewStateChange={(view) => {
+        if (!activeFlight) {
+          setLastIdleMapView(view);
+        }
+      }}
+      onSelectAlert={handleSelectAlert}
+    />
+  );
 
   return (
     <div className="console-shell">
-      <div className="map-shell">
-        <LiveMap
-          config={snapshot.config}
-          liveState={displayLiveState}
-          track={displayTrack}
-          alerts={deferredAlerts}
-          selectedAlertId={selectedAlertId}
-          enabledRegions={mapRegionReady ? enabledRegions : []}
-          selectedRegion={mapRegionReady ? selectedRegion : null}
-          assetOrigin={mapRegionReady ? offlineCatalog.asset_origin : null}
-          mapMode={mapMode}
-          activeFlight={activeFlight}
-          reviewMode={reviewMode}
-          linkPulseActive={linkPulseActive}
-          measureToolbarHost={measureToolbarHostRef.current}
-          focusTarget={mapFocusTarget}
-          focusKey={mapFocusKey}
-          onSelectAlert={handleSelectAlert}
-        />
+      <div className={`map-shell ${activeFlight ? 'map-shell--flight-mode' : ''}`}>
+        <div
+          className={`flight-surface-layout ${
+            activeFlight
+              ? videoDominant
+                ? 'flight-surface-layout--video-dominant'
+                : 'flight-surface-layout--map-dominant'
+              : 'flight-surface-layout--idle'
+          }`}
+        >
+          <div
+            className={`flight-surface flight-surface--video ${
+              activeFlight
+                ? videoDominant
+                  ? 'flight-surface--dominant'
+                  : 'flight-surface--corner'
+                : 'flight-surface--hidden'
+            }`}
+          >
+            <LiveVideoPane
+              video={videoPreview}
+              dominant={videoDominant}
+              onSwap={swapFlightSurfaces}
+            />
+          </div>
+          <div
+            className={`flight-surface flight-surface--map ${
+              activeFlight
+                ? videoDominant
+                  ? 'flight-surface--corner'
+                  : 'flight-surface--dominant'
+                : 'flight-surface--dominant'
+            }`}
+          >
+            {mapElement}
+            {mapIsCornerPane ? (
+              <button
+                type="button"
+                className="flight-surface__swap-hitbox"
+                onClick={swapFlightSurfaces}
+                aria-label="Show map in main view"
+              />
+            ) : null}
+          </div>
+        </div>
 
         {bannerMessage ? (
           <div className="warning-banner warning-banner--overlay">
@@ -1156,9 +1335,44 @@ export function App() {
                 key={notification.id}
                 className={`flight-notification flight-notification--${notification.severity} ${
                   notification.closing ? 'flight-notification--closing' : ''
+                } ${
+                  notification.actionType === 'open-detections'
+                    ? 'flight-notification--interactive'
+                    : ''
                 }`}
+                onClick={() => {
+                  if (notification.actionType === 'open-detections') {
+                    handleFlightNotificationAction(notification, 'open');
+                  }
+                }}
               >
                 <span>{notification.message}</span>
+                {notification.actionLabel || notification.dismissLabel ? (
+                  <div className="flight-notification__actions">
+                    {notification.actionLabel ? (
+                      <button
+                        className="secondary-button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleFlightNotificationAction(notification, 'open');
+                        }}
+                      >
+                        {notification.actionLabel}
+                      </button>
+                    ) : null}
+                    {notification.dismissLabel ? (
+                      <button
+                        className="secondary-button secondary-button--muted"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleFlightNotificationAction(notification, 'dismiss');
+                        }}
+                      >
+                        {notification.dismissLabel}
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>
@@ -1205,70 +1419,101 @@ export function App() {
             >
               {reviewMode ? 'End Review' : activeFlight ? 'End flight' : 'Start flight'}
             </button>
+            {activeFlight ? (
+              <>
+                <button
+                  className={`secondary-button flight-detections-button ${
+                    activeFlightDetectionFlash ? 'flight-detections-button--flash' : ''
+                  } ${!activeFlightHasDetections ? 'flight-detections-button--empty' : ''}`}
+                  onClick={openDetectionPanel}
+                  disabled={!activeFlightHasDetections}
+                >
+                  <span>Detections</span>
+                  <span className="flight-detections-button__count">{deferredAlerts.length}</span>
+                </button>
+              </>
+            ) : null}
           </div>
 
           <div className="map-toolbar__group">
-            <div className="map-mode-toggle" role="tablist" aria-label="Basemap mode">
+            {activeFlight ? (
               <button
-                className={`secondary-button ${mapMode === 'street_dark' ? 'secondary-button--active' : ''}`}
-                onClick={() => handleMapModeChange('street_dark')}
-              >
-                Street
-              </button>
-              <button
-                className={`secondary-button ${mapMode === 'satellite' ? 'secondary-button--active' : ''}`}
-                onClick={() => handleMapModeChange('satellite')}
-              >
-                Satellite
-              </button>
-            </div>
-            <div ref={regionMenuRef} className="toolbar-select">
-              <button
-                className={`secondary-button toolbar-select__button ${
-                  regionMenuOpen ? 'secondary-button--active' : ''
+                className={`secondary-button ${
+                  videoPreview.recording_active ? 'secondary-button--active' : ''
                 }`}
-                onClick={() => {
-                  if (enabledRegions.length === 0) {
-                    return;
-                  }
-                  setRegionMenuOpen((current) => !current);
-                }}
-                disabled={enabledRegions.length === 0}
-                aria-expanded={regionMenuOpen}
-                aria-label="Select region"
+                onClick={() => void runCommand(handleToggleRecording)}
+                disabled={recordButtonDisabled}
               >
-                <span>{selectedRegionLabel}</span>
-                <span className="toolbar-select__chevron" aria-hidden="true" />
+                {videoPreview.recording_active ? 'Stop recording' : 'Record'}
               </button>
-              {regionMenuOpen && enabledRegions.length > 0 ? (
-                <div className="toolbar-select__menu">
-                  {enabledRegions.map((region) => (
-                    <button
-                      key={region.id}
-                      className={`toolbar-select__option ${
-                        selectedRegion?.id === region.id ? 'toolbar-select__option--active' : ''
-                      }`}
-                      onClick={() => {
-                        setRegionMenuOpen(false);
-                        void runCommand(async () => {
-                          await selectOfflineRegion(region.id);
-                        });
-                      }}
-                    >
-                      {getRegionDisplayName(region, snapshot.config.region_name_overrides)}
-                    </button>
-                  ))}
+            ) : null}
+            {!toolbarVideoMode ? (
+              <div className="map-mode-toggle" role="tablist" aria-label="Basemap mode">
+                <button
+                  className={`secondary-button ${mapMode === 'street_dark' ? 'secondary-button--active' : ''}`}
+                  onClick={() => handleMapModeChange('street_dark')}
+                >
+                  Street
+                </button>
+                <button
+                  className={`secondary-button ${mapMode === 'satellite' ? 'secondary-button--active' : ''}`}
+                  onClick={() => handleMapModeChange('satellite')}
+                >
+                  Satellite
+                </button>
+              </div>
+            ) : null}
+            {!toolbarVideoMode ? (
+              <>
+                <div ref={regionMenuRef} className="toolbar-select">
+                  <button
+                    className={`secondary-button toolbar-select__button ${
+                      regionMenuOpen ? 'secondary-button--active' : ''
+                    }`}
+                    onClick={() => {
+                      if (enabledRegions.length === 0) {
+                        return;
+                      }
+                      setRegionMenuOpen((current) => !current);
+                    }}
+                    disabled={enabledRegions.length === 0}
+                    aria-expanded={regionMenuOpen}
+                    aria-label="Select region"
+                  >
+                    <span>{selectedRegionLabel}</span>
+                    <span className="toolbar-select__chevron" aria-hidden="true" />
+                  </button>
+                  {regionMenuOpen && enabledRegions.length > 0 ? (
+                    <div className="toolbar-select__menu">
+                      {enabledRegions.map((region) => (
+                        <button
+                          key={region.id}
+                          className={`toolbar-select__option ${
+                            selectedRegion?.id === region.id ? 'toolbar-select__option--active' : ''
+                          }`}
+                          onClick={() => {
+                            setRegionMenuOpen(false);
+                            void runCommand(async () => {
+                              await selectOfflineRegion(region.id);
+                            });
+                          }}
+                        >
+                          {getRegionDisplayName(region, snapshot.config.region_name_overrides)}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
-              ) : null}
-            </div>
-            <div ref={measureToolbarHostRef} className="toolbar-measure-slot" />
-            <button
-              className={`secondary-button ${activePanel === 'flights' ? 'secondary-button--active' : ''}`}
-              onClick={() => togglePanel('flights')}
-              disabled={activeFlight}
-            >
-              Flights
-            </button>
+                <div ref={measureToolbarHostRef} className="toolbar-measure-slot" />
+                <button
+                  className={`secondary-button ${activePanel === 'flights' ? 'secondary-button--active' : ''}`}
+                  onClick={() => togglePanel('flights')}
+                  disabled={activeFlight}
+                >
+                  Flights
+                </button>
+              </>
+            ) : null}
             <button
               className={`secondary-button ${activePanel === 'settings' ? 'secondary-button--active' : ''}`}
               onClick={() => setActivePanel((current) => (current === 'settings' ? null : 'settings'))}
@@ -1318,6 +1563,7 @@ export function App() {
             selectedIndex={effectiveReviewFrameIndex}
             markers={reviewDetectionMarkers}
             selectedMarkerId={selectedAlertId}
+            hasRecordings={reviewHasVideoClips}
             onChange={handleReviewFrameChange}
             onSelectMarker={(markerId, markerIndex) => {
               setReviewFrameIndex(markerIndex);
@@ -1332,27 +1578,57 @@ export function App() {
                 updateSessionDetails(focusedSession.id, name, focusedSession.description ?? null)
               );
             }}
+            onOpenRecordings={() => setReviewVideoOpen(true)}
           />
         ) : null}
 
         {alertDetailVisible && selectedAlert ? (
-          <AlertDetail
-            alert={selectedAlert}
-            config={snapshot.config}
-            alertIndex={Math.max(selectedAlertIndex, 0)}
-            alertCount={deferredAlerts.length}
-            onPrevious={() => stepDetection(-1)}
-            onNext={() => stepDetection(1)}
-            canPrevious={selectedAlertIndex > 0}
-            canNext={selectedAlertIndex >= 0 && selectedAlertIndex < deferredAlerts.length - 1}
-            onClose={() => {
-              setAlertDetailVisible(false);
-              setSelectedAlertId(null);
-            }}
-          />
+          activeFlight ? (
+            <>
+              <button
+                className="modal-backdrop"
+                onClick={() => {
+                  setAlertDetailVisible(false);
+                  setSelectedAlertId(null);
+                }}
+                aria-label="Close detection details"
+              />
+              <div className="alert-detail-modal">
+                <AlertDetail
+                  alert={selectedAlert}
+                  config={snapshot.config}
+                  alertIndex={Math.max(selectedAlertIndex, 0)}
+                  alertCount={deferredAlerts.length}
+                  onPrevious={() => stepDetection(-1)}
+                  onNext={() => stepDetection(1)}
+                  canPrevious={selectedAlertIndex > 0}
+                  canNext={selectedAlertIndex >= 0 && selectedAlertIndex < deferredAlerts.length - 1}
+                  onClose={() => {
+                    setAlertDetailVisible(false);
+                    setSelectedAlertId(null);
+                  }}
+                />
+              </div>
+            </>
+          ) : (
+            <AlertDetail
+              alert={selectedAlert}
+              config={snapshot.config}
+              alertIndex={Math.max(selectedAlertIndex, 0)}
+              alertCount={deferredAlerts.length}
+              onPrevious={() => stepDetection(-1)}
+              onNext={() => stepDetection(1)}
+              canPrevious={selectedAlertIndex > 0}
+              canNext={selectedAlertIndex >= 0 && selectedAlertIndex < deferredAlerts.length - 1}
+              onClose={() => {
+                setAlertDetailVisible(false);
+                setSelectedAlertId(null);
+              }}
+            />
+          )
         ) : null}
 
-        {hasDetections && !alertDetailVisible ? (
+        {reviewMode && hasDetections && !alertDetailVisible ? (
           <button className="detection-toggle-fab" onClick={openDetectionPanel}>
             <span className="detection-toggle-fab__label">Detections</span>
             <span className="detection-toggle-fab__count">{deferredAlerts.length}</span>
@@ -1388,6 +1664,13 @@ export function App() {
           </>
         ) : null}
       </div>
+
+        {reviewMode && reviewVideoOpen && snapshot.review_video_clips.length > 0 ? (
+          <ReviewVideoModal
+            clips={snapshot.review_video_clips}
+            onClose={() => setReviewVideoOpen(false)}
+          />
+        ) : null}
 
         <SettingsDrawer
           open={activePanel === 'settings'}

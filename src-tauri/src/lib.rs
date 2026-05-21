@@ -118,6 +118,22 @@ async fn export_session_telemetry(
     state.export_session_telemetry(&app, session_id).await
 }
 
+#[tauri::command]
+async fn start_video_recording(
+    app: AppHandle,
+    state: State<'_, Arc<AppRuntime>>,
+) -> Result<(), String> {
+    state.start_video_recording(&app).await
+}
+
+#[tauri::command]
+async fn stop_video_recording(
+    app: AppHandle,
+    state: State<'_, Arc<AppRuntime>>,
+) -> Result<(), String> {
+    state.stop_video_recording(&app).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -140,7 +156,9 @@ pub fn run() {
             clear_focused_session,
             update_session_details,
             delete_session,
-            export_session_telemetry
+            export_session_telemetry,
+            start_video_recording,
+            stop_video_recording
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kerbodyne Ground Station");

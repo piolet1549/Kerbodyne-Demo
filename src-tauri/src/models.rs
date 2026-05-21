@@ -32,6 +32,7 @@ pub struct AppConfig {
     pub aircraft_icon: AircraftIconConfig,
     pub track_display: TrackDisplayConfig,
     pub flight_alerts: FlightAlertConfig,
+    pub video: VideoConfig,
 }
 
 impl Default for AppConfig {
@@ -57,6 +58,20 @@ impl Default for AppConfig {
             aircraft_icon: AircraftIconConfig::default(),
             track_display: TrackDisplayConfig::default(),
             flight_alerts: FlightAlertConfig::default(),
+            video: VideoConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoConfig {
+    pub auto_record_live: bool,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            auto_record_live: false,
         }
     }
 }
@@ -313,6 +328,64 @@ pub struct MissionSession {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackPointRecord {
+    pub lat: f64,
+    pub lon: f64,
+    pub recorded_at: String,
+    pub alt_msl_m: Option<f64>,
+    pub heading_deg: Option<f64>,
+    pub groundspeed_mps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionVideoClip {
+    pub id: String,
+    pub session_id: String,
+    pub file_path: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub duration_ms: u64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub codec: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoPreviewStatus {
+    Idle,
+    WaitingForStream,
+    WaitingForKeyframe,
+    Live,
+    Recording,
+    Stale,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoPreviewState {
+    pub status: VideoPreviewStatus,
+    pub preview_url: Option<String>,
+    pub recording_active: bool,
+    pub current_clip_id: Option<String>,
+    pub message: Option<String>,
+}
+
+impl Default for VideoPreviewState {
+    fn default() -> Self {
+        Self {
+            status: VideoPreviewStatus::Idle,
+            preview_url: None,
+            recording_active: false,
+            current_clip_id: None,
+            message: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionStatus {
     Disconnected,
@@ -361,8 +434,10 @@ pub struct AppSnapshot {
     pub alerts: Vec<AlertRecord>,
     pub system_statuses: Vec<SystemStatusRecord>,
     pub sessions: Vec<MissionSession>,
-    pub track: Vec<(f64, f64)>,
+    pub track: Vec<TrackPointRecord>,
     pub review_frames: Vec<ReviewTelemetryFrame>,
+    pub review_video_clips: Vec<SessionVideoClip>,
+    pub video_preview: VideoPreviewState,
     pub raw_telemetry_packets: Vec<String>,
     pub warnings: Vec<String>,
 }

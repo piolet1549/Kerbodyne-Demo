@@ -70,6 +70,14 @@ export async function exportSessionTelemetry(sessionId: string): Promise<string>
   });
 }
 
+export async function startVideoRecording(): Promise<void> {
+  return invoke('start_video_recording');
+}
+
+export async function stopVideoRecording(): Promise<void> {
+  return invoke('stop_video_recording');
+}
+
 export async function listenToRuntimeEvents(
   handler: (event: RuntimeEvent) => void
 ): Promise<UnlistenFn> {
