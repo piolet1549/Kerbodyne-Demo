@@ -413,15 +413,33 @@ button {
   font-size: 0.84rem;
 }
 
+.telemetry-hud-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  pointer-events: none;
+}
+
 .telemetry-hud-stack {
   position: absolute;
   top: 88px;
   left: 18px;
-  z-index: 7;
-  width: min(320px, calc(100vw - 36px));
+  z-index: 1;
+  width: min(320px, calc(100vw - 36px), calc((100vh - 120px) * 0.64));
+  max-height: calc(100vh - 112px);
   display: flex;
   flex-direction: column;
   gap: 12px;
+  pointer-events: none;
+}
+
+.telemetry-hud-stack--main {
+  left: 18px;
+}
+
+.telemetry-hud-stack--expanded {
+  left: auto;
+  right: 18px;
 }
 
 .telemetry-hud {
@@ -430,6 +448,7 @@ button {
   width: 100%;
   padding: 16px 16px 14px;
   border-radius: 20px;
+  pointer-events: auto;
 }
 
 .telemetry-hud--idle {
@@ -446,7 +465,7 @@ button {
 
 .telemetry-hud__topline-actions {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: flex-end;
   gap: 10px;
 }
@@ -477,6 +496,7 @@ button {
 .telemetry-hud__vision-indicator {
   flex: 0 0 auto;
   height: 56px;
+  min-height: 56px;
   min-width: 108px;
   padding: 0 14px;
   display: inline-flex;
@@ -511,11 +531,25 @@ button {
   text-transform: uppercase;
 }
 
-.telemetry-hud__vision-indicator--connected,
-.telemetry-hud__vision-indicator--pending,
 .telemetry-hud__vision-indicator--waiting,
 .telemetry-hud__vision-indicator--stale {
   border-color: rgba(255, 255, 255, 0.04);
+  --telemetry-hud-vision-shadow: rgba(255, 123, 69, 0.34);
+  --telemetry-hud-vision-glow: rgba(255, 123, 69, 0.28);
+  --telemetry-hud-vision-color: #ff7b45;
+}
+
+.telemetry-hud__vision-indicator--pending {
+  border-color: rgba(255, 255, 255, 0.04);
+  --telemetry-hud-vision-shadow: rgba(255, 214, 87, 0.34);
+  --telemetry-hud-vision-glow: rgba(255, 214, 87, 0.28);
+  --telemetry-hud-vision-color: #ffd657;
+}
+
+.telemetry-hud__vision-indicator--connected {
+  --telemetry-hud-vision-shadow: rgba(104, 222, 146, 0.34);
+  --telemetry-hud-vision-glow: rgba(104, 222, 146, 0.3);
+  --telemetry-hud-vision-color: #68de92;
 }
 
 .telemetry-hud__vision-indicator--connected::after,
@@ -526,11 +560,11 @@ button {
   position: absolute;
   inset: -2px;
   border-radius: inherit;
-  border: 3px solid var(--telemetry-hud-status-color);
+  border: 3px solid var(--telemetry-hud-vision-color);
   pointer-events: none;
   box-shadow:
-    0 0 0 1px var(--telemetry-hud-status-shadow),
-    0 0 14px var(--telemetry-hud-status-glow);
+    0 0 0 1px var(--telemetry-hud-vision-shadow),
+    0 0 14px var(--telemetry-hud-vision-glow);
   animation: telemetry-hud-border-pulse 1.85s ease-in-out infinite;
 }
 
@@ -697,10 +731,14 @@ button {
   position: absolute;
   left: 50%;
   top: calc(50% + 2px);
-  width: 86px;
-  height: 18px;
+  width: 92px;
+  height: 16px;
   transform: translate(-50%, -50%);
-  z-index: 2;
+  z-index: 3;
+  background:
+    radial-gradient(circle at center, rgba(255, 255, 255, 0.96) 0 3px, transparent 3.8px);
+  background-repeat: no-repeat;
+  background-position: center;
 }
 
 .telemetry-hud__attitude-aircraft::before,
@@ -708,10 +746,12 @@ button {
   content: '';
   position: absolute;
   top: 50%;
-  width: 34px;
+  width: 32px;
   height: 3px;
-  background: rgba(255, 255, 255, 0.92);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.96);
   transform: translateY(-50%);
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.08);
 }
 
 .telemetry-hud__attitude-aircraft::before {
@@ -722,22 +762,16 @@ button {
   right: 0;
 }
 
-.telemetry-hud__attitude-aircraft {
-  border-top: 3px solid rgba(255, 255, 255, 0.92);
-  border-left: 3px solid transparent;
-  border-right: 3px solid transparent;
-}
-
 .telemetry-hud__attitude-command {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 48px;
-  height: 22px;
-  border: 2px solid rgba(255, 255, 255, 0.76);
-  border-radius: 5px;
+  width: 86px;
+  height: 12px;
+  border: 1.5px solid rgba(255, 255, 255, 0.8);
+  border-radius: 4px;
   transform: translate(-50%, -50%);
-  box-shadow: 0 0 14px rgba(255, 255, 255, 0.12);
+  box-shadow: 0 0 12px rgba(255, 255, 255, 0.08);
   z-index: 2;
 }
 
@@ -773,15 +807,16 @@ button {
   width: 100%;
 }
 
-.telemetry-hud--open {
-  border-bottom-left-radius: 24px;
-  border-bottom-right-radius: 24px;
-}
-
 .telemetry-hud__expanded {
   margin-top: 16px;
   padding-top: 16px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.telemetry-hud__expanded--standalone {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
 }
 
 .telemetry-hud__expanded-grid {
@@ -798,17 +833,6 @@ button {
 
 .telemetry-hud__expanded-section--full {
   width: 100%;
-}
-
-.telemetry-hud__section-title {
-  display: block;
-  width: 100%;
-  text-align: center;
-  color: var(--muted);
-  font-size: 0.76rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 
 .telemetry-hud__expanded-metrics {
@@ -850,6 +874,61 @@ button {
     box-shadow:
       0 0 0 2px var(--telemetry-hud-status-shadow),
       0 0 24px var(--telemetry-hud-status-glow);
+  }
+}
+
+@media (max-height: 900px) {
+  .telemetry-hud-stack {
+    top: 72px;
+    width: min(300px, calc(100vw - 28px), calc((100vh - 100px) * 0.64));
+    max-height: calc(100vh - 88px);
+  }
+
+  .telemetry-hud {
+    padding: 14px 14px 12px;
+    border-radius: 18px;
+  }
+
+  .telemetry-hud__attitude-shell {
+    margin: 12px 0 14px;
+  }
+
+  .telemetry-hud__attitude {
+    max-width: 248px;
+    height: 118px;
+  }
+
+  .telemetry-hud__grid {
+    gap: 12px;
+  }
+}
+
+@media (max-height: 760px) {
+  .telemetry-hud-stack {
+    top: 64px;
+    width: min(286px, calc(100vw - 24px), calc((100vh - 84px) * 0.66));
+    max-height: calc(100vh - 72px);
+    gap: 10px;
+  }
+
+  .telemetry-hud {
+    padding: 13px 13px 11px;
+  }
+
+  .telemetry-hud__mode-box,
+  .telemetry-hud__vision-indicator {
+    height: 52px;
+    min-height: 52px;
+  }
+
+  .telemetry-hud__attitude {
+    max-width: 234px;
+    height: 108px;
+  }
+
+  .telemetry-hud__expanded {
+    margin-top: 14px;
+    padding-top: 14px;
   }
 }
 
@@ -1898,11 +1977,6 @@ button {
     min-width: calc(100vw - 24px);
   }
 
-  .telemetry-hud-stack {
-    top: auto;
-    bottom: 18px;
-  }
-
   .telemetry-hud__topline {
     flex-wrap: wrap;
     align-items: flex-start;
@@ -1953,11 +2027,6 @@ button {
 
   .map-toolbar {
     top: 12px;
-  }
-
-  .telemetry-hud-stack {
-    bottom: 12px;
-    top: auto;
   }
 
   .telemetry-hud__expanded-grid {
@@ -2604,23 +2673,54 @@ button {
 }
 
 .replay-timeline__footer {
+  position: relative;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(76px, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   color: var(--muted);
   font-size: 0.84rem;
   min-height: 42px;
+  font-variant-numeric: tabular-nums;
+}
+
+.replay-timeline__playback-controls {
+  grid-column: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  justify-self: start;
+}
+
+.replay-timeline__time {
+  white-space: nowrap;
+}
+
+.replay-timeline__time--elapsed {
+  color: var(--muted);
+}
+
+.replay-timeline__time--total {
+  grid-column: 3;
+  justify-self: end;
 }
 
 .replay-timeline__frame-counter {
-  display: inline-block;
-  justify-self: center;
-  will-change: transform;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 76px;
+  transform: translate(-50%, -50%);
 }
 
-.replay-timeline__footer span:last-child {
-  justify-self: end;
+.replay-timeline__frame-placeholder {
+  visibility: hidden;
+  grid-column: 2;
+  justify-self: center;
+  min-width: 76px;
 }
 
 .save-row__actions {
@@ -3568,16 +3668,19 @@ button {
 }
 
 .replay-timeline__header {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  position: relative;
+  display: flex;
+  justify-content: center;
   align-items: center;
   gap: 14px;
   min-height: 44px;
 }
 
 .replay-timeline__recordings-button {
-  position: static;
-  transform: none;
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
 }
 
 .replay-timeline__playback-controls {
@@ -3775,6 +3878,7 @@ button {
   }
 
   .replay-timeline__header {
+    display: grid;
     grid-template-columns: 1fr;
     justify-items: center;
   }

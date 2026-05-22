@@ -199,6 +199,18 @@ impl Database {
             .map_err(|error| error.to_string())
     }
 
+    pub fn delete_empty_sessions(&self) -> Result<usize, String> {
+        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        connection
+            .execute(
+                "DELETE FROM sessions
+                 WHERE event_count = 0
+                   AND alert_count = 0",
+                [],
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub fn load_alerts_for_session(&self, session_id: &str) -> Result<Vec<AlertRecord>, String> {
         let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
         let mut statement = connection
@@ -532,6 +544,7 @@ impl Database {
                     FROM replay_events
                     WHERE session_id = ?1
                       AND envelope_json LIKE '%\"type\":\"telemetry\"%'
+                      AND envelope_json LIKE '%\"armed\":true%'
                     LIMIT 1
                 )",
                 params![session_id],

@@ -214,14 +214,84 @@ function readStringExtra(extras: Record<string, unknown> | null | undefined, key
   return null;
 }
 
+const ARDUPLANE_FLIGHT_MODE_LABELS: Record<number, string> = {
+  0: 'Manual',
+  1: 'Circle',
+  2: 'Stabilize',
+  3: 'Training',
+  4: 'Acro',
+  5: 'FBWA',
+  6: 'FBWB',
+  7: 'Cruise',
+  8: 'Autotune',
+  10: 'Auto',
+  11: 'RTL',
+  12: 'Loiter',
+  15: 'Guided',
+  16: 'Initializing',
+  17: 'QStabilize',
+  18: 'QHover',
+  19: 'QLoiter',
+  20: 'QLand',
+  21: 'QRTL',
+  22: 'QAutotune',
+  23: 'QAcro',
+  24: 'Thermal',
+  25: 'LoiterAltQLand',
+  26: 'Autoland',
+  27: 'AutoTakeoff'
+};
+
+const ARDUPLANE_FLIGHT_DIRECTOR_MODE_NUMBERS = new Set([
+  1, 7, 10, 11, 12, 15, 18, 19, 20, 21, 24, 25, 26, 27
+]);
+
+const ARDUPLANE_FLIGHT_DIRECTOR_MODE_LABELS = new Set([
+  'circle',
+  'cruise',
+  'auto',
+  'rtl',
+  'loiter',
+  'guided',
+  'qhover',
+  'qloiter',
+  'qland',
+  'qrtl',
+  'thermal',
+  'loiteraltqland',
+  'autoland',
+  'autotakeoff',
+  'takeoff'
+]);
+
 function formatFlightModeLabel(value: string | number | null | undefined) {
   if (typeof value === 'string' && value.trim()) {
     return value.trim();
   }
   if (typeof value === 'number' && Number.isFinite(value)) {
-    return `Mode ${Math.round(value)}`;
+    const normalized = Math.round(value);
+    return ARDUPLANE_FLIGHT_MODE_LABELS[normalized] ?? `Mode ${normalized}`;
   }
   return '--';
+}
+
+function shouldShowFlightDirector(value: string | number | null | undefined) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return ARDUPLANE_FLIGHT_DIRECTOR_MODE_NUMBERS.has(Math.round(value));
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return false;
+    }
+    const parsed = Number(trimmed);
+    if (Number.isFinite(parsed)) {
+      return ARDUPLANE_FLIGHT_DIRECTOR_MODE_NUMBERS.has(Math.round(parsed));
+    }
+    const normalized = trimmed.toLowerCase().replace(/[\s_-]+/g, '');
+    return ARDUPLANE_FLIGHT_DIRECTOR_MODE_LABELS.has(normalized);
+  }
+  return false;
 }
 
 function buildMetricState(
@@ -393,6 +463,7 @@ export function App() {
     readNumberExtra(liveExtras, 'flight_mode') ??
     readStringExtra(liveExtras, 'flight_mode');
   const flightModeLabel = formatFlightModeLabel(flightModeRaw);
+  const showFlightDirector = shouldShowFlightDirector(flightModeRaw);
   const pitchDeg = readNumberExtra(liveExtras, 'pitch_deg');
   const rollDeg = readNumberExtra(liveExtras, 'roll_deg');
   const navPitchDeg = readNumberExtra(liveExtras, 'nav_pitch_deg');
@@ -407,6 +478,7 @@ export function App() {
   const cpuPercent = readNumberExtra(liveExtras, 'cpu_pct');
   const cpuMhz = readNumberExtra(liveExtras, 'cpu_mhz');
   const npuTempC = readNumberExtra(liveExtras, 'npu_temp_c');
+  const batteryMahConsumed = readNumberExtra(liveExtras, 'battery_mah');
   const visionActive = readBooleanExtra(liveExtras, 'vision_active');
   const displayTrack = useMemo(() => {
     if (!reviewMode) {
@@ -443,7 +515,7 @@ export function App() {
     () => deferredAlerts.findIndex((alert) => alert.id === selectedAlertId),
     [deferredAlerts, selectedAlertId]
   );
-  const mapFocusTarget = useMemo<[number, number] | null>(() => {
+  const reviewInitialMapFocusTarget = useMemo<[number, number] | null>(() => {
     if (!reviewMode) {
       return null;
     }
@@ -456,9 +528,7 @@ export function App() {
       displayTrack[displayTrack.length - 1] ?? snapshot.track[snapshot.track.length - 1];
     return lastTrackPoint ? [lastTrackPoint.lat, lastTrackPoint.lon] : null;
   }, [displayTrack, reviewMode, selectedReviewFrame, snapshot.track]);
-  const mapFocusKey = reviewMode
-    ? `${snapshot.focused_session_id ?? 'none'}:${effectiveReviewFrameIndex ?? 'none'}`
-    : null;
+  const reviewInitialMapFocusKey = reviewMode ? snapshot.focused_session_id ?? null : null;
 
   function clearNotificationTimer(notificationId: string) {
     const existing = notificationTimersRef.current[notificationId];
@@ -986,11 +1056,14 @@ export function App() {
     if (!activeFlight && !reviewMode) {
       return null;
     }
-    if (activeFlight && snapshot.connection.status === 'stale') {
-      return { label: 'Vision telemetry stale', variant: 'stale' as const };
-    }
-    if (!flightHasReceivedConnection && activeFlight) {
+    if (activeFlight && (!flightHasReceivedConnection || snapshot.connection.status === 'stale')) {
       return { label: 'Awaiting vision telemetry', variant: 'waiting' as const };
+    }
+    if (visionActive == null) {
+      return {
+        label: activeFlight ? 'Awaiting vision telemetry' : 'Vision pipeline unavailable',
+        variant: 'waiting' as const
+      };
     }
     if (visionActive) {
       return { label: 'Vision pipeline active', variant: 'connected' as const };
@@ -1401,8 +1474,8 @@ export function App() {
       forceFollow={mapIsCornerPane}
       preferredInitialView={activeFlight ? lastIdleMapView : null}
       measureToolbarHost={!mapIsCornerPane ? measureToolbarHostRef.current : null}
-      focusTarget={mapFocusTarget}
-      focusKey={mapFocusKey}
+      focusTarget={reviewInitialMapFocusTarget}
+      focusKey={reviewInitialMapFocusKey}
       onViewStateChange={(view) => {
         if (!activeFlight) {
           setLastIdleMapView(view);
@@ -1695,12 +1768,13 @@ export function App() {
             visionValue={visionActive}
             flightModeLabel={flightModeLabel}
             batteryPercent={displayLiveState?.battery?.percent ?? null}
-            attitude={{
-              pitchDeg,
-              rollDeg,
-              navPitchDeg,
-              navRollDeg
-            }}
+              attitude={{
+                pitchDeg,
+                rollDeg,
+                navPitchDeg,
+                navRollDeg,
+                showFlightDirector
+              }}
             metricStates={activeFlight ? telemetryMetricStates : undefined}
             expandedHud={
               (activeFlight || reviewMode)
@@ -1716,7 +1790,9 @@ export function App() {
                     vibrationY,
                     vibrationZ,
                     altitudeMslM: displayAltitudeMsl,
-                    targetAltitudeMslM
+                    targetAltitudeMslM,
+                    flightTimeS: displayLiveState?.flight_time_s ?? null,
+                    batteryMahConsumed
                   }
                 : null
             }

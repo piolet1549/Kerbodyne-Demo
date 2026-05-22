@@ -154,18 +154,6 @@ export function SettingsDrawer({
     }));
   }
 
-  function patchVideo(
-    next: Partial<AppConfig['video']>
-  ) {
-    setDraft((current) => ({
-      ...current,
-      video: {
-        ...current.video,
-        ...next
-      }
-    }));
-  }
-
   function toggleRegion(regionId: string) {
     setDraft((current) => {
       const enabled = current.enabled_region_ids.includes(regionId);
@@ -720,40 +708,6 @@ export function SettingsDrawer({
             ) : null}
           </section>
 
-          <section className="settings-section">
-            <div className="settings-section__header">
-              <strong>Video</strong>
-            </div>
-
-            <div className="settings-form settings-form--compact">
-              <label>
-                Auto-record live video
-                <div className="settings-pill-row">
-                  <button
-                    type="button"
-                    className={`secondary-button secondary-button--muted ${
-                      draft.video.auto_record_live ? 'secondary-button--active' : ''
-                    }`}
-                    onClick={() => patchVideo({ auto_record_live: true })}
-                  >
-                    Enabled
-                  </button>
-                  <button
-                    type="button"
-                    className={`secondary-button secondary-button--muted ${
-                      !draft.video.auto_record_live ? 'secondary-button--active' : ''
-                    }`}
-                    onClick={() => patchVideo({ auto_record_live: false })}
-                  >
-                    Disabled
-                  </button>
-                </div>
-                <span className="settings-hint">
-                  Starts a new recording automatically when a live flight begins.
-                </span>
-              </label>
-            </div>
-          </section>
         </div>
 
         {error ? <p className="drawer-error">{error}</p> : null}

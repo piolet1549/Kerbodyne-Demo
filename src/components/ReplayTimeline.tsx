@@ -48,11 +48,8 @@ export function ReplayTimeline({
 }: ReplayTimelineProps) {
   const [draftFlightName, setDraftFlightName] = useState(flightName);
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false);
-  const [frameCounterOffset, setFrameCounterOffset] = useState(0);
   const speedOptions = [0.5, 1, 2, 4];
   const speedMenuRef = useRef<HTMLDivElement | null>(null);
-  const footerRef = useRef<HTMLDivElement | null>(null);
-  const frameCounterRef = useRef<HTMLSpanElement | null>(null);
 
   useEffect(() => {
     setDraftFlightName(flightName);
@@ -82,36 +79,6 @@ export function ReplayTimeline({
       window.removeEventListener('keydown', handleEscape);
     };
   }, [speedMenuOpen]);
-
-  useEffect(() => {
-    function updateFrameCounterOffset() {
-      const footer = footerRef.current;
-      const counter = frameCounterRef.current;
-      if (!footer || !counter) {
-        return;
-      }
-      const footerRect = footer.getBoundingClientRect();
-      const counterRect = counter.getBoundingClientRect();
-      const footerCenter = footerRect.left + footerRect.width / 2;
-      const counterCenter = counterRect.left + counterRect.width / 2;
-      setFrameCounterOffset(footerCenter - counterCenter);
-    }
-
-    const frame = window.requestAnimationFrame(updateFrameCounterOffset);
-    const resizeObserver = new ResizeObserver(updateFrameCounterOffset);
-    if (footerRef.current) {
-      resizeObserver.observe(footerRef.current);
-    }
-    if (frameCounterRef.current) {
-      resizeObserver.observe(frameCounterRef.current);
-    }
-    window.addEventListener('resize', updateFrameCounterOffset);
-    return () => {
-      window.cancelAnimationFrame(frame);
-      resizeObserver.disconnect();
-      window.removeEventListener('resize', updateFrameCounterOffset);
-    };
-  }, [draftFlightName, frames.length, playbackActive, playbackSpeed, selectedIndex]);
 
   const progress = useMemo(() => {
     if (frames.length === 0) {
@@ -208,7 +175,7 @@ export function ReplayTimeline({
         })}
       </div>
 
-      <div ref={footerRef} className="replay-timeline__footer">
+      <div className="replay-timeline__footer">
         <div className="replay-timeline__playback-controls">
           <button
             type="button"
@@ -258,16 +225,17 @@ export function ReplayTimeline({
               </div>
             ) : null}
           </div>
+          <span className="replay-timeline__time replay-timeline__time--elapsed">
+            {progress.current}
+          </span>
         </div>
-        <span>{progress.current}</span>
-        <span
-          ref={frameCounterRef}
-          className="replay-timeline__frame-counter"
-          style={{ transform: `translateX(${frameCounterOffset}px)` }}
-        >
+        <span className="replay-timeline__frame-placeholder" aria-hidden="true">
           {selectedIndex + 1}/{frames.length}
         </span>
-        <span>{progress.total}</span>
+        <span className="replay-timeline__time replay-timeline__time--total">{progress.total}</span>
+        <span className="replay-timeline__frame-counter">
+          {selectedIndex + 1}/{frames.length}
+        </span>
       </div>
     </section>
   );
