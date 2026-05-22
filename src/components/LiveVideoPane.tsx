@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { VideoPreviewState } from '../lib/types';
 
 interface LiveVideoPaneProps {
@@ -27,74 +27,25 @@ function statusLabel(status: VideoPreviewState['status']) {
 }
 
 export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
-  const [frameUrl, setFrameUrl] = useState<string | null>(null);
-  const frameUrlRef = useRef<string | null>(null);
-  const waitingForFeed = matchesErrorIdle(video.status) || video.status === 'waiting_for_stream' || video.status === 'waiting_for_keyframe';
+  const [streamNonce, setStreamNonce] = useState(0);
+  const waitingForFeed =
+    matchesErrorIdle(video.status) ||
+    video.status === 'waiting_for_stream' ||
+    video.status === 'waiting_for_keyframe';
   const WrapperTag = dominant ? 'div' : 'button';
 
   useEffect(() => {
-    let cancelled = false;
-    let timeoutId: number | null = null;
+    setStreamNonce((current) => current + 1);
+  }, [video.preview_url, video.recording_active, video.current_clip_id, video.status]);
 
-    const revokeFrameUrl = (url: string | null) => {
-      if (url) {
-        URL.revokeObjectURL(url);
-      }
-    };
-
-    const schedulePoll = (delay = 66) => {
-      timeoutId = window.setTimeout(() => {
-        void pollFrame();
-      }, delay);
-    };
-
-    async function pollFrame() {
-      if (cancelled || !video.preview_url) {
-        return;
-      }
-
-      try {
-        const response = await fetch(`${video.preview_url}?t=${Date.now()}`, {
-          cache: 'no-store'
-        });
-        if (cancelled) {
-          return;
-        }
-        if (response.status === 200) {
-          const blob = await response.blob();
-          if (cancelled) {
-            return;
-          }
-          const nextUrl = URL.createObjectURL(blob);
-          const previousUrl = frameUrlRef.current;
-          frameUrlRef.current = nextUrl;
-          setFrameUrl(nextUrl);
-          revokeFrameUrl(previousUrl);
-        }
-      } catch {
-        // Swallow transient frame fetch errors and keep polling.
-      }
-
-      if (!cancelled) {
-        schedulePoll();
-      }
+  const streamUrl = useMemo(() => {
+    if (!video.preview_url) {
+      return null;
     }
 
-    if (video.preview_url) {
-      schedulePoll(0);
-    }
-
-    return () => {
-      cancelled = true;
-      if (timeoutId != null) {
-        window.clearTimeout(timeoutId);
-      }
-      const previousUrl = frameUrlRef.current;
-      frameUrlRef.current = null;
-      setFrameUrl(null);
-      revokeFrameUrl(previousUrl);
-    };
-  }, [video.preview_url]);
+    const separator = video.preview_url.includes('?') ? '&' : '?';
+    return `${video.preview_url}${separator}stream=${streamNonce}`;
+  }, [video.preview_url, streamNonce]);
 
   return (
     <WrapperTag
@@ -109,8 +60,13 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
           }
         : {})}
     >
-      {frameUrl ? (
-        <img className="live-video-pane__image" src={frameUrl} alt="Live aircraft video feed" />
+      {streamUrl ? (
+        <img
+          key={streamUrl}
+          className="live-video-pane__image"
+          src={streamUrl}
+          alt="Live aircraft video feed"
+        />
       ) : (
         <div className="live-video-pane__empty" />
       )}

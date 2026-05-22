@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, VecDeque},
-    env,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -11,11 +10,11 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    net::{TcpListener, UdpSocket},
-    process::{Child, ChildStderr, ChildStdout, Command},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+    process::{Child, Command},
     sync::{watch, Mutex, RwLock},
-    time::{sleep, Duration},
+    time::{sleep, timeout, Duration},
 };
 use uuid::Uuid;
 
@@ -50,6 +49,12 @@ const VIDEO_STALE_AFTER_SECS: i64 = 3;
 const COMPAT_HF_STALE_SECS: i64 = 2;
 const COMPAT_MF_STALE_SECS: i64 = 4;
 const COMPAT_LF_STALE_SECS: i64 = 8;
+const VIDEO_PREVIEW_PATH: &str = "/live.mjpg";
+const VLC_HTTP_PROBE_INTERVAL_MS: u64 = 300;
+const VLC_HTTP_PROBE_TIMEOUT_MS: u64 = 2200;
+const VLC_SHUTDOWN_TIMEOUT_SECS: u64 = 8;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Clone, Default)]
 struct CompatibilityTelemetryState {
@@ -271,17 +276,18 @@ struct RecordingRunState {
     clip_id: String,
     session_id: String,
     started_at: String,
-    temp_h264_path: PathBuf,
     mp4_path: PathBuf,
 }
 
 #[derive(Default)]
 struct VideoRuntimeState {
-    preview_stdout_handle: Option<tauri::async_runtime::JoinHandle<()>>,
-    preview_stderr_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    preview_monitor_handle: Option<tauri::async_runtime::JoinHandle<()>>,
     preview_child: Option<Child>,
     recording: Option<RecordingRunState>,
     last_preview_frame_at: Option<DateTime<Utc>>,
+    preview_http_port: Option<u16>,
+    sdp_path: Option<PathBuf>,
+    log_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -349,7 +355,7 @@ pub struct AppRuntime {
     latest_preview_frame: RwLock<Option<Vec<u8>>>,
     video_runtime: Mutex<VideoRuntimeState>,
     video_dir: PathBuf,
-    gstreamer_path: RwLock<Option<PathBuf>>,
+    vlc_path: RwLock<Option<PathBuf>>,
 }
 
 impl AppRuntime {
@@ -406,7 +412,7 @@ impl AppRuntime {
             latest_preview_frame: RwLock::new(None),
             video_runtime: Mutex::new(VideoRuntimeState::default()),
             video_dir,
-            gstreamer_path: RwLock::new(None),
+            vlc_path: RwLock::new(None),
         }))
     }
 
@@ -414,11 +420,6 @@ impl AppRuntime {
         match spawn_offline_asset_server(self.clone()) {
             Ok(asset_origin) => {
                 *self.asset_server_origin.blocking_write() = asset_origin;
-                let preview_url = format!(
-                    "{}/__preview__/live.jpg",
-                    self.asset_server_origin.blocking_read().clone()
-                );
-                self.video_preview.blocking_write().preview_url = Some(preview_url);
             }
             Err(error) => {
                 eprintln!("Kerbodyne offline asset server failed to start: {error}");
@@ -433,7 +434,7 @@ impl AppRuntime {
             loop {
                 sleep(Duration::from_secs(2)).await;
                 let connection_changed = runtime.refresh_connection_health().await;
-                let video_changed = runtime.refresh_video_health().await;
+                let video_changed = runtime.refresh_video_health(&app).await;
                 if connection_changed || video_changed {
                     let _ = runtime.emit_snapshot(&app).await;
                 }
@@ -661,13 +662,7 @@ impl AppRuntime {
         }
 
         if let Err(error) = self.start_video_subsystem(app, &session_id).await {
-            if !error.contains("Live video runtime unavailable") {
-                self.push_warning(app, error).await;
-            }
-        } else if self.config.read().await.video.auto_record_live {
-            if let Err(error) = self.start_video_recording(app).await {
-                self.push_warning(app, error).await;
-            }
+            self.push_warning(app, error).await;
         }
 
         self.emit_snapshot(app).await?;
@@ -1066,9 +1061,42 @@ impl AppRuntime {
         changed
     }
 
-    async fn refresh_video_health(&self) -> bool {
+    async fn refresh_video_health(&self, app: &AppHandle) -> bool {
+        let mut exited_log_path = None;
         let (preview_running, last_preview_frame_at, recording_active) = {
-            let runtime = self.video_runtime.lock().await;
+            let mut runtime = self.video_runtime.lock().await;
+            if let Some(child) = runtime.preview_child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        if let Some(handle) = runtime.preview_monitor_handle.take() {
+                            handle.abort();
+                        }
+                        if let Some(sdp_path) = runtime.sdp_path.take() {
+                            let _ = fs::remove_file(sdp_path);
+                        }
+                        runtime.preview_child = None;
+                        runtime.last_preview_frame_at = None;
+                        runtime.preview_http_port = None;
+                        exited_log_path = runtime.log_path.clone();
+                        runtime.log_path = None;
+                    }
+                    Err(_) => {
+                        if let Some(handle) = runtime.preview_monitor_handle.take() {
+                            handle.abort();
+                        }
+                        if let Some(sdp_path) = runtime.sdp_path.take() {
+                            let _ = fs::remove_file(sdp_path);
+                        }
+                        runtime.preview_child = None;
+                        runtime.last_preview_frame_at = None;
+                        runtime.preview_http_port = None;
+                        exited_log_path = runtime.log_path.clone();
+                        runtime.log_path = None;
+                    }
+                    Ok(None) => {}
+                }
+            }
+
             (
                 runtime.preview_child.is_some(),
                 runtime.last_preview_frame_at,
@@ -1076,11 +1104,21 @@ impl AppRuntime {
             )
         };
 
+        if let Some(log_path) = exited_log_path {
+            let diagnostics = read_log_tail(&log_path, 12);
+            let warning = diagnostics
+                .map(|tail| format!("Live video runtime exited unexpectedly. {tail}"))
+                .unwrap_or_else(|| "Live video runtime exited unexpectedly.".to_string());
+            self.push_warning(app, warning).await;
+        }
+
         let mut preview = self.video_preview.write().await;
-        let next_status = if matches!(preview.status, VideoPreviewStatus::Error | VideoPreviewStatus::Idle) {
-            preview.status.clone()
-        } else if !preview_running {
-            VideoPreviewStatus::Idle
+        let next_status = if !preview_running {
+            if preview.preview_url.is_some() {
+                VideoPreviewStatus::Error
+            } else {
+                VideoPreviewStatus::Idle
+            }
         } else if let Some(last_frame) = last_preview_frame_at {
             if (Utc::now() - last_frame).num_seconds() > VIDEO_STALE_AFTER_SECS {
                 VideoPreviewStatus::Stale
@@ -1093,13 +1131,21 @@ impl AppRuntime {
             VideoPreviewStatus::WaitingForStream
         };
 
-        if preview.status != next_status {
-            preview.status = next_status.clone();
-            preview.message = Some(video_status_message(&next_status).to_string());
-            return true;
+        let next_message = video_status_message(&next_status).to_string();
+        let changed = preview.status != next_status
+            || preview.message.as_deref() != Some(next_message.as_str())
+            || preview.recording_active != recording_active;
+
+        if changed {
+            preview.status = next_status;
+            preview.message = Some(next_message);
+            preview.recording_active = recording_active;
+            if !recording_active {
+                preview.current_clip_id = None;
+            }
         }
 
-        false
+        changed
     }
 
     pub fn subscribe_preview_frames(&self) -> watch::Receiver<Option<Vec<u8>>> {
@@ -1111,38 +1157,66 @@ impl AppRuntime {
     }
 
     async fn stop_preview_process(&self) {
+        let (monitor_handle, mut preview_child, sdp_path) = {
+            let mut runtime = self.video_runtime.lock().await;
+            (
+                runtime.preview_monitor_handle.take(),
+                runtime.preview_child.take(),
+                runtime.sdp_path.take(),
+            )
+        };
+
+        if let Some(handle) = monitor_handle {
+            handle.abort();
+        }
+
+        if let Some(mut child) = preview_child.take() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(b"quit\n").await;
+                let _ = stdin.flush().await;
+            }
+
+            if timeout(Duration::from_secs(VLC_SHUTDOWN_TIMEOUT_SECS), child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
+        }
+
+        if let Some(sdp_path) = sdp_path {
+            let _ = fs::remove_file(sdp_path);
+        }
+
         let mut runtime = self.video_runtime.lock().await;
-        if let Some(handle) = runtime.preview_stdout_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = runtime.preview_stderr_handle.take() {
-            handle.abort();
-        }
-        if let Some(child) = runtime.preview_child.as_mut() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-        runtime.preview_child = None;
+        runtime.preview_http_port = None;
         runtime.last_preview_frame_at = None;
+        runtime.log_path = None;
     }
 
     async fn launch_preview_process(
         &self,
         app: &AppHandle,
-        gst_launch: &Path,
-        recording_temp_h264_path: Option<&Path>,
+        vlc_executable: &Path,
+        recording_mp4_path: Option<&Path>,
     ) -> Result<(), String> {
         self.stop_preview_process().await;
-
-        let mut preview_child = spawn_preview_process(gst_launch, recording_temp_h264_path)?;
-        let preview_stdout = preview_child
-            .stdout
-            .take()
-            .ok_or_else(|| "Unable to capture preview process output.".to_string())?;
-        let preview_stderr = preview_child
-            .stderr
-            .take()
-            .ok_or_else(|| "Unable to capture preview process diagnostics.".to_string())?;
+        let preview_http_port = allocate_loopback_port()?;
+        let sdp_path = self
+            .video_dir
+            .join(format!("live-preview-{}.sdp", preview_http_port));
+        write_live_sdp(&sdp_path)?;
+        let log_path = self
+            .video_dir
+            .join(format!("live-preview-{}.log", preview_http_port));
+        let preview_child = spawn_vlc_preview_process(
+            vlc_executable,
+            &sdp_path,
+            preview_http_port,
+            recording_mp4_path,
+            &log_path,
+        )?;
 
         let (recording_active, current_clip_id) = {
             let runtime = self.video_runtime.lock().await;
@@ -1153,10 +1227,9 @@ impl AppRuntime {
         };
 
         {
-            let preview_url = self.video_preview.read().await.preview_url.clone();
             *self.video_preview.write().await = VideoPreviewState {
                 status: VideoPreviewStatus::WaitingForStream,
-                preview_url,
+                preview_url: Some(preview_stream_url(preview_http_port)),
                 recording_active,
                 current_clip_id,
                 message: Some(video_status_message(&VideoPreviewStatus::WaitingForStream).to_string()),
@@ -1165,59 +1238,19 @@ impl AppRuntime {
         *self.latest_preview_frame.write().await = None;
         let _ = self.preview_frame_sender.send(None);
 
-        let runtime_for_preview = app.state::<Arc<AppRuntime>>().inner().clone();
-        let app_for_preview = app.clone();
-        let preview_stdout_handle = tauri::async_runtime::spawn(async move {
-            let result = stream_preview_jpegs(runtime_for_preview.clone(), &app_for_preview, preview_stdout).await;
-            if let Err(error) = result {
-                runtime_for_preview
-                    .push_warning(&app_for_preview, format!("Live video preview failed: {error}"))
-                    .await;
-                {
-                    let mut preview = runtime_for_preview.video_preview.write().await;
-                    let preview_url = preview.preview_url.clone();
-                    *preview = VideoPreviewState {
-                        status: VideoPreviewStatus::Error,
-                        preview_url,
-                        recording_active: false,
-                        current_clip_id: None,
-                        message: Some("Live video preview failed".into()),
-                    };
-                }
-                let _ = runtime_for_preview.emit_snapshot(&app_for_preview).await;
-            } else {
-                runtime_for_preview
-                    .push_warning(
-                        &app_for_preview,
-                        "Live video preview ended unexpectedly.".into(),
-                    )
-                    .await;
-                {
-                    let mut preview = runtime_for_preview.video_preview.write().await;
-                    let preview_url = preview.preview_url.clone();
-                    *preview = VideoPreviewState {
-                        status: VideoPreviewStatus::Error,
-                        preview_url,
-                        recording_active: false,
-                        current_clip_id: None,
-                        message: Some("Live video preview unavailable".into()),
-                    };
-                }
-                let _ = runtime_for_preview.emit_snapshot(&app_for_preview).await;
-            }
-        });
-
-        let runtime_for_preview_stderr = app.state::<Arc<AppRuntime>>().inner().clone();
-        let app_for_preview_stderr = app.clone();
-        let preview_stderr_handle = tauri::async_runtime::spawn(async move {
-            consume_preview_stderr(runtime_for_preview_stderr, &app_for_preview_stderr, preview_stderr).await;
+        let runtime_for_monitor = app.state::<Arc<AppRuntime>>().inner().clone();
+        let app_for_monitor = app.clone();
+        let preview_monitor_handle = tauri::async_runtime::spawn(async move {
+            monitor_preview_stream(runtime_for_monitor, &app_for_monitor, preview_http_port).await;
         });
 
         let mut runtime = self.video_runtime.lock().await;
         runtime.preview_child = Some(preview_child);
-        runtime.preview_stdout_handle = Some(preview_stdout_handle);
-        runtime.preview_stderr_handle = Some(preview_stderr_handle);
+        runtime.preview_monitor_handle = Some(preview_monitor_handle);
         runtime.last_preview_frame_at = None;
+        runtime.preview_http_port = Some(preview_http_port);
+        runtime.sdp_path = Some(sdp_path);
+        runtime.log_path = Some(log_path);
 
         Ok(())
     }
@@ -1229,10 +1262,12 @@ impl AppRuntime {
     ) -> Result<(), String> {
         self.stop_video_subsystem(app).await?;
 
-        let gst_launch = resolve_gstreamer_executable(app)
-            .ok_or_else(|| "Live video runtime unavailable: gst-launch-1.0.exe not found in bundled resources or PATH.".to_string())?;
-        *self.gstreamer_path.write().await = Some(gst_launch.clone());
-        self.launch_preview_process(app, &gst_launch, None).await?;
+        let vlc_executable = resolve_vlc_executable(app).ok_or_else(|| {
+            "Live video runtime unavailable: vlc.exe not found in bundled resources or PATH."
+                .to_string()
+        })?;
+        *self.vlc_path.write().await = Some(vlc_executable.clone());
+        self.launch_preview_process(app, &vlc_executable, None).await?;
 
         self.emit_snapshot(app).await?;
         Ok(())
@@ -1242,11 +1277,7 @@ impl AppRuntime {
         let _ = self.stop_video_recording_internal(app, false).await;
         self.stop_preview_process().await;
 
-        let preview_url = self.video_preview.read().await.preview_url.clone();
-        *self.video_preview.write().await = VideoPreviewState {
-            preview_url,
-            ..VideoPreviewState::default()
-        };
+        *self.video_preview.write().await = VideoPreviewState::default();
         *self.latest_preview_frame.write().await = None;
         let _ = self.preview_frame_sender.send(None);
         Ok(())
@@ -1257,13 +1288,13 @@ impl AppRuntime {
         app: &AppHandle,
         session_id: &str,
     ) -> Result<(), String> {
-        let gst_launch = self
-            .gstreamer_path
+        let vlc_executable = self
+            .vlc_path
             .read()
             .await
             .clone()
-            .or_else(|| resolve_gstreamer_executable(app))
-            .ok_or_else(|| "Live video runtime unavailable: gst-launch-1.0.exe not found.".to_string())?;
+            .or_else(|| resolve_vlc_executable(app))
+            .ok_or_else(|| "Live video runtime unavailable: vlc.exe not found.".to_string())?;
 
         let mut runtime = self.video_runtime.lock().await;
         if runtime.recording.is_some() {
@@ -1274,26 +1305,25 @@ impl AppRuntime {
         fs::create_dir_all(&session_dir).map_err(|error| error.to_string())?;
         let clip_id = Uuid::new_v4().to_string();
         let started_at = Utc::now().to_rfc3339();
-        let temp_h264_path = session_dir.join(format!("{clip_id}.h264"));
         let mp4_path = session_dir.join(format!("{clip_id}.mp4"));
+        let _ = fs::remove_file(&mp4_path);
 
         runtime.recording = Some(RecordingRunState {
             clip_id: clip_id.clone(),
             session_id: session_id.to_string(),
             started_at,
-            temp_h264_path,
             mp4_path,
         });
         drop(runtime);
-        let recording_temp_path = self
+        let recording_output_path = self
             .video_runtime
             .lock()
             .await
             .recording
             .as_ref()
-            .map(|recording| recording.temp_h264_path.clone())
+            .map(|recording| recording.mp4_path.clone())
             .ok_or_else(|| "Recording state was not initialized.".to_string())?;
-        self.launch_preview_process(app, &gst_launch, Some(&recording_temp_path))
+        self.launch_preview_process(app, &vlc_executable, Some(&recording_output_path))
             .await?;
         self.emit_snapshot(app).await?;
         Ok(())
@@ -1319,23 +1349,11 @@ impl AppRuntime {
             - parse_timestamp(&recording.started_at).unwrap_or_else(|_| Utc::now()))
             .num_milliseconds()
             .max(0) as u64;
-        let bytes_written = fs::metadata(&recording.temp_h264_path)
+        let bytes_written = fs::metadata(&recording.mp4_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
 
         if bytes_written > 0 {
-            let gst_launch = self
-                .gstreamer_path
-                .read()
-                .await
-                .clone()
-                .or_else(|| resolve_gstreamer_executable(app))
-                .ok_or_else(|| "Live video runtime unavailable while finalizing recording.".to_string())?;
-            remux_h264_to_mp4(&gst_launch, &recording.temp_h264_path, &recording.mp4_path).await?;
-
-            let clip_bytes = fs::metadata(&recording.mp4_path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(bytes_written);
             let clip = SessionVideoClip {
                 id: recording.clip_id.clone(),
                 session_id: recording.session_id.clone(),
@@ -1347,7 +1365,7 @@ impl AppRuntime {
                 height: 1080,
                 fps: 60.0,
                 codec: "h264".into(),
-                bytes: clip_bytes,
+                bytes: bytes_written,
             };
             self.db.upsert_session_video_clip(&clip)?;
             *self.sessions.write().await = self.db.load_sessions(MAX_SESSION_HISTORY)?;
@@ -1357,17 +1375,15 @@ impl AppRuntime {
             }
         }
 
-        let _ = fs::remove_file(&recording.temp_h264_path);
-
         if restart_preview {
-            let gst_launch = self
-                .gstreamer_path
+            let vlc_executable = self
+                .vlc_path
                 .read()
                 .await
                 .clone()
-                .or_else(|| resolve_gstreamer_executable(app))
+                .or_else(|| resolve_vlc_executable(app))
                 .ok_or_else(|| "Live video runtime unavailable while restarting preview.".to_string())?;
-            self.launch_preview_process(app, &gst_launch, None).await?;
+            self.launch_preview_process(app, &vlc_executable, None).await?;
         } else {
             let mut preview = self.video_preview.write().await;
             preview.recording_active = false;
@@ -1377,15 +1393,13 @@ impl AppRuntime {
         Ok(())
     }
 
-    async fn publish_preview_frame(&self, app: &AppHandle, frame: Vec<u8>) {
+    async fn register_preview_activity(&self, app: &AppHandle) {
         let mut should_emit = false;
         let recording_active = {
             let mut runtime = self.video_runtime.lock().await;
             runtime.last_preview_frame_at = Some(Utc::now());
             runtime.recording.is_some()
         };
-        *self.latest_preview_frame.write().await = Some(frame.clone());
-        let _ = self.preview_frame_sender.send(Some(frame));
         {
             let mut preview = self.video_preview.write().await;
             let next_status = if recording_active {
@@ -2103,219 +2117,228 @@ fn video_status_message(status: &VideoPreviewStatus) -> &'static str {
     }
 }
 
-fn resolve_gstreamer_executable(app: &AppHandle) -> Option<PathBuf> {
-    let bundled = app
-        .path()
-        .resource_dir()
-        .ok()
-        .map(|path| path.join("gstreamer").join("bin").join("gst-launch-1.0.exe"));
-    if let Some(path) = bundled {
-        if path.is_file() {
-            return Some(path);
+fn resolve_vlc_executable(app: &AppHandle) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("vlc").join("vlc.exe"));
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            candidates.push(exe_dir.join("vlc").join("vlc.exe"));
+            candidates.push(exe_dir.join("resources").join("vlc").join("vlc.exe"));
+            candidates.push(
+                exe_dir
+                    .join("..")
+                    .join("resources")
+                    .join("vlc")
+                    .join("vlc.exe"),
+            );
+        }
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("src-tauri").join("resources").join("vlc").join("vlc.exe"));
+        candidates.push(current_dir.join("resources").join("vlc").join("vlc.exe"));
+    }
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
 
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
-            .map(|path| path.join("gst-launch-1.0.exe"))
+            .map(|path| path.join("vlc.exe"))
             .find(|candidate| candidate.is_file())
     })
 }
 
-fn configure_gstreamer_command(command: &mut Command, gst_launch: &Path) {
-    if let Some(gst_root) = gst_launch.parent().and_then(|bin_dir| bin_dir.parent()) {
-        let bin_dir = gst_root.join("bin");
-        let plugin_dir = gst_root.join("lib").join("gstreamer-1.0");
-        let scanner_path = gst_root
-            .join("libexec")
-            .join("gstreamer-1.0")
-            .join("gst-plugin-scanner.exe");
+fn configure_vlc_command(command: &mut Command, vlc_executable: &Path) {
+    if let Some(vlc_root) = vlc_executable.parent() {
+        let plugin_dir = vlc_root.join("plugins");
+        command.current_dir(vlc_root);
+        if plugin_dir.is_dir() {
+            command.env("VLC_PLUGIN_PATH", plugin_dir);
+        }
+    }
 
-        let existing_path = env::var_os("PATH").unwrap_or_default();
-        let mut joined_paths = vec![bin_dir.clone()];
-        joined_paths.extend(env::split_paths(&existing_path));
-        if let Ok(path_value) = env::join_paths(joined_paths) {
-            command.env("PATH", path_value);
-        }
-        command.env("GST_PLUGIN_SYSTEM_PATH_1_0", plugin_dir);
-        if scanner_path.is_file() {
-            command.env("GST_PLUGIN_SCANNER_1_0", scanner_path);
-        }
-        command.current_dir(gst_root);
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
     }
 }
 
-fn gstreamer_location_arg(path: &Path) -> String {
+fn preview_stream_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}{VIDEO_PREVIEW_PATH}")
+}
+
+fn write_live_sdp(path: &Path) -> Result<(), String> {
+    fs::write(
+        path,
+        format!(
+            "c=IN IP4 0.0.0.0\r\nm=video {LIVE_VIDEO_RTP_PORT} RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n"
+        ),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn vlc_file_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn spawn_preview_process(
-    gst_launch: &Path,
-    recording_temp_h264_path: Option<&Path>,
-) -> Result<Child, String> {
-    let mut command = Command::new(gst_launch);
-    configure_gstreamer_command(&mut command, gst_launch);
-    let port_arg = format!("port={LIVE_VIDEO_RTP_PORT}");
-    command
-        .arg("-q")
-        .arg("udpsrc")
-        .arg(port_arg)
-        .arg("reuse=true")
-        .arg("buffer-size=2097152")
-        .arg("caps=application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000")
-        .arg("!")
-        .arg("rtpjitterbuffer")
-        .arg("latency=15")
-        .arg("drop-on-latency=true")
-        .arg("do-lost=true")
-        .arg("!")
-        .arg("rtph264depay")
-        .arg("!")
-        .arg("h264parse")
-        .arg("config-interval=-1")
-        .arg("!")
-        .arg("tee")
-        .arg("name=t");
+fn vlc_sout_file_path(path: &Path) -> String {
+    format!("'{}'", vlc_file_path(path).replace('\'', "\\'"))
+}
 
-    if let Some(path) = recording_temp_h264_path {
-        command
-            .arg("t.")
-            .arg("!")
-            .arg("queue")
-            .arg("!")
-            .arg("video/x-h264,stream-format=byte-stream,alignment=au")
-            .arg("!")
-            .arg("filesink")
-            .arg(format!("location={}", gstreamer_location_arg(path)))
-            .arg("sync=false");
+fn build_vlc_sout(preview_http_port: u16, recording_mp4_path: Option<&Path>) -> String {
+    let preview_dst = format!(
+        ":{}{}",
+        preview_http_port,
+        VIDEO_PREVIEW_PATH
+    );
+    let preview_branch = format!(
+        "transcode{{vcodec=MJPG,vb=8000,scale=1,acodec=none}}:standard{{access=http{{mime=multipart/x-mixed-replace;boundary=--frame}},mux=mpjpeg,dst={preview_dst}}}"
+    );
+
+    if let Some(path) = recording_mp4_path {
+        format!(
+            "#duplicate{{dst={preview_branch},dst=standard{{access=file,mux=mp4,dst={}}}}}",
+            vlc_sout_file_path(path)
+        )
+    } else {
+        format!("#{preview_branch}")
     }
+}
 
+fn spawn_vlc_preview_process(
+    vlc_executable: &Path,
+    sdp_path: &Path,
+    preview_http_port: u16,
+    recording_mp4_path: Option<&Path>,
+    log_path: &Path,
+) -> Result<Child, String> {
+    let mut command = Command::new(vlc_executable);
+    configure_vlc_command(&mut command, vlc_executable);
+    let sout = build_vlc_sout(preview_http_port, recording_mp4_path);
     command
-        .arg("t.")
-        .arg("!")
-        .arg("queue")
-        .arg("!")
-        .arg("avdec_h264")
-        .arg("!")
-        .arg("videoconvert")
-        .arg("!")
-        .arg("videorate")
-        .arg("!")
-        .arg("video/x-raw,framerate=20/1")
-        .arg("!")
-        .arg("jpegenc")
-        .arg("quality=80")
-        .arg("!")
-        .arg("fdsink")
-        .arg("fd=1")
-        .arg("sync=false")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .arg("-I")
+        .arg("dummy")
+        .arg("--extraintf")
+        .arg("rc")
+        .arg("--rc-quiet")
+        .arg("--ignore-config")
+        .arg("--file-logging")
+        .arg("--logmode")
+        .arg("text")
+        .arg("--logfile")
+        .arg(log_path)
+        .arg("--no-video-title-show")
+        .arg("--no-sout-audio")
+        .arg("--network-caching=60")
+        .arg("--live-caching=60")
+        .arg("--clock-jitter=0")
+        .arg("--clock-synchro=0")
+        .arg("--drop-late-frames")
+        .arg("--skip-frames")
+        .arg(sdp_path)
+        .arg("--sout")
+        .arg(sout)
+        .arg("--sout-keep")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|error| error.to_string())
 }
 
-async fn remux_h264_to_mp4(
-    gst_launch: &Path,
-    input_path: &Path,
-    output_path: &Path,
-) -> Result<(), String> {
-    let mut command = Command::new(gst_launch);
-    configure_gstreamer_command(&mut command, gst_launch);
-    let status = command
-        .args([
-            "-q",
-            "filesrc",
-            &format!("location={}", gstreamer_location_arg(input_path)),
-            "!",
-            "h264parse",
-            "!",
-            "mp4mux",
-            "faststart=true",
-            "!",
-            "filesink",
-            &format!("location={}", gstreamer_location_arg(output_path)),
-        ])
-        .status()
-        .await
+fn allocate_loopback_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| error.to_string())?;
+    let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+    drop(listener);
+    Ok(port)
+}
 
-    if status.success() {
-        Ok(())
+fn preview_stream_request(port: u16) -> Vec<u8> {
+    format!(
+        "GET {VIDEO_PREVIEW_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+fn buffer_contains_jpeg_frame(buffer: &[u8]) -> bool {
+    buffer.windows(2).any(|window| window == [0xFF, 0xD8])
+        || buffer
+            .windows(b"Content-Type: image/jpeg".len())
+            .any(|window| window == b"Content-Type: image/jpeg")
+}
+
+fn read_log_tail(path: &Path, line_limit: usize) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let tail = content
+        .lines()
+        .rev()
+        .take(line_limit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let trimmed = tail.trim();
+    if trimmed.is_empty() {
+        None
     } else {
-        Err("Unable to finalize recorded video clip.".into())
+        Some(trimmed.to_string())
     }
 }
 
-async fn stream_preview_jpegs(
+async fn monitor_preview_stream(
     runtime: Arc<AppRuntime>,
     app: &AppHandle,
-    mut stdout: ChildStdout,
-) -> Result<(), String> {
-    let mut read_buffer = [0u8; 65536];
-    let mut buffer = Vec::<u8>::new();
-
-    loop {
-        let read = stdout
-            .read(&mut read_buffer)
-            .await
-            .map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&read_buffer[..read]);
-
-        while let Some(frame) = extract_next_jpeg_frame(&mut buffer) {
-            runtime.publish_preview_frame(app, frame).await;
-        }
-    }
-
-    Ok(())
-}
-
-async fn consume_preview_stderr(
-    runtime: Arc<AppRuntime>,
-    app: &AppHandle,
-    stderr: ChildStderr,
+    preview_http_port: u16,
 ) {
-    let mut reader = BufReader::new(stderr);
-    let mut line = String::new();
+    let request = preview_stream_request(preview_http_port);
+    let mut read_buffer = vec![0_u8; 65_536];
 
     loop {
-        line.clear();
-        let Ok(read) = reader.read_line(&mut line).await else {
-            break;
+        let mut stream = match TcpStream::connect(("127.0.0.1", preview_http_port)).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                sleep(Duration::from_millis(VLC_HTTP_PROBE_INTERVAL_MS)).await;
+                continue;
+            }
         };
-        if read == 0 {
-            break;
-        }
 
-        let message = line.trim();
-        if message.is_empty() {
+        if stream.write_all(&request).await.is_err() || stream.flush().await.is_err() {
+            sleep(Duration::from_millis(VLC_HTTP_PROBE_INTERVAL_MS)).await;
             continue;
         }
 
-        runtime
-            .push_warning(app, format!("Live video runtime: {message}"))
-            .await;
-    }
-}
+        loop {
+            let read = match timeout(
+                Duration::from_millis(VLC_HTTP_PROBE_TIMEOUT_MS),
+                stream.read(&mut read_buffer),
+            )
+            .await
+            {
+                Ok(Ok(read)) => read,
+                _ => break,
+            };
 
-fn extract_next_jpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let start = buffer
-        .windows(2)
-        .position(|window| window == [0xFF, 0xD8])?;
-    if start > 0 {
-        buffer.drain(0..start);
+            if read == 0 {
+                break;
+            }
+
+            if buffer_contains_jpeg_frame(&read_buffer[..read]) {
+                runtime.register_preview_activity(app).await;
+            }
+        }
+
+        sleep(Duration::from_millis(VLC_HTTP_PROBE_INTERVAL_MS)).await;
     }
-    let end = buffer
-        .windows(2)
-        .position(|window| window == [0xFF, 0xD9])?;
-    if end + 2 <= buffer.len() {
-        let frame = buffer.drain(0..end + 2).collect::<Vec<_>>();
-        return Some(frame);
-    }
-    None
 }
 
 fn sanitize_extension(extension: &str) -> &str {

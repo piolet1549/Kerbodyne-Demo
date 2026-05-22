@@ -1,7 +1,7 @@
 {
   "name": "kerbodyne-ground-station",
   "private": true,
-  "version": "0.1.12",
+  "version": "0.1.13",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 1420",
@@ -11,9 +11,9 @@
     "clean:build": "powershell -ExecutionPolicy Bypass -File scripts/clean-build-artifacts.ps1",
     "clean:cache": "powershell -ExecutionPolicy Bypass -File scripts/clean-runtime-cache.ps1",
     "clean:all": "npm run clean:build && npm run clean:cache",
-    "prepare:gstreamer": "powershell -ExecutionPolicy Bypass -File scripts/prepare-gstreamer-runtime.ps1",
+    "prepare:vlc": "powershell -ExecutionPolicy Bypass -File scripts/prepare-vlc-runtime.ps1",
     "tauri:dev": "tauri dev",
-    "tauri:build": "npm run prepare:gstreamer && tauri build"
+    "tauri:build": "npm run prepare:vlc && tauri build"
   },
   "dependencies": {
     "@protomaps/basemaps": "^5.7.2",
