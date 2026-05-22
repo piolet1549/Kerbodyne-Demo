@@ -385,7 +385,7 @@ impl Default for VideoPreviewState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionStatus {
     Disconnected,
@@ -394,6 +394,20 @@ pub enum ConnectionStatus {
     ReceivingTelemetry,
     ReceivingAlert,
     Stale,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LegacyTelemetryPacketType {
+    #[serde(rename = "hf")]
+    HighFrequency,
+    #[serde(rename = "mf")]
+    MediumFrequency,
+    #[serde(rename = "lf")]
+    LowFrequency,
+    #[serde(rename = "oc")]
+    OnChange,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,14 +477,35 @@ pub struct ReviewTelemetryFrame {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LegacyTelemetryPacket {
+    #[serde(rename = "type", default)]
+    pub packet_type: Option<LegacyTelemetryPacketType>,
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub alt_m: Option<f64>,
+    pub vspeed_ms: Option<f64>,
     pub ground_speed_ms: Option<f64>,
     pub heading_deg: Option<f64>,
+    pub pitch_deg: Option<f64>,
+    pub roll_deg: Option<f64>,
+    pub flight_mode: Option<u32>,
+    pub throttle_pct: Option<f64>,
+    pub nav_pitch_deg: Option<f64>,
+    pub nav_roll_deg: Option<f64>,
+    pub alt_demanded_m: Option<f64>,
+    pub vib_x: Option<f64>,
+    pub vib_y: Option<f64>,
+    pub vib_z: Option<f64>,
     pub battery_v: Option<f64>,
-    pub battery_remaining_pct: Option<f64>,
+    pub battery_a: Option<f64>,
+    #[serde(alias = "battery_remaining_pct")]
+    pub battery_pct: Option<f64>,
+    pub battery_mah: Option<f64>,
     pub armed: Option<bool>,
+    pub cpu_temp_c: Option<f64>,
+    pub cpu_pct: Option<f64>,
+    pub cpu_mhz: Option<f64>,
+    pub npu_temp_c: Option<f64>,
+    pub vision_active: Option<bool>,
     #[serde(flatten)]
     pub extras: HashMap<String, Value>,
 }
@@ -519,8 +554,8 @@ pub struct LegacySystemStatusPacket {
 #[cfg(test)]
 mod tests {
     use super::{
-        LegacyAlertPacket, LegacySystemStatusPacket, LegacyTelemetryPacket, TelemetryPayload,
-        WireEnvelope, SCHEMA_VERSION,
+        LegacyAlertPacket, LegacySystemStatusPacket, LegacyTelemetryPacket,
+        LegacyTelemetryPacketType, TelemetryPayload, WireEnvelope, SCHEMA_VERSION,
     };
 
     #[test]
@@ -560,7 +595,28 @@ mod tests {
         let packet: LegacyTelemetryPacket = serde_json::from_str(raw).unwrap();
         assert_eq!(packet.lat, Some(38.5));
         assert_eq!(packet.alt_m, Some(180.0));
-        assert_eq!(packet.battery_remaining_pct, Some(87.0));
+        assert_eq!(packet.battery_pct, Some(87.0));
+    }
+
+    #[test]
+    fn split_legacy_telemetry_packet_roundtrips() {
+        let raw = r#"{
+            "type":"lf",
+            "battery_v":15.6,
+            "battery_a":22.4,
+            "battery_pct":61,
+            "battery_mah":1033,
+            "cpu_temp_c":71.4,
+            "cpu_pct":48.2,
+            "cpu_mhz":2399,
+            "npu_temp_c":62.8,
+            "vision_active":true
+        }"#;
+
+        let packet: LegacyTelemetryPacket = serde_json::from_str(raw).unwrap();
+        assert_eq!(packet.packet_type, Some(LegacyTelemetryPacketType::LowFrequency));
+        assert_eq!(packet.battery_pct, Some(61.0));
+        assert_eq!(packet.vision_active, Some(true));
     }
 
     #[test]

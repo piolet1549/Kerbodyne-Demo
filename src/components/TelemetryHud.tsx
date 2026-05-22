@@ -1,5 +1,4 @@
 import type { AircraftLiveState, HudMetricState } from '../lib/types';
-import { formatTimestamp } from '../lib/time';
 
 type HudStatusVariant = 'waiting' | 'pending' | 'connected' | 'stale';
 
@@ -12,17 +11,36 @@ interface ExpandedHudData {
   open: boolean;
   cpuTempC?: number | null;
   cpuPercent?: number | null;
+  cpuClockMhz?: number | null;
   npuTempC?: number | null;
-  status: HudStatus;
+  throttlePct?: number | null;
+  verticalSpeedMps?: number | null;
+  vibrationX?: number | null;
+  vibrationY?: number | null;
+  vibrationZ?: number | null;
+  altitudeMslM?: number | null;
+  targetAltitudeMslM?: number | null;
+}
+
+interface AttitudeData {
+  pitchDeg?: number | null;
+  rollDeg?: number | null;
+  navPitchDeg?: number | null;
+  navRollDeg?: number | null;
 }
 
 interface TelemetryHudProps {
   liveState?: AircraftLiveState | null;
   mode: 'live' | 'review';
-  reviewTimestamp?: string | null;
   altitudeAglM?: number | null;
   altitudeMslM?: number | null;
+  targetAltitudeMslM?: number | null;
   liveConnectionState?: HudStatus | null;
+  visionStatus?: HudStatus | null;
+  visionValue?: boolean | null;
+  flightModeLabel: string;
+  batteryPercent?: number | null;
+  attitude?: AttitudeData | null;
   metricStates?: {
     altitude?: HudMetricState;
     speed?: HudMetricState;
@@ -31,7 +49,6 @@ interface TelemetryHudProps {
   expandedHud?: ExpandedHudData | null;
   onOpenRawData?: (() => void) | undefined;
   onToggleExpandedHud?: (() => void) | undefined;
-  onExportTelemetry?: (() => void) | undefined;
 }
 
 function renderValue(value?: number | null, suffix = ''): string {
@@ -44,14 +61,15 @@ function renderWholeValue(value?: number | null, suffix = ''): string {
   return `${value.toFixed(0)}${suffix}`;
 }
 
-function renderPositionLabel(liveState?: AircraftLiveState | null) {
-  const positionAvailable =
-    liveState?.armed &&
-    liveState.lat != null &&
-    !Number.isNaN(liveState.lat) &&
-    liveState.lon != null &&
-    !Number.isNaN(liveState.lon);
-  return positionAvailable ? `${liveState!.lat!.toFixed(5)}, ${liveState!.lon!.toFixed(5)}` : '--';
+function renderHeadingValue(value?: number | null): string {
+  if (value == null || Number.isNaN(value)) return '--';
+  const normalized = ((Math.round(value) % 360) + 360) % 360;
+  return normalized.toString().padStart(3, '0');
+}
+
+function renderSpeedMph(value?: number | null): string {
+  if (value == null || Number.isNaN(value)) return '--';
+  return `${(value * 2.2369362920544).toFixed(1)} mph`;
 }
 
 function metricClasses(state?: HudMetricState) {
@@ -71,45 +89,134 @@ function metricStyle(state?: HudMetricState) {
   return { color: state.color_hex };
 }
 
-function ExportIcon() {
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function formatSignedPitchLabel(value: number) {
+  return `${value > 0 ? '+' : ''}${value}`;
+}
+
+function AttitudeIndicator({ attitude }: { attitude?: AttitudeData | null }) {
+  const pitch = attitude?.pitchDeg ?? 0;
+  const roll = attitude?.rollDeg ?? 0;
+  const hasCommand =
+    attitude?.navPitchDeg != null &&
+    !Number.isNaN(attitude.navPitchDeg) &&
+    attitude?.navRollDeg != null &&
+    !Number.isNaN(attitude.navRollDeg);
+  const navPitch = hasCommand ? (attitude?.navPitchDeg as number) : pitch;
+  const navRoll = hasCommand ? (attitude?.navRollDeg as number) : roll;
+  const horizonTranslateY = clamp(pitch * -2.4, -58, 58);
+  const commandTranslateY = clamp((pitch - navPitch) * 2.2, -36, 36);
+  const commandRotate = clamp(navRoll - roll, -42, 42);
+  const commandTranslateX = clamp((navRoll - roll) * 1.1, -36, 36);
+  const pitchMarks = [-20, -10, 10, 20];
+
   return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="icon-export">
-      <path d="M12 4v10" />
-      <path d="m8 10 4 4 4-4" />
-      <path d="M5 17.5h14" />
-      <path d="M7 20h10" />
-    </svg>
+    <div className="telemetry-hud__attitude-shell" aria-label="Attitude indicator">
+      <div className="telemetry-hud__attitude">
+        <div className="telemetry-hud__attitude-roll-arc" />
+        <div className="telemetry-hud__attitude-roll-notch" />
+        <div className="telemetry-hud__attitude-mask">
+          <div
+            className="telemetry-hud__attitude-horizon"
+            style={{ transform: `translateY(${horizonTranslateY}px) rotate(${roll}deg)` }}
+          >
+            <div className="telemetry-hud__attitude-sky" />
+            <div className="telemetry-hud__attitude-ground" />
+            <div className="telemetry-hud__attitude-line" />
+            {pitchMarks.map((mark) => (
+              <div
+                key={mark}
+                className="telemetry-hud__attitude-pitch-mark"
+                style={{ top: `calc(50% + ${mark * -2.4}px)` }}
+              >
+                <span className="telemetry-hud__attitude-pitch-label">
+                  {formatSignedPitchLabel(mark)}
+                </span>
+                <span className="telemetry-hud__attitude-pitch-bar" />
+                <span className="telemetry-hud__attitude-pitch-label">
+                  {formatSignedPitchLabel(mark)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="telemetry-hud__attitude-aircraft" />
+        {hasCommand ? (
+          <div
+            className="telemetry-hud__attitude-command"
+            style={{
+              transform: `translate(${commandTranslateX}px, ${commandTranslateY}px) rotate(${commandRotate}deg)`
+            }}
+          />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function VisionIndicator({
+  mode,
+  status,
+  value
+}: {
+  mode: 'live' | 'review';
+  status?: HudStatus | null;
+  value?: boolean | null;
+}) {
+  if (mode === 'review') {
+    return (
+      <div className="telemetry-hud__vision-indicator telemetry-hud__vision-indicator--review">
+        <span className="telemetry-hud__label">Vision</span>
+        <strong title={status?.label} aria-label={status?.label}>
+          {value == null ? '--' : value ? 'on' : 'off'}
+        </strong>
+      </div>
+    );
+  }
+
+  const className = [
+    'telemetry-hud__vision-indicator',
+    status ? `telemetry-hud__vision-indicator--${status.variant}` : ''
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  return (
+    <div className={className} title={status?.label} aria-label={status?.label}>
+      <span className="telemetry-hud__vision-label">Vision</span>
+    </div>
   );
 }
 
 export function TelemetryHud({
   liveState,
   mode,
-  reviewTimestamp,
   altitudeAglM,
   altitudeMslM,
+  targetAltitudeMslM,
   liveConnectionState,
+  visionStatus,
+  visionValue,
+  flightModeLabel,
+  batteryPercent,
+  attitude,
   metricStates,
   expandedHud,
   onOpenRawData,
-  onToggleExpandedHud,
-  onExportTelemetry
+  onToggleExpandedHud
 }: TelemetryHudProps) {
-  const positionLabel = renderPositionLabel(liveState);
-  const expandedHudDisabled = mode === 'live' && liveConnectionState?.variant === 'waiting';
   const liveHudClassName = [
     'telemetry-hud',
-    mode === 'live' && liveConnectionState ? `telemetry-hud--status-${liveConnectionState.variant}` : ''
+    mode === 'live' && liveConnectionState ? `telemetry-hud--status-${liveConnectionState.variant}` : '',
+    mode === 'review' || expandedHud?.open ? 'telemetry-hud--open' : ''
   ]
     .filter(Boolean)
     .join(' ');
-  const expandedHudClassName = [
-    'telemetry-hud',
-    'telemetry-hud--expanded',
-    mode === 'live' && expandedHud ? `telemetry-hud--status-${expandedHud.status.variant}` : ''
-  ]
-    .filter(Boolean)
-    .join(' ');
+
+  const showExpanded = (mode === 'live' && expandedHud?.open) || (mode === 'review' && expandedHud);
 
   return (
     <div className="telemetry-hud-stack">
@@ -119,40 +226,34 @@ export function TelemetryHud({
         aria-label={mode === 'live' && liveConnectionState ? liveConnectionState.label : undefined}
       >
         <div className="telemetry-hud__topline">
-          <div className="telemetry-hud__row telemetry-hud__row--wide">
-            <span className="telemetry-hud__label">
-              {mode === 'review' ? 'Replay position' : 'Position'}
-            </span>
-            <strong>{positionLabel}</strong>
-            {mode === 'review' && reviewTimestamp ? (
-              <span className="telemetry-hud__subvalue">{formatTimestamp(reviewTimestamp)}</span>
-            ) : null}
+          <div className="telemetry-hud__mode-box">
+            <span className="telemetry-hud__label">Flight mode</span>
+            <strong>{flightModeLabel}</strong>
           </div>
 
-          {mode === 'live' && onOpenRawData ? (
-            <button className="secondary-button telemetry-hud__top-action" onClick={onOpenRawData}>
-              View raw data
-            </button>
-          ) : null}
-
-          {mode === 'review' && onExportTelemetry ? (
-            <button
-              className="secondary-button telemetry-hud__export-button"
-              onClick={onExportTelemetry}
-              aria-label="Export flight telemetry"
-              title="Export flight telemetry"
-            >
-              <ExportIcon />
-            </button>
-          ) : null}
+          <div className="telemetry-hud__topline-actions">
+            <VisionIndicator mode={mode} status={visionStatus} value={visionValue} />
+          </div>
         </div>
+
+        <AttitudeIndicator attitude={attitude} />
 
         <div className="telemetry-hud__grid">
           <div>
-            <span className="telemetry-hud__label">Heading</span>
-            <strong className="telemetry-hud__metric-value">
-              {renderWholeValue(liveState?.heading_deg, ' deg')}
+            <span className="telemetry-hud__label">Altitude</span>
+            <strong
+              className={metricClasses(metricStates?.altitude)}
+              style={metricStyle(metricStates?.altitude)}
+            >
+              {renderValue(altitudeAglM, ' m')}
             </strong>
+            <span
+              className={`telemetry-hud__subvalue ${
+                metricStates?.altitude?.pulse ? 'telemetry-hud__subvalue--pulse' : ''
+              }`}
+            >
+              {renderValue(targetAltitudeMslM, ' m')}
+            </span>
           </div>
           <div>
             <span className="telemetry-hud__label">Speed</span>
@@ -162,22 +263,13 @@ export function TelemetryHud({
             >
               {renderValue(liveState?.groundspeed_mps, ' m/s')}
             </strong>
+            <span className="telemetry-hud__subvalue">{renderSpeedMph(liveState?.groundspeed_mps)}</span>
           </div>
           <div>
-            <span className="telemetry-hud__label">Altitude</span>
-            <strong
-              className={metricClasses(metricStates?.altitude)}
-              style={metricStyle(metricStates?.altitude)}
-            >
-              {renderValue(altitudeAglM ?? 0, ' m AGL')}
+            <span className="telemetry-hud__label">Heading</span>
+            <strong className="telemetry-hud__metric-value">
+              {renderHeadingValue(liveState?.heading_deg)}
             </strong>
-            <span
-              className={`telemetry-hud__subvalue ${
-                metricStates?.altitude?.pulse ? 'telemetry-hud__subvalue--pulse' : ''
-              }`}
-            >
-              {renderValue(altitudeMslM, ' m MSL')}
-            </span>
           </div>
           <div>
             <span className="telemetry-hud__label">Battery</span>
@@ -193,7 +285,9 @@ export function TelemetryHud({
               }`}
               style={metricStyle(metricStates?.battery)}
             >
-              {liveState?.battery?.percent != null ? `${liveState.battery.percent.toFixed(0)}%` : '--'}
+              {batteryPercent != null && !Number.isNaN(batteryPercent)
+                ? `${batteryPercent.toFixed(0)}%`
+                : '--'}
             </span>
           </div>
         </div>
@@ -205,42 +299,96 @@ export function TelemetryHud({
                 expandedHud?.open ? 'secondary-button--active' : ''
               }`}
               onClick={onToggleExpandedHud}
-              disabled={expandedHudDisabled}
             >
-              Hardware performance
+              More data
             </button>
           </div>
         ) : null}
-      </div>
 
-      {((mode === 'live' && expandedHud?.open) || (mode === 'review' && expandedHud)) ? (
-        <div
-          className={expandedHudClassName}
-          title={expandedHud.status.label}
-          aria-label={expandedHud.status.label}
-        >
-          <div className="telemetry-hud__expanded-grid">
-            <div className="telemetry-hud__expanded-card">
-              <span className="telemetry-hud__label">CPU temp</span>
-              <strong className="telemetry-hud__metric-value">
-                {renderValue(expandedHud.cpuTempC, ' C')}
-              </strong>
+        {showExpanded ? (
+          <div className="telemetry-hud__expanded">
+            <div className="telemetry-hud__expanded-grid">
+              <section className="telemetry-hud__expanded-section telemetry-hud__expanded-section--full">
+                <span className="telemetry-hud__section-title">Pi status</span>
+                <div className="telemetry-hud__expanded-metrics telemetry-hud__expanded-metrics--pi">
+                  <div>
+                    <span className="telemetry-hud__label">CPU temp</span>
+                    <strong className="telemetry-hud__metric-value">
+                      {renderValue(expandedHud.cpuTempC, ' C')}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="telemetry-hud__label">CPU load</span>
+                    <strong className="telemetry-hud__metric-value">
+                      {renderValue(expandedHud.cpuPercent, ' %')}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="telemetry-hud__label">NPU temp</span>
+                    <strong className="telemetry-hud__metric-value">
+                      {renderValue(expandedHud.npuTempC, ' C')}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="telemetry-hud__label">Clock speed</span>
+                    <strong className="telemetry-hud__metric-value">
+                      {renderWholeValue(expandedHud.cpuClockMhz, ' MHz')}
+                    </strong>
+                  </div>
+                </div>
+              </section>
+
+              <section className="telemetry-hud__expanded-section">
+                <div className="telemetry-hud__expanded-metrics">
+                  <div>
+                    <span className="telemetry-hud__label">Throttle</span>
+                    <strong className="telemetry-hud__metric-value">
+                      {renderWholeValue(expandedHud.throttlePct, ' %')}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="telemetry-hud__label">Vertical speed</span>
+                    <strong className="telemetry-hud__metric-value">
+                      {renderValue(expandedHud.verticalSpeedMps, ' m/s')}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="telemetry-hud__label">Altitude MSL</span>
+                    <strong className="telemetry-hud__metric-value">
+                      {renderValue(expandedHud.altitudeMslM, ' m')}
+                    </strong>
+                    <span className="telemetry-hud__subvalue">
+                      {renderValue(expandedHud.targetAltitudeMslM, ' m')}
+                    </span>
+                  </div>
+                  <div className="telemetry-hud__vibration">
+                    <span className="telemetry-hud__label">Vibration</span>
+                    <div className="telemetry-hud__vibration-list">
+                      <strong className="telemetry-hud__metric-value">
+                        X {renderValue(expandedHud.vibrationX)}
+                      </strong>
+                      <strong className="telemetry-hud__metric-value">
+                        Y {renderValue(expandedHud.vibrationY)}
+                      </strong>
+                      <strong className="telemetry-hud__metric-value">
+                        Z {renderValue(expandedHud.vibrationZ)}
+                      </strong>
+                    </div>
+                  </div>
+                </div>
+              </section>
             </div>
-            <div className="telemetry-hud__expanded-card">
-              <span className="telemetry-hud__label">CPU load</span>
-              <strong className="telemetry-hud__metric-value">
-                {renderValue(expandedHud.cpuPercent, ' %')}
-              </strong>
-            </div>
-            <div className="telemetry-hud__expanded-card">
-              <span className="telemetry-hud__label">NPU temp</span>
-              <strong className="telemetry-hud__metric-value">
-                {renderValue(expandedHud.npuTempC, ' C')}
-              </strong>
-            </div>
+
+            {mode === 'live' && onOpenRawData ? (
+              <div className="telemetry-hud__expanded-actions">
+                <button className="secondary-button telemetry-hud__action" onClick={onOpenRawData}>
+                  View raw data
+                </button>
+              </div>
+            ) : null}
           </div>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
     </div>
   );
 }

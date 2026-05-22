@@ -326,19 +326,9 @@ mod tests {
 
     fn test_config(root: &std::path::Path) -> AppConfig {
         AppConfig {
-            listen_port: 8765,
-            aircraft_label: "Kerbodyne".into(),
-            map_style_url: None,
-            map_tile_template: None,
             offline_maps_root: Some(root.to_string_lossy().to_string()),
-            selected_region_id: None,
-            enabled_region_ids: Vec::new(),
-            region_name_overrides: Default::default(),
             default_map_mode: MapMode::StreetDark,
-            default_fov_deg: 38.0,
-            default_range_m: 250.0,
-            stale_after_seconds: 10,
-            class_display_names: Default::default(),
+            ..AppConfig::default()
         }
     }
 

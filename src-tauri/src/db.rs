@@ -523,6 +523,23 @@ impl Database {
             .map_err(|error| error.to_string())
     }
 
+    pub fn session_has_armed_replay_events(&self, session_id: &str) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM replay_events
+                    WHERE session_id = ?1
+                      AND envelope_json LIKE '%\"type\":\"telemetry\"%'
+                    LIMIT 1
+                )",
+                params![session_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub fn upsert_session_video_clip(&self, clip: &SessionVideoClip) -> Result<(), String> {
         let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
         connection

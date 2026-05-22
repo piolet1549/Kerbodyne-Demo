@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env,
     fs,
     path::{Path, PathBuf},
@@ -28,10 +28,11 @@ use crate::{
         AlertPayload, AlertRecord, AppConfig, AppSnapshot, AircraftLiveState, BatterySummary,
         ConnectionHealth, ConnectionStatus, DEFAULT_AIRCRAFT_ID, LEGACY_ALERT_PORT,
         LEGACY_TELEMETRY_PORT, LegacyAlertPacket, LegacySystemStatusPacket,
-        LegacyTelemetryPacket, MapAlertSector, MissionSession, OfflineRegionCatalog,
-        OfflineRegionManifest, ReplayFrame, ReviewTelemetryFrame, RuntimeEvent,
-        RuntimeMode, SCHEMA_VERSION, SessionVideoClip, SystemStatusPayload, SystemStatusRecord,
-        TelemetryPayload, TrackPointRecord, VideoPreviewState, VideoPreviewStatus, WireEnvelope,
+        LegacyTelemetryPacket, LegacyTelemetryPacketType, MapAlertSector, MissionSession,
+        OfflineRegionCatalog, OfflineRegionManifest, ReplayFrame, ReviewTelemetryFrame,
+        RuntimeEvent, RuntimeMode, SCHEMA_VERSION, SessionVideoClip, SystemStatusPayload,
+        SystemStatusRecord, TelemetryPayload, TrackPointRecord, VideoPreviewState,
+        VideoPreviewStatus, WireEnvelope,
     },
     offline_maps,
     server::{
@@ -50,6 +51,225 @@ const LIVE_VIDEO_RTP_PORT: u16 = 5600;
 const PREVIEW_VIDEO_PORT: u16 = 5602;
 const RECORD_VIDEO_PORT: u16 = 5603;
 const VIDEO_STALE_AFTER_SECS: i64 = 3;
+const COMPAT_HF_STALE_SECS: i64 = 2;
+const COMPAT_MF_STALE_SECS: i64 = 4;
+const COMPAT_LF_STALE_SECS: i64 = 8;
+
+#[derive(Debug, Clone, Default)]
+struct CompatibilityTelemetryState {
+    lat: Option<f64>,
+    lon: Option<f64>,
+    alt_m: Option<f64>,
+    vspeed_ms: Option<f64>,
+    ground_speed_ms: Option<f64>,
+    heading_deg: Option<f64>,
+    pitch_deg: Option<f64>,
+    roll_deg: Option<f64>,
+    armed: Option<bool>,
+    flight_mode: Option<u32>,
+    throttle_pct: Option<f64>,
+    nav_pitch_deg: Option<f64>,
+    nav_roll_deg: Option<f64>,
+    alt_demanded_m: Option<f64>,
+    vib_x: Option<f64>,
+    vib_y: Option<f64>,
+    vib_z: Option<f64>,
+    battery_v: Option<f64>,
+    battery_a: Option<f64>,
+    battery_pct: Option<f64>,
+    battery_mah: Option<f64>,
+    cpu_temp_c: Option<f64>,
+    cpu_pct: Option<f64>,
+    cpu_mhz: Option<f64>,
+    npu_temp_c: Option<f64>,
+    vision_active: Option<bool>,
+    extras: HashMap<String, Value>,
+    has_split_packets: bool,
+    last_hf_at: Option<DateTime<Utc>>,
+    last_mf_at: Option<DateTime<Utc>>,
+    last_lf_at: Option<DateTime<Utc>>,
+    last_oc_at: Option<DateTime<Utc>>,
+}
+
+impl CompatibilityTelemetryState {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn apply_packet(&mut self, packet: &LegacyTelemetryPacket, received_at: DateTime<Utc>) {
+        if packet.packet_type.is_some() {
+            self.has_split_packets = true;
+        }
+
+        match packet.packet_type.unwrap_or(LegacyTelemetryPacketType::Unknown) {
+            LegacyTelemetryPacketType::HighFrequency => self.last_hf_at = Some(received_at),
+            LegacyTelemetryPacketType::MediumFrequency => self.last_mf_at = Some(received_at),
+            LegacyTelemetryPacketType::LowFrequency => self.last_lf_at = Some(received_at),
+            LegacyTelemetryPacketType::OnChange => self.last_oc_at = Some(received_at),
+            LegacyTelemetryPacketType::Unknown => {}
+        }
+
+        update_if_some(&mut self.lat, packet.lat);
+        update_if_some(&mut self.lon, packet.lon);
+        update_if_some(&mut self.alt_m, packet.alt_m);
+        update_if_some(&mut self.vspeed_ms, packet.vspeed_ms);
+        update_if_some(&mut self.ground_speed_ms, packet.ground_speed_ms);
+        update_if_some(&mut self.heading_deg, packet.heading_deg);
+        update_if_some(&mut self.pitch_deg, packet.pitch_deg);
+        update_if_some(&mut self.roll_deg, packet.roll_deg);
+        update_if_some(&mut self.armed, packet.armed);
+        update_if_some(&mut self.flight_mode, packet.flight_mode);
+        update_if_some(&mut self.throttle_pct, packet.throttle_pct);
+        update_if_some(&mut self.nav_pitch_deg, packet.nav_pitch_deg);
+        update_if_some(&mut self.nav_roll_deg, packet.nav_roll_deg);
+        update_if_some(&mut self.alt_demanded_m, packet.alt_demanded_m);
+        update_if_some(&mut self.vib_x, packet.vib_x);
+        update_if_some(&mut self.vib_y, packet.vib_y);
+        update_if_some(&mut self.vib_z, packet.vib_z);
+        update_if_some(&mut self.battery_v, packet.battery_v);
+        update_if_some(&mut self.battery_a, packet.battery_a);
+        update_if_some(&mut self.battery_pct, packet.battery_pct);
+        update_if_some(&mut self.battery_mah, packet.battery_mah);
+        update_if_some(&mut self.cpu_temp_c, packet.cpu_temp_c);
+        update_if_some(&mut self.cpu_pct, packet.cpu_pct);
+        update_if_some(&mut self.cpu_mhz, packet.cpu_mhz);
+        update_if_some(&mut self.npu_temp_c, packet.npu_temp_c);
+        update_if_some(&mut self.vision_active, packet.vision_active);
+
+        for (key, value) in &packet.extras {
+            self.extras.insert(key.clone(), value.clone());
+        }
+    }
+
+    fn has_any_state(&self) -> bool {
+        self.lat.is_some()
+            || self.lon.is_some()
+            || self.alt_m.is_some()
+            || self.ground_speed_ms.is_some()
+            || self.heading_deg.is_some()
+            || self.armed.is_some()
+            || self.flight_mode.is_some()
+            || self.battery_v.is_some()
+            || self.battery_pct.is_some()
+            || self.battery_a.is_some()
+            || self.battery_mah.is_some()
+            || self.cpu_temp_c.is_some()
+            || self.cpu_pct.is_some()
+            || self.cpu_mhz.is_some()
+            || self.npu_temp_c.is_some()
+            || self.vision_active.is_some()
+    }
+
+    fn resolved_armed(&self) -> bool {
+        self.armed.unwrap_or(!self.has_split_packets)
+    }
+
+    fn last_packet_at(&self) -> Option<DateTime<Utc>> {
+        [
+            self.last_hf_at.clone(),
+            self.last_mf_at.clone(),
+            self.last_lf_at.clone(),
+            self.last_oc_at.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+    }
+
+    fn tier_is_current(
+        &self,
+        last_seen: Option<DateTime<Utc>>,
+        window_seconds: i64,
+        now: &DateTime<Utc>,
+    ) -> bool {
+        last_seen
+            .map(|timestamp| now.signed_duration_since(timestamp).num_seconds() <= window_seconds)
+            .unwrap_or(false)
+    }
+
+    fn build_connection_note(&self, now: &DateTime<Utc>) -> String {
+        if !self.has_any_state() {
+            return "Telemetry packet received; awaiting aircraft state".into();
+        }
+
+        let mut missing = Vec::new();
+        if self.has_split_packets {
+            if !self.tier_is_current(self.last_hf_at.clone(), COMPAT_HF_STALE_SECS, now) {
+                missing.push("high-rate");
+            }
+            if !self.tier_is_current(self.last_mf_at.clone(), COMPAT_MF_STALE_SECS, now) {
+                missing.push("medium-rate");
+            }
+            if !self.tier_is_current(self.last_lf_at.clone(), COMPAT_LF_STALE_SECS, now) {
+                missing.push("low-rate");
+            }
+        }
+
+        if missing.is_empty() {
+            "Receiving split compatibility telemetry".into()
+        } else {
+            format!(
+                "Receiving split compatibility telemetry; awaiting {} packets",
+                missing.join(", ")
+            )
+        }
+    }
+
+    fn to_payload(&self, packet_type: Option<LegacyTelemetryPacketType>) -> TelemetryPayload {
+        let armed = self.resolved_armed();
+        let mut extras = self.extras.clone();
+
+        if let Some(packet_type) = packet_type {
+            let packet_type_label = match packet_type {
+                LegacyTelemetryPacketType::HighFrequency => "hf",
+                LegacyTelemetryPacketType::MediumFrequency => "mf",
+                LegacyTelemetryPacketType::LowFrequency => "lf",
+                LegacyTelemetryPacketType::OnChange => "oc",
+                LegacyTelemetryPacketType::Unknown => "unknown",
+            };
+            extras.insert(
+                "legacy_packet_type".into(),
+                Value::String(packet_type_label.to_string()),
+            );
+        }
+
+        insert_optional_number(&mut extras, "vspeed_ms", self.vspeed_ms);
+        insert_optional_number(&mut extras, "pitch_deg", self.pitch_deg);
+        insert_optional_number(&mut extras, "roll_deg", self.roll_deg);
+        insert_optional_number(&mut extras, "flight_mode", self.flight_mode.map(|value| value as f64));
+        insert_optional_number(&mut extras, "throttle_pct", self.throttle_pct);
+        insert_optional_number(&mut extras, "nav_pitch_deg", self.nav_pitch_deg);
+        insert_optional_number(&mut extras, "nav_roll_deg", self.nav_roll_deg);
+        insert_optional_number(&mut extras, "alt_demanded_m", self.alt_demanded_m);
+        insert_optional_number(&mut extras, "vib_x", self.vib_x);
+        insert_optional_number(&mut extras, "vib_y", self.vib_y);
+        insert_optional_number(&mut extras, "vib_z", self.vib_z);
+        insert_optional_number(&mut extras, "battery_a", self.battery_a);
+        insert_optional_number(&mut extras, "battery_mah", self.battery_mah);
+        insert_optional_number(&mut extras, "cpu_temp_c", self.cpu_temp_c);
+        insert_optional_number(&mut extras, "cpu_pct", self.cpu_pct);
+        insert_optional_number(&mut extras, "cpu_mhz", self.cpu_mhz);
+        insert_optional_number(&mut extras, "npu_temp_c", self.npu_temp_c);
+        insert_optional_bool(&mut extras, "vision_active", self.vision_active);
+        extras.insert("legacy_armed".into(), Value::Bool(armed));
+
+        TelemetryPayload {
+            lat: if armed { self.lat } else { None },
+            lon: if armed { self.lon } else { None },
+            alt_msl_m: self.alt_m,
+            groundspeed_mps: self.ground_speed_ms,
+            heading_deg: self.heading_deg,
+            flight_time_s: None,
+            armed,
+            battery: Some(BatterySummary {
+                percent: self.battery_pct,
+                voltage_v: self.battery_v,
+            }),
+            link: None,
+            extras,
+        }
+    }
+}
 
 struct RecordingRunState {
     clip_id: String,
@@ -131,6 +351,7 @@ pub struct AppRuntime {
     current_session_id: RwLock<Option<String>>,
     current_session_source: RwLock<Option<String>>,
     focused_session_id: RwLock<Option<String>>,
+    compatibility_telemetry: RwLock<CompatibilityTelemetryState>,
     active_tasks: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
     preview_frame_sender: watch::Sender<Option<Vec<u8>>>,
     latest_preview_frame: RwLock<Option<Vec<u8>>>,
@@ -186,6 +407,7 @@ impl AppRuntime {
             current_session_id: RwLock::new(None),
             current_session_source: RwLock::new(None),
             focused_session_id: RwLock::new(focused_session_id),
+            compatibility_telemetry: RwLock::new(CompatibilityTelemetryState::default()),
             active_tasks: Mutex::new(Vec::new()),
             preview_frame_sender,
             latest_preview_frame: RwLock::new(None),
@@ -629,13 +851,14 @@ impl AppRuntime {
     ) -> Result<(), String> {
         let had_connection = self.connection.read().await.last_packet_at.is_some();
         let has_armed_telemetry = *self.session_has_armed_telemetry.read().await;
-        let should_save = save && had_connection && has_armed_telemetry;
         let session_id = self
             .current_session_id
             .read()
             .await
             .clone()
             .ok_or_else(|| "No active flight to stop.".to_string())?;
+        let has_armed_replay_events = self.db.session_has_armed_replay_events(&session_id)?;
+        let should_save = save && had_connection && has_armed_telemetry && has_armed_replay_events;
 
         if should_save {
             let fallback_name = {
@@ -675,6 +898,7 @@ impl AppRuntime {
         self.end_current_session().await?;
         *self.session_has_armed_telemetry.write().await = false;
         self.raw_telemetry_packets.write().await.clear();
+        self.compatibility_telemetry.write().await.clear();
 
         {
             let mut mode = self.mode.write().await;
@@ -723,14 +947,19 @@ impl AppRuntime {
             Some(id) => self.db.load_track(id)?,
             None => Vec::new(),
         };
-        let review_frames = match session_id.as_deref() {
-            Some(id) => review_frames_from_replay(self.db.load_replay_events(id)?),
+        let replay_events = match session_id.as_deref() {
+            Some(id) => self.db.load_replay_events(id)?,
             None => Vec::new(),
         };
+        let review_frames = review_frames_from_replay(replay_events.clone());
         let review_video_clips = match session_id.as_deref() {
             Some(id) => self.db.load_video_clips_for_session(id)?,
             None => Vec::new(),
         };
+        let raw_packets = replay_events
+            .into_iter()
+            .map(|frame| frame.envelope_json)
+            .collect::<Vec<_>>();
 
         *self.focused_session_id.write().await = session_id;
         *self.alerts.write().await = alerts;
@@ -738,6 +967,7 @@ impl AppRuntime {
         *self.track.write().await = track;
         *self.review_frames.write().await = review_frames;
         *self.review_video_clips.write().await = review_video_clips;
+        *self.raw_telemetry_packets.write().await = raw_packets;
         if self.current_session_id.read().await.is_none() {
             *self.live_state.write().await = None;
         }
@@ -760,6 +990,7 @@ impl AppRuntime {
         self.alerts.write().await.clear();
         self.system_statuses.write().await.clear();
         *self.session_has_armed_telemetry.write().await = false;
+        self.compatibility_telemetry.write().await.clear();
         self.review_frames.write().await.clear();
         self.review_video_clips.write().await.clear();
         self.raw_telemetry_packets.write().await.clear();
@@ -772,6 +1003,12 @@ impl AppRuntime {
 
     async fn refresh_connection_health(&self) -> bool {
         let stale_after_seconds = self.config.read().await.stale_after_seconds;
+        if self.current_session_source.read().await.as_deref() == Some(LEGACY_SOURCE_LABEL) {
+            return self
+                .refresh_compatibility_connection_health(stale_after_seconds)
+                .await;
+        }
+
         let mut connection = self.connection.write().await;
         if !matches!(
             connection.status,
@@ -797,6 +1034,42 @@ impl AppRuntime {
         }
 
         false
+    }
+
+    async fn refresh_compatibility_connection_health(&self, stale_after_seconds: u64) -> bool {
+        let now = Utc::now();
+        let state = self.compatibility_telemetry.read().await.clone();
+        let Some(last_packet_at) = state.last_packet_at() else {
+            return false;
+        };
+
+        let next_status = if (now - last_packet_at).num_seconds() > stale_after_seconds as i64 {
+            ConnectionStatus::Stale
+        } else {
+            ConnectionStatus::ReceivingTelemetry
+        };
+        let next_note = if next_status == ConnectionStatus::Stale {
+            "Telemetry link is stale".to_string()
+        } else {
+            state.build_connection_note(&now)
+        };
+        let next_last_packet_at = Some(last_packet_at.to_rfc3339());
+
+        let port = LEGACY_TELEMETRY_PORT;
+        let mut connection = self.connection.write().await;
+        let changed = connection.status != next_status
+            || connection.port != port
+            || connection.last_packet_at != next_last_packet_at
+            || connection.note.as_deref() != Some(next_note.as_str());
+
+        if changed {
+            connection.status = next_status;
+            connection.port = port;
+            connection.last_packet_at = next_last_packet_at;
+            connection.note = Some(next_note);
+        }
+
+        changed
     }
 
     async fn refresh_video_health(&self) -> bool {
@@ -1228,58 +1501,46 @@ impl AppRuntime {
         let packet: LegacyTelemetryPacket =
             serde_json::from_str(raw_json).map_err(|error| error.to_string())?;
         self.push_raw_telemetry_packet(raw_json).await;
+        let now = Utc::now();
+        let packet_type = packet.packet_type;
+        let state = {
+            let mut compatibility = self.compatibility_telemetry.write().await;
+            compatibility.apply_packet(&packet, now);
+            compatibility.clone()
+        };
 
-        let armed = packet.armed.unwrap_or(true);
-        let has_any_state = packet.alt_m.is_some()
-            || packet.ground_speed_ms.is_some()
-            || packet.heading_deg.is_some()
-            || packet.battery_v.is_some()
-            || packet.battery_remaining_pct.is_some()
-            || packet.lat.is_some()
-            || packet.lon.is_some();
+        let has_any_state = state.has_any_state();
 
         if !has_any_state {
-            self.update_connection_activity(
-                ConnectionStatus::ReceivingTelemetry,
-                "Telemetry packet received; awaiting aircraft state".into(),
-                Some(Utc::now().to_rfc3339()),
-            )
-            .await;
+            let _ = self
+                .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
+                .await;
             self.emit_snapshot(app).await?;
             return Ok(());
         }
 
-        let now = Utc::now().to_rfc3339();
+        let sent_at = now.to_rfc3339();
         let message_id = format!("legacy-telemetry-{}", Uuid::new_v4());
-        let mut extras = packet.extras;
-        extras.insert("legacy_armed".into(), Value::Bool(armed));
-        let payload = TelemetryPayload {
-            lat: if armed { packet.lat } else { None },
-            lon: if armed { packet.lon } else { None },
-            alt_msl_m: packet.alt_m,
-            groundspeed_mps: packet.ground_speed_ms,
-            heading_deg: packet.heading_deg,
-            flight_time_s: None,
-            armed,
-            battery: Some(BatterySummary {
-                percent: packet.battery_remaining_pct,
-                voltage_v: packet.battery_v,
-            }),
-            link: None,
-            extras,
-        };
+        let payload = state.to_payload(packet_type);
 
         let canonical_raw_json = serde_json::to_string(&json!({
             "schema_version": SCHEMA_VERSION,
             "message_id": message_id,
             "aircraft_id": DEFAULT_AIRCRAFT_ID,
-            "sent_at": now,
+            "sent_at": sent_at,
             "type": "telemetry",
             "payload": payload
         }))
         .map_err(|error| error.to_string())?;
 
-        self.ingest_json(app, &canonical_raw_json, source).await
+        self.ingest_json(app, &canonical_raw_json, source).await?;
+        let connection_changed = self
+            .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
+            .await;
+        if connection_changed {
+            self.emit_snapshot(app).await?;
+        }
+        Ok(())
     }
 
     pub async fn ingest_legacy_alert(
@@ -1481,7 +1742,13 @@ impl AppRuntime {
             *self.session_has_armed_telemetry.write().await = true;
         }
 
-        self.update_runtime_status(source, &sent_at).await;
+        if matches!(source, IngestSource::CompatibilityTelemetry) {
+            let _ = self
+                .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
+                .await;
+        } else {
+            self.update_runtime_status(source, &sent_at).await;
+        }
         if envelope.payload.armed {
             self.record_event(&session_id, canonical_raw_json, &sent_at, false)
                 .await?;
@@ -1558,7 +1825,15 @@ impl AppRuntime {
             alerts.truncate(50);
         }
 
-        self.update_runtime_status(source, &sent_at).await;
+        if matches!(source, IngestSource::CompatibilityAlert)
+            && self.current_session_source.read().await.as_deref() == Some(LEGACY_SOURCE_LABEL)
+        {
+            let _ = self
+                .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
+                .await;
+        } else {
+            self.update_runtime_status(source, &sent_at).await;
+        }
         self.record_event(&session_id, canonical_raw_json, &sent_at, true)
             .await?;
         self.emit_snapshot(app).await?;
@@ -1598,7 +1873,15 @@ impl AppRuntime {
             system_statuses.truncate(40);
         }
 
-        self.update_runtime_status(source, &sent_at).await;
+        if matches!(source, IngestSource::CompatibilityAlert)
+            && self.current_session_source.read().await.as_deref() == Some(LEGACY_SOURCE_LABEL)
+        {
+            let _ = self
+                .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
+                .await;
+        } else {
+            self.update_runtime_status(source, &sent_at).await;
+        }
         self.record_event(&session_id, canonical_raw_json, &sent_at, false)
             .await?;
 
@@ -1624,18 +1907,6 @@ impl AppRuntime {
             last_packet_at: Some(sent_at.to_string()),
             note: Some(source.note().into()),
         };
-    }
-
-    async fn update_connection_activity(
-        &self,
-        status: ConnectionStatus,
-        note: String,
-        last_packet_at: Option<String>,
-    ) {
-        let mut connection = self.connection.write().await;
-        connection.status = status;
-        connection.last_packet_at = last_packet_at;
-        connection.note = Some(note);
     }
 
     async fn begin_session(&self, aircraft_id: &str, source: &str) -> Result<String, String> {
@@ -1827,6 +2098,24 @@ impl AppRuntime {
         let path = self.media_dir.join(file_name);
         fs::write(&path, bytes).map_err(|error| error.to_string())?;
         Ok(Some(path.to_string_lossy().to_string()))
+    }
+}
+
+fn update_if_some<T>(target: &mut Option<T>, value: Option<T>) {
+    if let Some(value) = value {
+        *target = Some(value);
+    }
+}
+
+fn insert_optional_number(target: &mut HashMap<String, Value>, key: &str, value: Option<f64>) {
+    if let Some(value) = value {
+        target.insert(key.to_string(), json!(value));
+    }
+}
+
+fn insert_optional_bool(target: &mut HashMap<String, Value>, key: &str, value: Option<bool>) {
+    if let Some(value) = value {
+        target.insert(key.to_string(), Value::Bool(value));
     }
 }
 

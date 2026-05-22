@@ -360,7 +360,7 @@ button {
   bottom: 18px;
   z-index: 7;
   width: min(620px, calc(100vw - 48px));
-  padding: 14px 16px;
+  padding: 12px 16px 10px;
   border: 1px solid var(--panel-border);
   border-radius: 20px;
   background: var(--panel);
@@ -404,7 +404,7 @@ button {
 
 .replay-timeline__slider {
   width: 100%;
-  margin: 12px 0 10px;
+  margin: 8px 0 6px;
   accent-color: #f4f4f4;
 }
 
@@ -428,7 +428,7 @@ button {
   position: relative;
   isolation: isolate;
   width: 100%;
-  padding: 16px;
+  padding: 16px 16px 14px;
   border-radius: 20px;
 }
 
@@ -439,21 +439,99 @@ button {
 
 .telemetry-hud__topline {
   display: flex;
-  align-items: flex-start;
+  align-items: stretch;
   justify-content: space-between;
   gap: 12px;
 }
 
-.telemetry-hud__row--wide {
-  margin-bottom: 14px;
-  flex: 1 1 auto;
-  min-width: 0;
+.telemetry-hud__topline-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
 }
 
-.telemetry-hud__top-action,
-.telemetry-hud__export-button {
+.telemetry-hud__mode-box {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  gap: 5px;
+  height: 56px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  box-sizing: border-box;
+}
+
+.telemetry-hud__mode-box strong {
+  display: block;
+  font-size: 1.02rem;
+  letter-spacing: 0.02em;
+}
+
+.telemetry-hud__vision-indicator {
   flex: 0 0 auto;
-  white-space: nowrap;
+  height: 56px;
+  min-width: 108px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  position: relative;
+  box-sizing: border-box;
+}
+
+.telemetry-hud__vision-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.telemetry-hud__vision-indicator--review {
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+}
+
+.telemetry-hud__vision-indicator--review strong {
+  display: block;
+  font-size: 1.02rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.telemetry-hud__vision-indicator--connected,
+.telemetry-hud__vision-indicator--pending,
+.telemetry-hud__vision-indicator--waiting,
+.telemetry-hud__vision-indicator--stale {
+  border-color: rgba(255, 255, 255, 0.04);
+}
+
+.telemetry-hud__vision-indicator--connected::after,
+.telemetry-hud__vision-indicator--pending::after,
+.telemetry-hud__vision-indicator--waiting::after,
+.telemetry-hud__vision-indicator--stale::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  border: 3px solid var(--telemetry-hud-status-color);
+  pointer-events: none;
+  box-shadow:
+    0 0 0 1px var(--telemetry-hud-status-shadow),
+    0 0 14px var(--telemetry-hud-status-glow);
+  animation: telemetry-hud-border-pulse 1.85s ease-in-out infinite;
 }
 
 .telemetry-hud--status-connected {
@@ -506,10 +584,179 @@ button {
   font-size: 1.02rem;
 }
 
+.telemetry-hud__attitude-shell {
+  display: flex;
+  justify-content: center;
+  margin: 14px 0 16px;
+}
+
+.telemetry-hud__attitude {
+  position: relative;
+  width: 100%;
+  max-width: 268px;
+  height: 132px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(8, 10, 14, 0.54);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.04),
+    0 16px 28px rgba(0, 0, 0, 0.16);
+  overflow: hidden;
+}
+
+.telemetry-hud__attitude-mask {
+  position: absolute;
+  inset: 8px 10px 14px;
+  overflow: hidden;
+  border-radius: 14px;
+}
+
+.telemetry-hud__attitude-horizon {
+  position: absolute;
+  left: -18%;
+  top: -42%;
+  width: 136%;
+  height: 188%;
+  transform-origin: center center;
+}
+
+.telemetry-hud__attitude-sky,
+.telemetry-hud__attitude-ground {
+  width: 100%;
+  height: 50%;
+}
+
+.telemetry-hud__attitude-sky {
+  background: linear-gradient(180deg, #6f747f 0%, #515560 100%);
+}
+
+.telemetry-hud__attitude-ground {
+  background: linear-gradient(180deg, #23262d 0%, #11141a 100%);
+}
+
+.telemetry-hud__attitude-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(50% - 1px);
+  height: 2px;
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.12);
+}
+
+.telemetry-hud__attitude-pitch-mark {
+  position: absolute;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transform: translateX(-50%);
+}
+
+.telemetry-hud__attitude-pitch-bar {
+  width: 68px;
+  height: 2px;
+  background: rgba(255, 255, 255, 0.7);
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.08);
+}
+
+.telemetry-hud__attitude-pitch-label {
+  width: 26px;
+  color: rgba(255, 255, 255, 0.76);
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+.telemetry-hud__attitude-roll-arc {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  width: 154px;
+  height: 44px;
+  border-top: 2px solid rgba(255, 255, 255, 0.58);
+  border-left: 2px solid transparent;
+  border-right: 2px solid transparent;
+  border-radius: 999px 999px 0 0;
+  transform: translateX(-50%);
+}
+
+.telemetry-hud__attitude-roll-notch {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  width: 0;
+  height: 0;
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-top: 8px solid rgba(255, 255, 255, 0.88);
+  transform: translateX(-50%);
+}
+
+.telemetry-hud__attitude-aircraft {
+  position: absolute;
+  left: 50%;
+  top: calc(50% + 2px);
+  width: 86px;
+  height: 18px;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+}
+
+.telemetry-hud__attitude-aircraft::before,
+.telemetry-hud__attitude-aircraft::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  width: 34px;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.92);
+  transform: translateY(-50%);
+}
+
+.telemetry-hud__attitude-aircraft::before {
+  left: 0;
+}
+
+.telemetry-hud__attitude-aircraft::after {
+  right: 0;
+}
+
+.telemetry-hud__attitude-aircraft {
+  border-top: 3px solid rgba(255, 255, 255, 0.92);
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+}
+
+.telemetry-hud__attitude-command {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 48px;
+  height: 22px;
+  border: 2px solid rgba(255, 255, 255, 0.76);
+  border-radius: 5px;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 14px rgba(255, 255, 255, 0.12);
+  z-index: 2;
+}
+
 .telemetry-hud__grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+  align-items: start;
+}
+
+.telemetry-hud__grid > div,
+.telemetry-hud__expanded-metrics > div,
+.telemetry-hud__expanded-metrics--pi > div {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  min-width: 0;
 }
 
 .telemetry-hud__subvalue {
@@ -526,29 +773,68 @@ button {
   width: 100%;
 }
 
-.telemetry-hud__action:disabled {
-  opacity: 0.5;
+.telemetry-hud--open {
+  border-bottom-left-radius: 24px;
+  border-bottom-right-radius: 24px;
 }
 
-.telemetry-hud--expanded {
-  padding-top: 14px;
+.telemetry-hud__expanded {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .telemetry-hud__expanded-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
+  grid-template-columns: 1fr;
+  gap: 16px;
 }
 
-.telemetry-hud__expanded-card {
+.telemetry-hud__expanded-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.telemetry-hud__expanded-section--full {
+  width: 100%;
+}
+
+.telemetry-hud__section-title {
+  display: block;
+  width: 100%;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.telemetry-hud__expanded-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 18px;
+}
+
+.telemetry-hud__expanded-metrics--pi {
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.telemetry-hud__expanded-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-start;
+}
+
+.telemetry-hud__vibration-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  min-height: 78px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.03);
 }
 
 @keyframes telemetry-hud-border-pulse {
@@ -566,6 +852,7 @@ button {
       0 0 24px var(--telemetry-hud-status-glow);
   }
 }
+
 
 .map-overlay-note {
   position: absolute;
@@ -1677,6 +1964,11 @@ button {
     grid-template-columns: 1fr;
   }
 
+  .telemetry-hud__expanded-metrics,
+  .telemetry-hud__expanded-metrics--pi {
+    grid-template-columns: 1fr;
+  }
+
   .overlay-drawer {
     top: 12px;
     bottom: 12px;
@@ -2280,7 +2572,7 @@ button {
 }
 
 .replay-timeline__slider-shell {
-  margin: 14px 0 12px;
+  margin: 10px 0 8px;
   --replay-thumb-size: 16px;
 }
 
@@ -2313,15 +2605,18 @@ button {
 
 .replay-timeline__footer {
   display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   color: var(--muted);
   font-size: 0.84rem;
+  min-height: 42px;
 }
 
-.replay-timeline__footer span:nth-child(2) {
+.replay-timeline__frame-counter {
+  display: inline-block;
   justify-self: center;
+  will-change: transform;
 }
 
 .replay-timeline__footer span:last-child {
@@ -3109,8 +3404,8 @@ button {
 .flight-surface--corner {
   right: 18px;
   bottom: 18px;
-  width: min(320px, 25vw);
-  height: min(180px, 14.1vw);
+  width: min(480px, 37.5vw);
+  height: min(270px, 21.2vw);
   border: 1px solid var(--panel-border);
   border-radius: 22px;
   background: rgba(6, 6, 6, 0.96);
@@ -3280,12 +3575,9 @@ button {
   min-height: 44px;
 }
 
-.replay-timeline__controls {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
-  min-width: 0;
+.replay-timeline__recordings-button {
+  position: static;
+  transform: none;
 }
 
 .replay-timeline__playback-controls {
@@ -3294,22 +3586,97 @@ button {
   gap: 8px;
 }
 
-.replay-timeline__playback-button {
-  min-width: 52px;
+.replay-timeline__icon-button {
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.replay-timeline__speed {
-  min-width: 42px;
-  color: var(--muted);
+.replay-timeline__play-icon {
+  position: relative;
+  display: inline-block;
+  width: 0;
+  height: 0;
+  border-top: 8px solid transparent;
+  border-bottom: 8px solid transparent;
+  border-left: 13px solid currentColor;
+  margin-left: 3px;
+}
+
+.replay-timeline__play-icon--pause {
+  width: 14px;
+  height: 14px;
+  border: none;
+  margin-left: 0;
+}
+
+.replay-timeline__play-icon--pause::before,
+.replay-timeline__play-icon--pause::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  width: 4px;
+  height: 14px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.replay-timeline__play-icon--pause::before {
+  left: 1px;
+}
+
+.replay-timeline__play-icon--pause::after {
+  right: 1px;
+}
+
+.replay-timeline__speed-picker {
+  position: relative;
+}
+
+.replay-timeline__speed-button {
+  min-width: 56px;
+  padding-inline: 12px;
+}
+
+.replay-timeline__speed-menu {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 68px;
+  padding: 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  background: rgba(7, 7, 7, 0.98);
+  box-shadow: var(--shadow);
+  transform: translateX(-50%);
+}
+
+.replay-timeline__speed-option {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text);
   text-align: center;
-  font-size: 0.84rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
 }
 
-.replay-timeline__recordings-button {
-  position: static;
-  transform: none;
+.replay-timeline__speed-option:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.replay-timeline__speed-option--active {
+  border-color: var(--panel-border);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .review-video-modal {
@@ -3393,8 +3760,8 @@ button {
 
 @media (max-width: 900px) {
   .flight-surface--corner {
-    width: min(280px, 38vw);
-    height: min(158px, 21.4vw);
+    width: min(420px, 57vw);
+    height: min(237px, 32.1vw);
   }
 
   .review-video-modal__body {
@@ -3411,19 +3778,14 @@ button {
     grid-template-columns: 1fr;
     justify-items: center;
   }
-
-  .replay-timeline__controls {
-    flex-wrap: wrap;
-    justify-content: center;
-  }
 }
 
 @media (max-width: 640px) {
   .flight-surface--corner {
     right: 12px;
     bottom: 12px;
-    width: min(44vw, 220px);
-    height: min(24.75vw, 124px);
+    width: min(66vw, 330px);
+    height: min(37.13vw, 186px);
     border-radius: 18px;
   }
 

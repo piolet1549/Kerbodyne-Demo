@@ -40,6 +40,17 @@ interface FlightNotificationRecord {
   closing?: boolean;
 }
 
+function ExportIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="icon-export">
+      <path d="M12 4v10" />
+      <path d="m8 10 4 4 4-4" />
+      <path d="M5 17.5h14" />
+      <path d="M7 20h10" />
+    </svg>
+  );
+}
+
 const emptySnapshot: AppSnapshot = {
   config: {
     listen_port: 8765,
@@ -194,6 +205,25 @@ function readBooleanExtra(extras: Record<string, unknown> | null | undefined, ke
   return null;
 }
 
+function readStringExtra(extras: Record<string, unknown> | null | undefined, key: string) {
+  const value = extras?.[key];
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  return null;
+}
+
+function formatFlightModeLabel(value: string | number | null | undefined) {
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim();
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return `Mode ${Math.round(value)}`;
+  }
+  return '--';
+}
+
 function buildMetricState(
   tone: HudMetricState['tone'],
   color_hex?: string | null,
@@ -233,6 +263,7 @@ export function App() {
   const notificationTimersRef = useRef<Record<string, number>>({});
   const seenSystemStatusIdsRef = useRef<Set<string>>(new Set());
   const armedAltitudeBaselineRef = useRef<number | null>(null);
+  const armedAtTimestampRef = useRef<string | null>(null);
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [offlineCatalog, setOfflineCatalog] = useState<OfflineRegionCatalog>({
     asset_origin: '',
@@ -337,6 +368,9 @@ export function App() {
   const displayLiveState = reviewMode ? selectedReviewFrame?.live_state ?? null : snapshot.live_state;
   const displayAltitudeMsl = displayLiveState?.alt_msl_m ?? null;
   const displayAltitudeAgl = useMemo(() => {
+    if (displayAltitudeMsl == null) {
+      return null;
+    }
     if (!displayLiveState?.armed) {
       return 0;
     }
@@ -354,6 +388,21 @@ export function App() {
     snapshot.active_session_id
   ]);
   const liveExtras = (displayLiveState?.extras ?? null) as Record<string, unknown> | null;
+  const flightModeRaw =
+    readStringExtra(liveExtras, 'flight_mode_label') ??
+    readNumberExtra(liveExtras, 'flight_mode') ??
+    readStringExtra(liveExtras, 'flight_mode');
+  const flightModeLabel = formatFlightModeLabel(flightModeRaw);
+  const pitchDeg = readNumberExtra(liveExtras, 'pitch_deg');
+  const rollDeg = readNumberExtra(liveExtras, 'roll_deg');
+  const navPitchDeg = readNumberExtra(liveExtras, 'nav_pitch_deg');
+  const navRollDeg = readNumberExtra(liveExtras, 'nav_roll_deg');
+  const targetAltitudeMslM = readNumberExtra(liveExtras, 'alt_demanded_m');
+  const throttlePct = readNumberExtra(liveExtras, 'throttle_pct');
+  const verticalSpeedMps = readNumberExtra(liveExtras, 'vspeed_ms');
+  const vibrationX = readNumberExtra(liveExtras, 'vib_x');
+  const vibrationY = readNumberExtra(liveExtras, 'vib_y');
+  const vibrationZ = readNumberExtra(liveExtras, 'vib_z');
   const cpuTempC = readNumberExtra(liveExtras, 'cpu_temp_c');
   const cpuPercent = readNumberExtra(liveExtras, 'cpu_pct');
   const cpuMhz = readNumberExtra(liveExtras, 'cpu_mhz');
@@ -743,6 +792,7 @@ export function App() {
     if (!activeFlight) {
       seenSystemStatusIdsRef.current = new Set();
       armedAltitudeBaselineRef.current = null;
+      armedAtTimestampRef.current = null;
       setLowSpeedMonitoringEnabled(false);
       if (lowSpeedLandingTimerRef.current) {
         window.clearTimeout(lowSpeedLandingTimerRef.current);
@@ -767,6 +817,9 @@ export function App() {
 
     if (armedAltitudeBaselineRef.current == null && displayLiveState.alt_msl_m != null) {
       armedAltitudeBaselineRef.current = displayLiveState.alt_msl_m;
+    }
+    if (armedAtTimestampRef.current == null && displayLiveState.last_update_at) {
+      armedAtTimestampRef.current = displayLiveState.last_update_at;
     }
   }, [activeFlight, displayLiveState?.alt_msl_m, displayLiveState?.armed]);
 
@@ -929,20 +982,23 @@ export function App() {
     }
     return { label: 'Ready', variant: 'connected' as const };
   }, [activeFlight, displayLiveState?.armed, flightHasReceivedConnection, snapshot.connection.status]);
-  const expandedHudStatus = useMemo(() => {
+  const visionHudStatus = useMemo(() => {
     if (!activeFlight && !reviewMode) {
       return null;
     }
     if (activeFlight && snapshot.connection.status === 'stale') {
       return { label: 'Vision telemetry stale', variant: 'stale' as const };
     }
-    if (activeFlight && !flightHasReceivedConnection) {
+    if (!flightHasReceivedConnection && activeFlight) {
       return { label: 'Awaiting vision telemetry', variant: 'waiting' as const };
     }
     if (visionActive) {
       return { label: 'Vision pipeline active', variant: 'connected' as const };
     }
-    return { label: 'Vision pipeline inactive', variant: 'waiting' as const };
+    return {
+      label: activeFlight ? 'Vision pipeline inactive' : 'Vision pipeline unavailable',
+      variant: activeFlight ? ('pending' as const) : ('waiting' as const)
+    };
   }, [activeFlight, flightHasReceivedConnection, reviewMode, snapshot.connection.status, visionActive]);
   const telemetryMetricStates = useMemo(() => {
     const safeColor = '#f4f4f4';
@@ -1068,8 +1124,8 @@ export function App() {
   }, [
     activeFlight,
     displayLiveState?.alt_msl_m,
-    displayLiveState?.battery?.percent,
     displayLiveState?.groundspeed_mps,
+    displayLiveState?.battery?.percent,
     lowSpeedMonitoringEnabled,
     snapshot.config.flight_alerts.high_altitude_warning_m,
     snapshot.config.flight_alerts.high_speed_warning_mps,
@@ -1265,11 +1321,8 @@ export function App() {
     setReviewPlaybackActive((current) => !current);
   }
 
-  function handleAdjustReviewPlaybackSpeed(direction: -1 | 1) {
-    const speeds = [0.5, 1, 2, 4];
-    const currentIndex = speeds.findIndex((speed) => speed === reviewPlaybackSpeed);
-    const nextIndex = Math.max(0, Math.min((currentIndex >= 0 ? currentIndex : 1) + direction, speeds.length - 1));
-    setReviewPlaybackSpeed(speeds[nextIndex]);
+  function handleSelectReviewPlaybackSpeed(speed: number) {
+    setReviewPlaybackSpeed(speed);
   }
 
   function openStopFlightPrompt() {
@@ -1510,6 +1563,22 @@ export function App() {
             >
               {reviewMode ? 'End Review' : activeFlight ? 'End flight' : 'Start flight'}
             </button>
+            {reviewMode ? (
+              <>
+                {focusedSession?.id ? (
+                  <button
+                    className="secondary-button secondary-button--muted save-row__icon-button"
+                    onClick={() =>
+                      void runCommand(() => handleExportSession(focusedSession.id))
+                    }
+                    title="Export telemetry"
+                    aria-label="Export telemetry"
+                  >
+                    <ExportIcon />
+                  </button>
+                ) : null}
+              </>
+            ) : null}
             {activeFlight ? (
               <>
                 <button
@@ -1618,33 +1687,42 @@ export function App() {
           <TelemetryHud
             liveState={displayLiveState}
             mode={activeFlight ? 'live' : 'review'}
-            reviewTimestamp={selectedReviewFrame?.recorded_at ?? null}
             altitudeAglM={displayAltitudeAgl}
             altitudeMslM={displayAltitudeMsl}
+            targetAltitudeMslM={targetAltitudeMslM}
             liveConnectionState={liveHudStatus}
+            visionStatus={visionHudStatus}
+            visionValue={visionActive}
+            flightModeLabel={flightModeLabel}
+            batteryPercent={displayLiveState?.battery?.percent ?? null}
+            attitude={{
+              pitchDeg,
+              rollDeg,
+              navPitchDeg,
+              navRollDeg
+            }}
             metricStates={activeFlight ? telemetryMetricStates : undefined}
             expandedHud={
-              expandedHudStatus
+              (activeFlight || reviewMode)
                 ? {
                     open: activeFlight ? expandedHudOpen : reviewMode,
                     cpuTempC,
                     cpuPercent,
+                    cpuClockMhz: cpuMhz,
                     npuTempC,
-                    status: expandedHudStatus
+                    throttlePct,
+                    verticalSpeedMps,
+                    vibrationX,
+                    vibrationY,
+                    vibrationZ,
+                    altitudeMslM: displayAltitudeMsl,
+                    targetAltitudeMslM
                   }
                 : null
             }
             onOpenRawData={activeFlight ? () => setRawTelemetryOpen(true) : undefined}
             onToggleExpandedHud={
               activeFlight ? () => setExpandedHudOpen((current) => !current) : undefined
-            }
-            onExportTelemetry={
-              reviewMode && focusedSession?.id
-                ? () =>
-                    void runCommand(() =>
-                      handleExportSession(focusedSession.id)
-                    )
-                : undefined
             }
           />
         ) : null}
@@ -1674,7 +1752,7 @@ export function App() {
               );
             }}
             onTogglePlayback={handleToggleReviewPlayback}
-            onAdjustPlaybackSpeed={handleAdjustReviewPlaybackSpeed}
+            onSelectPlaybackSpeed={handleSelectReviewPlaybackSpeed}
             onOpenRecordings={() => setReviewVideoOpen(true)}
           />
         ) : null}
