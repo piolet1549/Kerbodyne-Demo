@@ -617,24 +617,12 @@ impl AppRuntime {
     }
 
     pub async fn start_live_ingest(&self, app: &AppHandle) -> Result<(), String> {
-        let udp_socket = UdpSocket::bind(("0.0.0.0", LEGACY_TELEMETRY_PORT))
-            .await
-            .map_err(|error| {
-                format!(
-                    "Unable to bind UDP telemetry listener on port {}: {}",
-                    LEGACY_TELEMETRY_PORT, error
-                )
-            })?;
-        let tcp_listener = TcpListener::bind(("0.0.0.0", LEGACY_ALERT_PORT))
-            .await
-            .map_err(|error| {
-                format!(
-                    "Unable to bind TCP alert listener on port {}: {}",
-                    LEGACY_ALERT_PORT, error
-                )
-            })?;
-
         self.prepare_for_new_manual_stream(app).await?;
+        let udp_socket =
+            bind_legacy_udp_listener(("0.0.0.0", LEGACY_TELEMETRY_PORT), LEGACY_TELEMETRY_PORT)
+                .await?;
+        let tcp_listener =
+            bind_legacy_alert_listener(("0.0.0.0", LEGACY_ALERT_PORT), LEGACY_ALERT_PORT).await?;
         let session_id = self
             .begin_session(DEFAULT_AIRCRAFT_ID, LEGACY_SOURCE_LABEL)
             .await?;
@@ -2085,6 +2073,56 @@ impl AppRuntime {
         fs::write(&path, bytes).map_err(|error| error.to_string())?;
         Ok(Some(path.to_string_lossy().to_string()))
     }
+}
+
+async fn bind_legacy_udp_listener(
+    address: (&str, u16),
+    port: u16,
+) -> Result<UdpSocket, String> {
+    for attempt in 0..6 {
+        match UdpSocket::bind(address).await {
+            Ok(socket) => return Ok(socket),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 5 => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Unable to bind UDP telemetry listener on port {}: {}",
+                    port, error
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "Unable to bind UDP telemetry listener on port {} after multiple attempts.",
+        port
+    ))
+}
+
+async fn bind_legacy_alert_listener(
+    address: (&str, u16),
+    port: u16,
+) -> Result<TcpListener, String> {
+    for attempt in 0..6 {
+        match TcpListener::bind(address).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 5 => {
+                sleep(Duration::from_millis(150)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Unable to bind TCP alert listener on port {}: {}",
+                    port, error
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "Unable to bind TCP alert listener on port {} after multiple attempts.",
+        port
+    ))
 }
 
 fn update_if_some<T>(target: &mut Option<T>, value: Option<T>) {
