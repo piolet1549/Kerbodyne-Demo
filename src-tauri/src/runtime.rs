@@ -1261,6 +1261,18 @@ impl AppRuntime {
         Ok(())
     }
 
+    pub async fn shutdown(&self, app: &AppHandle) {
+        {
+            let mut active_tasks = self.active_tasks.lock().await;
+            for handle in active_tasks.drain(..) {
+                handle.abort();
+            }
+        }
+        let _ = self.stop_video_subsystem(app).await;
+        let _ = self.end_current_session().await;
+        let _ = self.db.delete_empty_sessions();
+    }
+
     async fn stop_video_subsystem(&self, app: &AppHandle) -> Result<(), String> {
         let _ = self.stop_video_recording_internal(app, false).await;
         self.stop_preview_process().await;

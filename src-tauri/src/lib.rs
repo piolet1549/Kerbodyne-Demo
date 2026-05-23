@@ -9,7 +9,7 @@ use std::{io, sync::Arc};
 
 use models::{AppConfig, AppSnapshot, OfflineRegionCatalog, OfflineRegionManifest};
 use runtime::AppRuntime;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, RunEvent, State};
 
 #[tauri::command]
 async fn bootstrap_app(state: State<'_, Arc<AppRuntime>>) -> Result<AppSnapshot, String> {
@@ -135,7 +135,7 @@ async fn stop_video_recording(
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let runtime = AppRuntime::initialize(app.handle())
@@ -160,6 +160,14 @@ pub fn run() {
             start_video_recording,
             stop_video_recording
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Kerbodyne Ground Station");
+        .build(tauri::generate_context!())
+        .expect("error while building Kerbodyne Ground Station");
+
+    app.run(|app, event| {
+        if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+            if let Some(runtime) = app.try_state::<Arc<AppRuntime>>() {
+                tauri::async_runtime::block_on(runtime.shutdown(app));
+            }
+        }
+    });
 }
