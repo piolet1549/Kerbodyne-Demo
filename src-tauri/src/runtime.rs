@@ -13,7 +13,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     process::{Child, Command},
-    sync::{watch, Mutex, RwLock},
+    sync::{broadcast, watch, Mutex, RwLock},
     time::{sleep, timeout, Duration},
 };
 use uuid::Uuid;
@@ -23,8 +23,8 @@ use crate::{
     geometry::distance_m,
     models::{
         AlertPayload, AlertRecord, AppConfig, AppSnapshot, AircraftLiveState, BatterySummary,
-        ConnectionHealth, ConnectionStatus, DEFAULT_AIRCRAFT_ID, LEGACY_ALERT_PORT,
-        LEGACY_TELEMETRY_PORT, LegacyAlertPacket, LegacySystemStatusPacket,
+        ConnectionHealth, ConnectionStatus, DEFAULT_AIRCRAFT_ID, LegacyAlertPacket,
+        LegacySystemStatusPacket,
         LegacyTelemetryPacket, LegacyTelemetryPacketType, MapAlertSector, MissionSession,
         OfflineRegionCatalog, OfflineRegionManifest, ReplayFrame, ReviewTelemetryFrame,
         RuntimeEvent, RuntimeMode, SCHEMA_VERSION, SessionVideoClip, SystemStatusPayload,
@@ -50,6 +50,7 @@ const COMPAT_HF_STALE_SECS: i64 = 2;
 const COMPAT_MF_STALE_SECS: i64 = 4;
 const COMPAT_LF_STALE_SECS: i64 = 8;
 const VIDEO_PREVIEW_PATH: &str = "/live.mjpg";
+const APP_VIDEO_PREVIEW_FRAME_PATH: &str = "/__preview__/live.jpg";
 const VLC_HTTP_PROBE_INTERVAL_MS: u64 = 300;
 const VLC_HTTP_PROBE_TIMEOUT_MS: u64 = 2200;
 const VLC_SHUTDOWN_TIMEOUT_SECS: u64 = 8;
@@ -320,8 +321,8 @@ impl IngestSource {
     fn note(&self) -> &'static str {
         match self {
             Self::WebSocket => "Receiving canonical live telemetry",
-            Self::CompatibilityTelemetry => "Receiving compatibility telemetry on UDP 5001",
-            Self::CompatibilityAlert => "Receiving compatibility TCP packets on port 5000",
+            Self::CompatibilityTelemetry => "Receiving compatibility telemetry",
+            Self::CompatibilityAlert => "Receiving compatibility TCP packets",
         }
     }
 }
@@ -350,7 +351,15 @@ pub struct AppRuntime {
     current_session_source: RwLock<Option<String>>,
     focused_session_id: RwLock<Option<String>>,
     compatibility_telemetry: RwLock<CompatibilityTelemetryState>,
+    background_tasks: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
     active_tasks: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
+    legacy_listener_tasks: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
+    legacy_listener_init_lock: Mutex<()>,
+    legacy_listener_shutdown: Mutex<Option<broadcast::Sender<()>>>,
+    legacy_ingest_enabled: RwLock<bool>,
+    legacy_udp_listener_ready: RwLock<bool>,
+    legacy_tcp_listener_ready: RwLock<bool>,
+    shutdown_signal: broadcast::Sender<()>,
     preview_frame_sender: watch::Sender<Option<Vec<u8>>>,
     latest_preview_frame: RwLock<Option<Vec<u8>>>,
     video_runtime: Mutex<VideoRuntimeState>,
@@ -359,6 +368,11 @@ pub struct AppRuntime {
 }
 
 impl AppRuntime {
+    async fn legacy_ports(&self) -> (u16, u16) {
+        let config = self.config.read().await;
+        (config.legacy_telemetry_port, config.legacy_alert_port)
+    }
+
     pub fn initialize(app: &AppHandle) -> Result<Arc<Self>, String> {
         let data_dir = app
             .path()
@@ -370,6 +384,7 @@ impl AppRuntime {
         let video_dir = data_dir.join("recordings");
         fs::create_dir_all(&video_dir).map_err(|error| error.to_string())?;
         let (preview_frame_sender, _) = watch::channel(None);
+        let (shutdown_signal, _) = broadcast::channel(8);
 
         let database = Database::open(&data_dir.join("kerbodyne.db"))?;
         let mut config = database.load_config()?.unwrap_or_default();
@@ -407,7 +422,15 @@ impl AppRuntime {
             current_session_source: RwLock::new(None),
             focused_session_id: RwLock::new(focused_session_id),
             compatibility_telemetry: RwLock::new(CompatibilityTelemetryState::default()),
+            background_tasks: Mutex::new(Vec::new()),
             active_tasks: Mutex::new(Vec::new()),
+            legacy_listener_tasks: Mutex::new(Vec::new()),
+            legacy_listener_init_lock: Mutex::new(()),
+            legacy_listener_shutdown: Mutex::new(None),
+            legacy_ingest_enabled: RwLock::new(false),
+            legacy_udp_listener_ready: RwLock::new(false),
+            legacy_tcp_listener_ready: RwLock::new(false),
+            shutdown_signal,
             preview_frame_sender,
             latest_preview_frame: RwLock::new(None),
             video_runtime: Mutex::new(VideoRuntimeState::default()),
@@ -417,9 +440,12 @@ impl AppRuntime {
     }
 
     pub fn start_background_tasks(self: &Arc<Self>, app: AppHandle) {
-        match spawn_offline_asset_server(self.clone()) {
-            Ok(asset_origin) => {
+        match spawn_offline_asset_server(self.clone(), self.shutdown_signal.subscribe()) {
+            Ok((asset_origin, asset_server_handle)) => {
                 *self.asset_server_origin.blocking_write() = asset_origin;
+                self.background_tasks
+                    .blocking_lock()
+                    .push(asset_server_handle);
             }
             Err(error) => {
                 eprintln!("Kerbodyne offline asset server failed to start: {error}");
@@ -427,19 +453,33 @@ impl AppRuntime {
         }
 
         let port = self.config.blocking_read().listen_port;
-        spawn_websocket_server(self.clone(), app.clone(), port);
+        let websocket_handle = spawn_websocket_server(
+            self.clone(),
+            app.clone(),
+            port,
+            self.shutdown_signal.subscribe(),
+        );
+        self.background_tasks
+            .blocking_lock()
+            .push(websocket_handle);
 
         let runtime = self.clone();
-        tauri::async_runtime::spawn(async move {
+        let mut shutdown_receiver = self.shutdown_signal.subscribe();
+        let periodic_handle = tauri::async_runtime::spawn(async move {
             loop {
-                sleep(Duration::from_secs(2)).await;
-                let connection_changed = runtime.refresh_connection_health().await;
-                let video_changed = runtime.refresh_video_health(&app).await;
-                if connection_changed || video_changed {
-                    let _ = runtime.emit_snapshot(&app).await;
+                tokio::select! {
+                    _ = shutdown_receiver.recv() => break,
+                    _ = sleep(Duration::from_secs(2)) => {
+                        let connection_changed = runtime.refresh_connection_health().await;
+                        let video_changed = runtime.refresh_video_health(&app).await;
+                        if connection_changed || video_changed {
+                            let _ = runtime.emit_snapshot(&app).await;
+                        }
+                    }
                 }
             }
         });
+        self.background_tasks.blocking_lock().push(periodic_handle);
     }
 
     pub async fn snapshot(&self) -> AppSnapshot {
@@ -618,33 +658,21 @@ impl AppRuntime {
 
     pub async fn start_live_ingest(&self, app: &AppHandle) -> Result<(), String> {
         self.prepare_for_new_manual_stream(app).await?;
-        let udp_socket =
-            bind_legacy_udp_listener(("0.0.0.0", LEGACY_TELEMETRY_PORT), LEGACY_TELEMETRY_PORT)
-                .await?;
-        let tcp_listener =
-            bind_legacy_alert_listener(("0.0.0.0", LEGACY_ALERT_PORT), LEGACY_ALERT_PORT).await?;
+        self.ensure_legacy_listener_tasks(app).await?;
         let session_id = self
             .begin_session(DEFAULT_AIRCRAFT_ID, LEGACY_SOURCE_LABEL)
             .await?;
-
-        let runtime = app.state::<Arc<AppRuntime>>().inner().clone();
-        let telemetry_handle = spawn_legacy_telemetry_listener(runtime.clone(), app.clone(), udp_socket);
-        let alert_handle = spawn_legacy_alert_listener(runtime, app.clone(), tcp_listener);
-
-        {
-            let mut active_tasks = self.active_tasks.lock().await;
-            active_tasks.push(telemetry_handle);
-            active_tasks.push(alert_handle);
-        }
+        *self.legacy_ingest_enabled.write().await = true;
+        let (legacy_telemetry_port, legacy_alert_port) = self.legacy_ports().await;
         {
             *self.mode.write().await = RuntimeMode::Live;
             *self.connection.write().await = ConnectionHealth {
                 status: ConnectionStatus::Listening,
-                port: LEGACY_TELEMETRY_PORT,
+                port: legacy_telemetry_port,
                 last_packet_at: None,
                 note: Some(format!(
                     "Listening for airside downlink on UDP {} and TCP {}",
-                    LEGACY_TELEMETRY_PORT, LEGACY_ALERT_PORT
+                    legacy_telemetry_port, legacy_alert_port
                 )),
             };
         }
@@ -655,20 +683,6 @@ impl AppRuntime {
 
         self.emit_snapshot(app).await?;
         Ok(())
-    }
-
-    pub async fn start_video_recording(&self, app: &AppHandle) -> Result<(), String> {
-        let session_id = self
-            .current_session_id
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| "No active flight to record.".to_string())?;
-        self.start_video_recording_for_session(app, &session_id).await
-    }
-
-    pub async fn stop_video_recording(&self, app: &AppHandle) -> Result<(), String> {
-        self.stop_video_recording_internal(app, true).await
     }
 
     pub async fn focus_session(&self, app: &AppHandle, session_id: String) -> Result<(), String> {
@@ -825,6 +839,8 @@ impl AppRuntime {
         name: Option<String>,
         description: Option<String>,
     ) -> Result<(), String> {
+        *self.legacy_ingest_enabled.write().await = false;
+        self.stop_legacy_listener_tasks().await;
         let had_connection = self.connection.read().await.last_packet_at.is_some();
         let has_armed_telemetry = *self.session_has_armed_telemetry.read().await;
         let session_id = self
@@ -951,6 +967,8 @@ impl AppRuntime {
     }
 
     async fn prepare_for_new_manual_stream(&self, app: &AppHandle) -> Result<(), String> {
+        *self.legacy_ingest_enabled.write().await = false;
+        self.stop_legacy_listener_tasks().await;
         {
             let mut active_tasks = self.active_tasks.lock().await;
             for handle in active_tasks.drain(..) {
@@ -976,6 +994,120 @@ impl AppRuntime {
         *self.connection.write().await = ConnectionHealth::disconnected(port);
         self.emit_snapshot(app).await?;
         Ok(())
+    }
+
+    async fn ensure_legacy_listener_tasks(&self, app: &AppHandle) -> Result<(), String> {
+        let _guard = self.legacy_listener_init_lock.lock().await;
+        let needs_udp_listener = !*self.legacy_udp_listener_ready.read().await;
+        let needs_tcp_listener = !*self.legacy_tcp_listener_ready.read().await;
+
+        if !needs_udp_listener && !needs_tcp_listener {
+            return Ok(());
+        }
+
+        self.reclaim_legacy_ports().await?;
+
+        let runtime = app.state::<Arc<AppRuntime>>().inner().clone();
+        let (legacy_telemetry_port, legacy_alert_port) = self.legacy_ports().await;
+        let shutdown_signal = {
+            let mut shutdown = self.legacy_listener_shutdown.lock().await;
+            if let Some(existing) = shutdown.as_ref() {
+                existing.clone()
+            } else {
+                let (sender, _) = broadcast::channel(4);
+                *shutdown = Some(sender.clone());
+                sender
+            }
+        };
+
+        if needs_udp_listener {
+            let udp_socket = bind_legacy_udp_listener(
+                ("0.0.0.0", legacy_telemetry_port),
+                legacy_telemetry_port,
+            )
+            .await?;
+            let telemetry_handle = spawn_legacy_telemetry_listener(
+                runtime.clone(),
+                app.clone(),
+                udp_socket,
+                shutdown_signal.subscribe(),
+            );
+            self.legacy_listener_tasks.lock().await.push(telemetry_handle);
+            *self.legacy_udp_listener_ready.write().await = true;
+        }
+
+        if needs_tcp_listener {
+            let tcp_listener =
+                bind_legacy_alert_listener(("0.0.0.0", legacy_alert_port), legacy_alert_port)
+                    .await?;
+            let alert_handle = spawn_legacy_alert_listener(
+                runtime,
+                app.clone(),
+                tcp_listener,
+                shutdown_signal.subscribe(),
+            );
+            self.legacy_listener_tasks.lock().await.push(alert_handle);
+            *self.legacy_tcp_listener_ready.write().await = true;
+        }
+
+        Ok(())
+    }
+
+    async fn reclaim_legacy_ports(&self) -> Result<(), String> {
+        let (legacy_telemetry_port, legacy_alert_port) = self.legacy_ports().await;
+
+        for _ in 0..12 {
+            let udp_owner = detect_port_owner("udp", legacy_telemetry_port);
+            let tcp_owner = detect_port_owner("tcp", legacy_alert_port);
+
+            let mut killed_any = false;
+            for pid in [udp_owner, tcp_owner].into_iter().flatten() {
+                if pid == std::process::id() {
+                    continue;
+                }
+
+                if terminate_process_by_pid(pid) {
+                    killed_any = true;
+                }
+            }
+
+            let udp_still_owned = detect_port_owner("udp", legacy_telemetry_port).is_some();
+            let tcp_still_owned = detect_port_owner("tcp", legacy_alert_port).is_some();
+
+            if !udp_still_owned && !tcp_still_owned {
+                return Ok(());
+            }
+
+            if !killed_any {
+                sleep(Duration::from_millis(300)).await;
+            } else {
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+
+        let udp_owner = describe_port_owner(detect_port_owner("udp", legacy_telemetry_port));
+        let tcp_owner = describe_port_owner(detect_port_owner("tcp", legacy_alert_port));
+        Err(format!(
+            "Unable to clear legacy flight ports before starting a flight. UDP {} owner: {}. TCP {} owner: {}.",
+            legacy_telemetry_port, udp_owner, legacy_alert_port, tcp_owner
+        ))
+    }
+
+    async fn stop_legacy_listener_tasks(&self) {
+        if let Some(shutdown_signal) = self.legacy_listener_shutdown.lock().await.take() {
+            let _ = shutdown_signal.send(());
+        }
+
+        let mut legacy_listener_tasks = self.legacy_listener_tasks.lock().await;
+        for handle in legacy_listener_tasks.drain(..) {
+            let mut handle = handle;
+            if timeout(Duration::from_secs(2), &mut handle).await.is_err() {
+                handle.abort();
+            }
+        }
+
+        *self.legacy_udp_listener_ready.write().await = false;
+        *self.legacy_tcp_listener_ready.write().await = false;
     }
 
     async fn refresh_connection_health(&self) -> bool {
@@ -1032,7 +1164,7 @@ impl AppRuntime {
         };
         let next_last_packet_at = Some(last_packet_at.to_rfc3339());
 
-        let port = LEGACY_TELEMETRY_PORT;
+        let port = self.legacy_ports().await.0;
         let mut connection = self.connection.write().await;
         let changed = connection.status != next_status
             || connection.port != port
@@ -1214,10 +1346,12 @@ impl AppRuntime {
             )
         };
 
+        let preview_url = preview_frame_url(&self.asset_server_origin.read().await);
+
         {
             *self.video_preview.write().await = VideoPreviewState {
                 status: VideoPreviewStatus::WaitingForStream,
-                preview_url: Some(preview_stream_url(preview_http_port)),
+                preview_url,
                 recording_active,
                 current_clip_id,
                 message: Some(video_status_message(&VideoPreviewStatus::WaitingForStream).to_string()),
@@ -1250,6 +1384,13 @@ impl AppRuntime {
     ) -> Result<(), String> {
         self.stop_video_subsystem(app).await?;
 
+        if let Some(owner_pid) = detect_external_udp_port_owner(LIVE_VIDEO_RTP_PORT) {
+            return Err(format!(
+                "Live video port {} is already in use by another application (PID {}). Close the VLC test or any other program using the feed and try again.",
+                LIVE_VIDEO_RTP_PORT, owner_pid
+            ));
+        }
+
         let vlc_executable = resolve_vlc_executable(app).ok_or_else(|| {
             "Live video runtime unavailable: vlc.exe not found in bundled resources or PATH."
                 .to_string()
@@ -1262,10 +1403,22 @@ impl AppRuntime {
     }
 
     pub async fn shutdown(&self, app: &AppHandle) {
+        *self.legacy_ingest_enabled.write().await = false;
+        let _ = self.shutdown_signal.send(());
         {
             let mut active_tasks = self.active_tasks.lock().await;
             for handle in active_tasks.drain(..) {
                 handle.abort();
+            }
+        }
+        self.stop_legacy_listener_tasks().await;
+        {
+            let mut background_tasks = self.background_tasks.lock().await;
+            for handle in background_tasks.drain(..) {
+                let mut handle = handle;
+                if timeout(Duration::from_secs(2), &mut handle).await.is_err() {
+                    handle.abort();
+                }
             }
         }
         let _ = self.stop_video_subsystem(app).await;
@@ -1280,52 +1433,6 @@ impl AppRuntime {
         *self.video_preview.write().await = VideoPreviewState::default();
         *self.latest_preview_frame.write().await = None;
         let _ = self.preview_frame_sender.send(None);
-        Ok(())
-    }
-
-    async fn start_video_recording_for_session(
-        &self,
-        app: &AppHandle,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let vlc_executable = self
-            .vlc_path
-            .read()
-            .await
-            .clone()
-            .or_else(|| resolve_vlc_executable(app))
-            .ok_or_else(|| "Live video runtime unavailable: vlc.exe not found.".to_string())?;
-
-        let mut runtime = self.video_runtime.lock().await;
-        if runtime.recording.is_some() {
-            return Ok(());
-        }
-
-        let session_dir = self.video_dir.join(session_id);
-        fs::create_dir_all(&session_dir).map_err(|error| error.to_string())?;
-        let clip_id = Uuid::new_v4().to_string();
-        let started_at = Utc::now().to_rfc3339();
-        let mp4_path = session_dir.join(format!("{clip_id}.mp4"));
-        let _ = fs::remove_file(&mp4_path);
-
-        runtime.recording = Some(RecordingRunState {
-            clip_id: clip_id.clone(),
-            session_id: session_id.to_string(),
-            started_at,
-            mp4_path,
-        });
-        drop(runtime);
-        let recording_output_path = self
-            .video_runtime
-            .lock()
-            .await
-            .recording
-            .as_ref()
-            .map(|recording| recording.mp4_path.clone())
-            .ok_or_else(|| "Recording state was not initialized.".to_string())?;
-        self.launch_preview_process(app, &vlc_executable, Some(&recording_output_path))
-            .await?;
-        self.emit_snapshot(app).await?;
         Ok(())
     }
 
@@ -1418,6 +1525,12 @@ impl AppRuntime {
         }
     }
 
+    async fn publish_preview_frame(&self, app: &AppHandle, frame: Vec<u8>) {
+        *self.latest_preview_frame.write().await = Some(frame.clone());
+        let _ = self.preview_frame_sender.send(Some(frame));
+        self.register_preview_activity(app).await;
+    }
+
     pub async fn ingest_json(
         &self,
         app: &AppHandle,
@@ -1484,6 +1597,10 @@ impl AppRuntime {
         raw_json: &str,
         source: IngestSource,
     ) -> Result<(), String> {
+        if !*self.legacy_ingest_enabled.read().await {
+            return Ok(());
+        }
+
         let packet: LegacyTelemetryPacket =
             serde_json::from_str(raw_json).map_err(|error| error.to_string())?;
         self.push_raw_telemetry_packet(raw_json).await;
@@ -1535,6 +1652,10 @@ impl AppRuntime {
         raw_json: &str,
         source: IngestSource,
     ) -> Result<(), String> {
+        if !*self.legacy_ingest_enabled.read().await {
+            return Ok(());
+        }
+
         let value: Value = serde_json::from_str(raw_json).map_err(|error| error.to_string())?;
         let packet_type = value
             .get("packet_type")
@@ -1881,17 +2002,32 @@ impl AppRuntime {
     }
 
     async fn update_runtime_status(&self, source: IngestSource, sent_at: &str) {
-        let port = match source {
-            IngestSource::CompatibilityTelemetry => LEGACY_TELEMETRY_PORT,
-            IngestSource::CompatibilityAlert => LEGACY_ALERT_PORT,
-            _ => self.config.read().await.listen_port,
+        let config = self.config.read().await.clone();
+        let (port, note) = match source {
+            IngestSource::CompatibilityTelemetry => (
+                config.legacy_telemetry_port,
+                format!(
+                    "{} on UDP {}",
+                    source.note(),
+                    config.legacy_telemetry_port
+                ),
+            ),
+            IngestSource::CompatibilityAlert => (
+                config.legacy_alert_port,
+                format!(
+                    "{} on TCP {}",
+                    source.note(),
+                    config.legacy_alert_port
+                ),
+            ),
+            _ => (config.listen_port, source.note().to_string()),
         };
         *self.mode.write().await = source.mode();
         *self.connection.write().await = ConnectionHealth {
             status: source.connection_status(),
             port,
             last_packet_at: Some(sent_at.to_string()),
-            note: Some(source.note().into()),
+            note: Some(note),
         };
     }
 
@@ -2085,30 +2221,44 @@ impl AppRuntime {
         fs::write(&path, bytes).map_err(|error| error.to_string())?;
         Ok(Some(path.to_string_lossy().to_string()))
     }
+
+    pub async fn mark_legacy_udp_listener_down(&self) {
+        *self.legacy_udp_listener_ready.write().await = false;
+    }
+
+    pub async fn mark_legacy_tcp_listener_down(&self) {
+        *self.legacy_tcp_listener_ready.write().await = false;
+    }
 }
 
 async fn bind_legacy_udp_listener(
     address: (&str, u16),
     port: u16,
 ) -> Result<UdpSocket, String> {
-    for attempt in 0..6 {
+    for attempt in 0..20 {
         match UdpSocket::bind(address).await {
             Ok(socket) => return Ok(socket),
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 5 => {
-                sleep(Duration::from_millis(150)).await;
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 19 => {
+                sleep(Duration::from_millis(250)).await;
             }
             Err(error) => {
+                let owner = if error.kind() == std::io::ErrorKind::AddrInUse {
+                    format!(" Port owner: {}.", describe_port_owner(detect_port_owner("udp", port)))
+                } else {
+                    String::new()
+                };
                 return Err(format!(
-                    "Unable to bind UDP telemetry listener on port {}: {}",
-                    port, error
+                    "Unable to bind UDP telemetry listener on port {}: {}.{}",
+                    port, error, owner
                 ));
             }
         }
     }
 
     Err(format!(
-        "Unable to bind UDP telemetry listener on port {} after multiple attempts.",
-        port
+        "Unable to bind UDP telemetry listener on port {} after multiple attempts. Port owner: {}.",
+        port,
+        describe_port_owner(detect_port_owner("udp", port))
     ))
 }
 
@@ -2116,24 +2266,30 @@ async fn bind_legacy_alert_listener(
     address: (&str, u16),
     port: u16,
 ) -> Result<TcpListener, String> {
-    for attempt in 0..6 {
+    for attempt in 0..20 {
         match TcpListener::bind(address).await {
             Ok(listener) => return Ok(listener),
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 5 => {
-                sleep(Duration::from_millis(150)).await;
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 19 => {
+                sleep(Duration::from_millis(250)).await;
             }
             Err(error) => {
+                let owner = if error.kind() == std::io::ErrorKind::AddrInUse {
+                    format!(" Port owner: {}.", describe_port_owner(detect_port_owner("tcp", port)))
+                } else {
+                    String::new()
+                };
                 return Err(format!(
-                    "Unable to bind TCP alert listener on port {}: {}",
-                    port, error
+                    "Unable to bind TCP alert listener on port {}: {}.{}",
+                    port, error, owner
                 ));
             }
         }
     }
 
     Err(format!(
-        "Unable to bind TCP alert listener on port {} after multiple attempts.",
-        port
+        "Unable to bind TCP alert listener on port {} after multiple attempts. Port owner: {}.",
+        port,
+        describe_port_owner(detect_port_owner("tcp", port))
     ))
 }
 
@@ -2221,8 +2377,13 @@ fn configure_vlc_command(command: &mut Command, vlc_executable: &Path) {
     }
 }
 
-fn preview_stream_url(port: u16) -> String {
-    format!("http://127.0.0.1:{port}{VIDEO_PREVIEW_PATH}")
+fn preview_frame_url(asset_origin: &str) -> Option<String> {
+    let trimmed = asset_origin.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(format!("{trimmed}{APP_VIDEO_PREVIEW_FRAME_PATH}"))
+    }
 }
 
 fn write_live_sdp(path: &Path) -> Result<(), String> {
@@ -2250,7 +2411,7 @@ fn build_vlc_sout(preview_http_port: u16, recording_mp4_path: Option<&Path>) -> 
         VIDEO_PREVIEW_PATH
     );
     let preview_branch = format!(
-        "transcode{{vcodec=MJPG,vb=8000,scale=1,acodec=none}}:standard{{access=http{{mime=multipart/x-mixed-replace;boundary=--frame}},mux=mpjpeg,dst={preview_dst}}}"
+        "transcode{{vcodec=MJPG,vb=24000,fps=15,scale=1,acodec=none}}:standard{{access=http{{mime=multipart/x-mixed-replace;boundary=--frame}},mux=mpjpeg,dst={preview_dst}}}"
     );
 
     if let Some(path) = recording_mp4_path {
@@ -2345,6 +2506,100 @@ fn read_log_tail(path: &Path, line_limit: usize) -> Option<String> {
     }
 }
 
+#[cfg(windows)]
+fn detect_external_udp_port_owner(port: u16) -> Option<u32> {
+    detect_port_owner("udp", port)
+}
+
+#[cfg(not(windows))]
+fn detect_external_udp_port_owner(_port: u16) -> Option<u32> {
+    None
+}
+
+#[cfg(windows)]
+fn detect_port_owner(protocol: &str, port: u16) -> Option<u32> {
+    let output = std::process::Command::new("netstat")
+        .args(["-ano", "-p", protocol])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let needle = format!(":{port}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().find_map(|line| {
+        if !line.contains(&needle) {
+            return None;
+        }
+
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        let pid = columns.last()?.parse::<u32>().ok()?;
+        if pid == std::process::id() {
+            None
+        } else {
+            Some(pid)
+        }
+    })
+}
+
+#[cfg(windows)]
+fn process_name_for_pid(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next()?.trim();
+    if line.is_empty() || line.starts_with("INFO:") {
+        return None;
+    }
+
+    line.trim_matches('"')
+        .split("\",\"")
+        .next()
+        .map(|value| value.to_string())
+}
+
+#[cfg(not(windows))]
+fn detect_port_owner(_protocol: &str, _port: u16) -> Option<u32> {
+    None
+}
+
+#[cfg(not(windows))]
+fn describe_port_owner(_owner_pid: Option<u32>) -> String {
+    "unknown".to_string()
+}
+
+#[cfg(windows)]
+fn terminate_process_by_pid(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn terminate_process_by_pid(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn describe_port_owner(owner_pid: Option<u32>) -> String {
+    match owner_pid {
+        Some(pid) => {
+            let name = process_name_for_pid(pid).unwrap_or_else(|| "unknown".to_string());
+            format!("{name} (PID {pid})")
+        }
+        None => "none".to_string(),
+    }
+}
+
 async fn monitor_preview_stream(
     runtime: Arc<AppRuntime>,
     app: &AppHandle,
@@ -2352,6 +2607,7 @@ async fn monitor_preview_stream(
 ) {
     let request = preview_stream_request(preview_http_port);
     let mut read_buffer = vec![0_u8; 65_536];
+    let mut stream_buffer = Vec::with_capacity(262_144);
 
     loop {
         let mut stream = match TcpStream::connect(("127.0.0.1", preview_http_port)).await {
@@ -2382,12 +2638,52 @@ async fn monitor_preview_stream(
                 break;
             }
 
-            if buffer_contains_jpeg_frame(&read_buffer[..read]) {
+            stream_buffer.extend_from_slice(&read_buffer[..read]);
+            if let Some(frame) = extract_latest_jpeg_frame(&mut stream_buffer) {
+                runtime.publish_preview_frame(app, frame).await;
+            }
+
+            if stream_buffer.len() > 4_000_000 {
+                trim_preview_stream_buffer(&mut stream_buffer);
+            } else if buffer_contains_jpeg_frame(&read_buffer[..read]) {
                 runtime.register_preview_activity(app).await;
             }
         }
 
         sleep(Duration::from_millis(VLC_HTTP_PROBE_INTERVAL_MS)).await;
+    }
+}
+
+fn extract_latest_jpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let mut latest_frame = None;
+    while let Some(frame) = extract_next_jpeg_frame(buffer) {
+        latest_frame = Some(frame);
+    }
+    latest_frame
+}
+
+fn extract_next_jpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let start = buffer.windows(2).position(|window| window == [0xFF, 0xD8])?;
+    if start > 0 {
+        buffer.drain(..start);
+    }
+
+    let end_rel = buffer[2..]
+        .windows(2)
+        .position(|window| window == [0xFF, 0xD9])?;
+    let end = end_rel + 4;
+    let frame = buffer[..end].to_vec();
+    buffer.drain(..end);
+    Some(frame)
+}
+
+fn trim_preview_stream_buffer(buffer: &mut Vec<u8>) {
+    if let Some(start) = buffer.windows(2).rposition(|window| window == [0xFF, 0xD8]) {
+        if start > 0 {
+            buffer.drain(..start);
+        }
+    } else {
+        buffer.clear();
     }
 }
 

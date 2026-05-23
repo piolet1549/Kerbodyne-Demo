@@ -53,6 +53,8 @@ export interface HudMetricState {
 
 export interface AppConfig {
   listen_port: number;
+  legacy_telemetry_port: number;
+  legacy_alert_port: number;
   aircraft_label: string;
   map_style_url?: string | null;
   map_tile_template?: string | null;

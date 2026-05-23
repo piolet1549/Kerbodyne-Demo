@@ -1,6 +1,6 @@
 [package]
 name = "kerbodyne-ground-station"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 
 [package.metadata]
@@ -20,6 +20,7 @@ hyper = { version = "0.14", features = ["full"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sysinfo = "0.30"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 thiserror = "1"

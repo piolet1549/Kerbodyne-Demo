@@ -5,8 +5,8 @@ use serde_json::Value;
 
 pub const SCHEMA_VERSION: &str = "kerbodyne.beta.v1";
 pub const DEFAULT_AIRCRAFT_ID: &str = "prototype-001";
-pub const LEGACY_TELEMETRY_PORT: u16 = 5001;
-pub const LEGACY_ALERT_PORT: u16 = 5000;
+pub const DEFAULT_LEGACY_TELEMETRY_PORT: u16 = 45101;
+pub const DEFAULT_LEGACY_ALERT_PORT: u16 = 45100;
 
 fn default_armed() -> bool {
     true
@@ -16,6 +16,8 @@ fn default_armed() -> bool {
 #[serde(default)]
 pub struct AppConfig {
     pub listen_port: u16,
+    pub legacy_telemetry_port: u16,
+    pub legacy_alert_port: u16,
     pub aircraft_label: String,
     pub map_style_url: Option<String>,
     pub map_tile_template: Option<String>,
@@ -43,6 +45,8 @@ impl Default for AppConfig {
 
         Self {
             listen_port: 8765,
+            legacy_telemetry_port: DEFAULT_LEGACY_TELEMETRY_PORT,
+            legacy_alert_port: DEFAULT_LEGACY_ALERT_PORT,
             aircraft_label: "Kerbodyne Beta Vehicle".into(),
             map_style_url: None,
             map_tile_template: None,

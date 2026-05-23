@@ -17,12 +17,18 @@ use tokio::{
     fs::{metadata, File},
     io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
     net::{TcpListener, TcpStream, UdpSocket},
+    sync::broadcast,
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::runtime::{AppRuntime, IngestSource};
 
-pub fn spawn_websocket_server(runtime: Arc<AppRuntime>, app: AppHandle, port: u16) {
+pub fn spawn_websocket_server(
+    runtime: Arc<AppRuntime>,
+    app: AppHandle,
+    port: u16,
+    mut shutdown: broadcast::Receiver<()>,
+) -> tauri::async_runtime::JoinHandle<()> {
     spawn(async move {
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
             Ok(listener) => listener,
@@ -38,13 +44,16 @@ pub fn spawn_websocket_server(runtime: Arc<AppRuntime>, app: AppHandle, port: u1
         };
 
         loop {
-            let (stream, peer_addr) = match listener.accept().await {
-                Ok(parts) => parts,
-                Err(error) => {
-                    runtime
-                        .push_warning(&app, format!("Telemetry accept error: {error}"))
-                        .await;
-                    continue;
+            let (stream, peer_addr) = tokio::select! {
+                _ = shutdown.recv() => break,
+                accept_result = listener.accept() => match accept_result {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        runtime
+                            .push_warning(&app, format!("Telemetry accept error: {error}"))
+                            .await;
+                        continue;
+                    }
                 }
             };
 
@@ -109,10 +118,13 @@ pub fn spawn_websocket_server(runtime: Arc<AppRuntime>, app: AppHandle, port: u1
                 }
             });
         }
-    });
+    })
 }
 
-pub fn spawn_offline_asset_server(runtime: Arc<AppRuntime>) -> Result<String, String> {
+pub fn spawn_offline_asset_server(
+    runtime: Arc<AppRuntime>,
+    mut shutdown: broadcast::Receiver<()>,
+) -> Result<(String, tauri::async_runtime::JoinHandle<()>), String> {
     let std_listener =
         std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
     std_listener
@@ -122,7 +134,7 @@ pub fn spawn_offline_asset_server(runtime: Arc<AppRuntime>) -> Result<String, St
         .local_addr()
         .map_err(|error| error.to_string())?;
 
-    spawn(async move {
+    let handle = spawn(async move {
         let listener = match TcpListener::from_std(std_listener) {
             Ok(listener) => listener,
             Err(error) => {
@@ -132,11 +144,14 @@ pub fn spawn_offline_asset_server(runtime: Arc<AppRuntime>) -> Result<String, St
         };
 
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(parts) => parts,
-                Err(error) => {
-                    eprintln!("Kerbodyne offline asset server listener failed: {error}");
-                    break;
+            let (stream, _) = tokio::select! {
+                _ = shutdown.recv() => break,
+                accept_result = listener.accept() => match accept_result {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        eprintln!("Kerbodyne offline asset server listener failed: {error}");
+                        break;
+                    }
                 }
             };
 
@@ -158,19 +173,23 @@ pub fn spawn_offline_asset_server(runtime: Arc<AppRuntime>) -> Result<String, St
         }
     });
 
-    Ok(format!("http://127.0.0.1:{}", local_addr.port()))
+    Ok((format!("http://127.0.0.1:{}", local_addr.port()), handle))
 }
 
 pub fn spawn_legacy_telemetry_listener(
     runtime: Arc<AppRuntime>,
     app: AppHandle,
     socket: UdpSocket,
+    mut shutdown: broadcast::Receiver<()>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     spawn(async move {
         let mut buffer = [0_u8; 2048];
 
         loop {
-            match socket.recv_from(&mut buffer).await {
+            match tokio::select! {
+                _ = shutdown.recv() => break,
+                recv_result = socket.recv_from(&mut buffer) => recv_result,
+            } {
                 Ok((size, _)) => match std::str::from_utf8(&buffer[..size]) {
                     Ok(text) => {
                         let _ = runtime
@@ -191,6 +210,7 @@ pub fn spawn_legacy_telemetry_listener(
                     }
                 },
                 Err(error) => {
+                    runtime.mark_legacy_udp_listener_down().await;
                     runtime
                         .push_warning(&app, format!("Telemetry UDP listener failed: {error}"))
                         .await;
@@ -205,12 +225,17 @@ pub fn spawn_legacy_alert_listener(
     runtime: Arc<AppRuntime>,
     app: AppHandle,
     listener: TcpListener,
+    mut shutdown: broadcast::Receiver<()>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     spawn(async move {
         loop {
-            let (stream, addr) = match listener.accept().await {
+            let (stream, addr) = match tokio::select! {
+                _ = shutdown.recv() => break,
+                accept_result = listener.accept() => accept_result,
+            } {
                 Ok(parts) => parts,
                 Err(error) => {
+                    runtime.mark_legacy_tcp_listener_down().await;
                     runtime
                         .push_warning(&app, format!("Alert TCP accept error: {error}"))
                         .await;

@@ -17,9 +17,7 @@ import {
   listOfflineRegions,
   listenToRuntimeEvents,
   selectOfflineRegion,
-  startVideoRecording,
   startLiveIngest,
-  stopVideoRecording,
   updateSessionDetails,
   updateConfig
 } from './lib/runtime';
@@ -54,6 +52,8 @@ function ExportIcon() {
 const emptySnapshot: AppSnapshot = {
   config: {
     listen_port: 8765,
+    legacy_telemetry_port: 45101,
+    legacy_alert_port: 45100,
     aircraft_label: 'Kerbodyne Beta Vehicle',
     map_style_url: null,
     map_tile_template: null,
@@ -375,7 +375,6 @@ export function App() {
   const previousActiveSessionIdRef = useRef<string | null>(null);
   const previousActiveFlightRef = useRef(false);
   const lowSpeedLandingTimerRef = useRef<number | null>(null);
-  const cpuThrottleTimerRef = useRef<number | null>(null);
 
   const deferredAlerts = useDeferredValue(snapshot.alerts);
   const activeSession = useMemo(
@@ -480,6 +479,23 @@ export function App() {
   const npuTempC = readNumberExtra(liveExtras, 'npu_temp_c');
   const batteryMahConsumed = readNumberExtra(liveExtras, 'battery_mah');
   const visionActive = readBooleanExtra(liveExtras, 'vision_active');
+  const displayTargetAltitudeAgl = useMemo(() => {
+    if (!displayLiveState?.armed || targetAltitudeMslM == null) {
+      return null;
+    }
+    const baseline = snapshot.active_session_id
+      ? armedAltitudeBaselineRef.current
+      : reviewArmedAltitudeBaseline;
+    if (baseline == null) {
+      return null;
+    }
+    return targetAltitudeMslM - baseline;
+  }, [
+    displayLiveState?.armed,
+    reviewArmedAltitudeBaseline,
+    snapshot.active_session_id,
+    targetAltitudeMslM
+  ]);
   const displayTrack = useMemo(() => {
     if (!reviewMode) {
       return snapshot.track;
@@ -617,7 +633,20 @@ export function App() {
     try {
       await command();
     } catch (error) {
-      showBanner(error instanceof Error ? error.message : 'Command failed');
+      if (error instanceof Error) {
+        showBanner(error.message);
+        return;
+      }
+      if (typeof error === 'string') {
+        showBanner(error);
+        return;
+      }
+      if (error && typeof error === 'object' && 'message' in error) {
+        const message = String((error as { message?: unknown }).message ?? '').trim();
+        showBanner(message || 'Command failed');
+        return;
+      }
+      showBanner('Command failed');
     }
   }
 
@@ -809,12 +838,6 @@ export function App() {
   const videoIsCornerPane = activeFlight && !videoDominant;
   const toolbarVideoMode = activeFlight && videoDominant;
   const videoPreview = snapshot.video_preview;
-  const feedUnavailable =
-    videoPreview.status === 'idle' ||
-    videoPreview.status === 'waiting_for_stream' ||
-    videoPreview.status === 'waiting_for_keyframe' ||
-    videoPreview.status === 'error';
-  const recordButtonDisabled = !videoPreview.recording_active && feedUnavailable;
   useEffect(() => {
     if (activeFlight && !previousActiveFlightRef.current) {
       setActiveFlightLayout('video-dominant');
@@ -840,10 +863,6 @@ export function App() {
     if (!activeFlight) {
       setRawTelemetryOpen(false);
       setExpandedHudOpen(false);
-      if (cpuThrottleTimerRef.current) {
-        window.clearTimeout(cpuThrottleTimerRef.current);
-        cpuThrottleTimerRef.current = null;
-      }
     }
   }, [activeFlight]);
 
@@ -941,55 +960,6 @@ export function App() {
       }, 3000);
     }
   }, [activeFlight, displayLiveState?.groundspeed_mps, lowSpeedMonitoringEnabled]);
-
-  useEffect(() => {
-    const notificationId = 'telemetry:cpu-throttle-warning';
-    const clearThrottleTimer = () => {
-      if (cpuThrottleTimerRef.current) {
-        window.clearTimeout(cpuThrottleTimerRef.current);
-        cpuThrottleTimerRef.current = null;
-      }
-    };
-
-    if (!activeFlight) {
-      clearThrottleTimer();
-      dismissFlightNotification(notificationId);
-      return;
-    }
-
-    if (cpuMhz != null && cpuMhz < 2400) {
-      const throttledMessage = `CPU throttling detected: ${(cpuMhz / 1000).toFixed(2)} GHz`;
-      const existingWarning = flightNotifications.find(
-        (notification) => notification.id === notificationId && !notification.closing
-      );
-
-      if (existingWarning) {
-        upsertFlightNotification({
-          id: notificationId,
-          message: throttledMessage,
-          severity: 'warning',
-          persistent: true
-        });
-        return;
-      }
-
-      if (!cpuThrottleTimerRef.current) {
-        cpuThrottleTimerRef.current = window.setTimeout(() => {
-          upsertFlightNotification({
-            id: notificationId,
-            message: throttledMessage,
-            severity: 'warning',
-            persistent: true
-          });
-          cpuThrottleTimerRef.current = null;
-        }, 5000);
-      }
-      return;
-    }
-
-    clearThrottleTimer();
-    dismissFlightNotification(notificationId);
-  }, [activeFlight, cpuMhz, flightNotifications]);
 
   useEffect(() => {
     if (!activeFlight) {
@@ -1426,17 +1396,6 @@ export function App() {
     );
   }
 
-  async function handleToggleRecording() {
-    if (!activeFlight) {
-      return;
-    }
-    if (snapshot.video_preview.recording_active) {
-      await stopVideoRecording();
-      return;
-    }
-    await startVideoRecording();
-  }
-
   async function handleExportSession(sessionId: string) {
     const exportPath = await exportSessionTelemetry(sessionId);
     const exportFileName =
@@ -1669,17 +1628,6 @@ export function App() {
           </div>
 
           <div className="map-toolbar__group">
-            {activeFlight ? (
-              <button
-                className={`secondary-button ${
-                  videoPreview.recording_active ? 'secondary-button--active' : ''
-                }`}
-                onClick={() => void runCommand(handleToggleRecording)}
-                disabled={recordButtonDisabled}
-              >
-                {videoPreview.recording_active ? 'Stop recording' : 'Record'}
-              </button>
-            ) : null}
             {!toolbarVideoMode ? (
               <div className="map-mode-toggle" role="tablist" aria-label="Basemap mode">
                 <button
@@ -1762,7 +1710,7 @@ export function App() {
             mode={activeFlight ? 'live' : 'review'}
             altitudeAglM={displayAltitudeAgl}
             altitudeMslM={displayAltitudeMsl}
-            targetAltitudeMslM={targetAltitudeMslM}
+            targetAltitudeAglM={displayTargetAltitudeAgl}
             liveConnectionState={liveHudStatus}
             visionStatus={visionHudStatus}
             visionValue={visionActive}
@@ -1791,7 +1739,6 @@ export function App() {
                     vibrationZ,
                     altitudeMslM: displayAltitudeMsl,
                     targetAltitudeMslM,
-                    flightTimeS: displayLiveState?.flight_time_s ?? null,
                     batteryMahConsumed
                   }
                 : null

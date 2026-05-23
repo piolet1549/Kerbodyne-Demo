@@ -20,7 +20,6 @@ interface ExpandedHudData {
   vibrationZ?: number | null;
   altitudeMslM?: number | null;
   targetAltitudeMslM?: number | null;
-  flightTimeS?: number | null;
   batteryMahConsumed?: number | null;
 }
 
@@ -37,7 +36,7 @@ interface TelemetryHudProps {
   mode: 'live' | 'review';
   altitudeAglM?: number | null;
   altitudeMslM?: number | null;
-  targetAltitudeMslM?: number | null;
+  targetAltitudeAglM?: number | null;
   liveConnectionState?: HudStatus | null;
   visionStatus?: HudStatus | null;
   visionValue?: boolean | null;
@@ -88,18 +87,11 @@ function renderSpeedMph(value?: number | null): string {
   return `${(value * 2.2369362920544).toFixed(1)} mph`;
 }
 
-function renderDuration(seconds?: number | null): string {
-  if (seconds == null || Number.isNaN(seconds)) return '--';
-  const totalSeconds = Math.max(0, Math.floor(seconds));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const remainingSeconds = totalSeconds % 60;
-  if (hours > 0) {
-    return `${hours}:${minutes.toString().padStart(2, '0')}:${remainingSeconds
-      .toString()
-      .padStart(2, '0')}`;
+function renderGpsPosition(lat?: number | null, lon?: number | null): string {
+  if (lat == null || lon == null || Number.isNaN(lat) || Number.isNaN(lon)) {
+    return '--';
   }
-  return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
+  return `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
 }
 
 function metricClasses(state?: HudMetricState) {
@@ -226,11 +218,13 @@ function VisionIndicator({
 function ExpandedHudPanel({
   mode,
   expandedHud,
+  liveState,
   liveConnectionState,
   onOpenRawData
 }: {
   mode: 'live' | 'review';
   expandedHud: ExpandedHudData;
+  liveState?: AircraftLiveState | null;
   liveConnectionState?: HudStatus | null;
   onOpenRawData?: (() => void) | undefined;
 }) {
@@ -300,12 +294,6 @@ function ExpandedHudPanel({
                 </strong>
               </div>
               <div>
-                <span className="telemetry-hud__label">Flight time</span>
-                <strong className="telemetry-hud__metric-value">
-                  {renderDuration(expandedHud.flightTimeS)}
-                </strong>
-              </div>
-              <div>
                 <span className="telemetry-hud__label">Altitude MSL</span>
                 <strong className="telemetry-hud__metric-value">
                   {renderValue(expandedHud.altitudeMslM, ' m')}
@@ -313,6 +301,12 @@ function ExpandedHudPanel({
                 <span className="telemetry-hud__subvalue">
                   {renderValue(expandedHud.targetAltitudeMslM, ' m')}
                 </span>
+              </div>
+              <div>
+                <span className="telemetry-hud__label">GPS position</span>
+                <strong className="telemetry-hud__metric-value">
+                  {renderGpsPosition(liveState?.lat, liveState?.lon)}
+                </strong>
               </div>
               <div className="telemetry-hud__vibration">
                 <span className="telemetry-hud__label">Vibration</span>
@@ -349,7 +343,7 @@ export function TelemetryHud({
   mode,
   altitudeAglM,
   altitudeMslM,
-  targetAltitudeMslM,
+  targetAltitudeAglM,
   liveConnectionState,
   visionStatus,
   visionValue,
@@ -405,7 +399,7 @@ export function TelemetryHud({
                   metricStates?.altitude?.pulse ? 'telemetry-hud__subvalue--pulse' : ''
                 }`}
               >
-                {renderValue(targetAltitudeMslM, ' m')}
+                {liveState?.armed ? renderValue(targetAltitudeAglM, ' m') : ''}
               </span>
             </div>
             <div>
@@ -441,7 +435,11 @@ export function TelemetryHud({
                 className={`telemetry-hud__subvalue ${
                   metricStates?.battery?.pulse ? 'telemetry-hud__subvalue--pulse' : ''
                 }`}
-                style={metricStyle(metricStates?.battery)}
+                style={
+                  metricStates?.battery?.tone && metricStates.battery.tone !== 'normal'
+                    ? metricStyle(metricStates.battery)
+                    : undefined
+                }
               >
                 {batteryPercent != null && !Number.isNaN(batteryPercent)
                   ? `${batteryPercent.toFixed(0)}%`
@@ -470,6 +468,7 @@ export function TelemetryHud({
           <ExpandedHudPanel
             mode={mode}
             expandedHud={expandedHud}
+            liveState={liveState}
             liveConnectionState={liveConnectionState}
             onOpenRawData={onOpenRawData}
           />
