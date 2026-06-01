@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -781,51 +781,96 @@ impl AppRuntime {
             timestamp
         );
         let path = downloads_dir.join(file_name);
-        let mut rows = String::from(
-            "recorded_at,message_id,aircraft_id,armed,lat,lon,alt_msl_m,groundspeed_mps,heading_deg,flight_time_s,battery_voltage_v,battery_percent,extras_json,raw_json\n",
-        );
+        let mut telemetry_rows = Vec::new();
+        let mut extra_columns = BTreeSet::new();
 
         for frame in replay_events {
-            let Ok(envelope) = serde_json::from_str::<WireEnvelope<TelemetryPayload>>(&frame.envelope_json)
+            let Ok(envelope) =
+                serde_json::from_str::<WireEnvelope<TelemetryPayload>>(&frame.envelope_json)
             else {
                 continue;
             };
             if envelope.envelope_type != "telemetry" {
                 continue;
             }
+            for key in envelope.payload.extras.keys() {
+                extra_columns.insert(key.clone());
+            }
+            telemetry_rows.push((frame.envelope_json, envelope));
+        }
+
+        let mut header = vec![
+            "recorded_at".to_string(),
+            "message_id".to_string(),
+            "aircraft_id".to_string(),
+            "armed".to_string(),
+            "lat".to_string(),
+            "lon".to_string(),
+            "alt_msl_m".to_string(),
+            "groundspeed_mps".to_string(),
+            "heading_deg".to_string(),
+            "flight_time_s".to_string(),
+            "battery_voltage_v".to_string(),
+            "battery_percent".to_string(),
+            "link_quality_percent".to_string(),
+            "link_latency_ms".to_string(),
+        ];
+        header.extend(extra_columns.iter().cloned());
+        header.push("extras_json".to_string());
+        header.push("raw_json".to_string());
+
+        let mut rows = String::new();
+        write_csv_row(&mut rows, &header);
+
+        for (raw_json, envelope) in telemetry_rows {
             let extras_json =
                 serde_json::to_string(&envelope.payload.extras).map_err(|error| error.to_string())?;
-            write_csv_row(
-                &mut rows,
-                &[
-                    normalize_timestamp(&envelope.sent_at),
-                    envelope.message_id,
-                    envelope.aircraft_id,
-                    envelope.payload.armed.to_string(),
-                    csv_option_f64(envelope.payload.lat),
-                    csv_option_f64(envelope.payload.lon),
-                    csv_option_f64(envelope.payload.alt_msl_m),
-                    csv_option_f64(envelope.payload.groundspeed_mps),
-                    csv_option_f64(envelope.payload.heading_deg),
-                    csv_option_f64(envelope.payload.flight_time_s),
-                    csv_option_f64(
-                        envelope
-                            .payload
-                            .battery
-                            .as_ref()
-                            .and_then(|battery| battery.voltage_v),
-                    ),
-                    csv_option_f64(
-                        envelope
-                            .payload
-                            .battery
-                            .as_ref()
-                            .and_then(|battery| battery.percent),
-                    ),
-                    extras_json,
-                    frame.envelope_json,
-                ],
-            );
+            let mut fields = vec![
+                normalize_timestamp(&envelope.sent_at),
+                envelope.message_id,
+                envelope.aircraft_id,
+                envelope.payload.armed.to_string(),
+                csv_option_f64(envelope.payload.lat),
+                csv_option_f64(envelope.payload.lon),
+                csv_option_f64(envelope.payload.alt_msl_m),
+                csv_option_f64(envelope.payload.groundspeed_mps),
+                csv_option_f64(envelope.payload.heading_deg),
+                csv_option_f64(envelope.payload.flight_time_s),
+                csv_option_f64(
+                    envelope
+                        .payload
+                        .battery
+                        .as_ref()
+                        .and_then(|battery| battery.voltage_v),
+                ),
+                csv_option_f64(
+                    envelope
+                        .payload
+                        .battery
+                        .as_ref()
+                        .and_then(|battery| battery.percent),
+                ),
+                csv_option_f64(
+                    envelope
+                        .payload
+                        .link
+                        .as_ref()
+                        .and_then(|link| link.quality_percent),
+                ),
+                csv_option_f64(
+                    envelope
+                        .payload
+                        .link
+                        .as_ref()
+                        .and_then(|link| link.latency_ms),
+                ),
+            ];
+            for key in &extra_columns {
+                fields.push(csv_json_value(envelope.payload.extras.get(key)));
+            }
+            fields.push(extras_json);
+            fields.push(raw_json);
+            write_csv_row(&mut rows, &fields);
         }
 
         fs::write(&path, rows).map_err(|error| error.to_string())?;
@@ -2697,6 +2742,16 @@ fn sanitize_extension(extension: &str) -> &str {
 
 fn csv_option_f64(value: Option<f64>) -> String {
     value.map(|number| number.to_string()).unwrap_or_default()
+}
+
+fn csv_json_value(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::Bool(boolean)) => boolean.to_string(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+    }
 }
 
 fn escape_csv_field(value: &str) -> String {

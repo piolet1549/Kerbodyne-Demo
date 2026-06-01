@@ -647,10 +647,12 @@ button {
 
 .telemetry-hud__attitude-horizon {
   position: absolute;
-  left: -18%;
-  top: -42%;
-  width: 136%;
-  height: 188%;
+  left: 50%;
+  top: 50%;
+  width: 440px;
+  height: 460px;
+  margin-left: -220px;
+  margin-top: -230px;
   transform-origin: center center;
 }
 
@@ -683,19 +685,19 @@ button {
   left: 50%;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   transform: translateX(-50%);
 }
 
 .telemetry-hud__attitude-pitch-bar {
-  width: 68px;
+  width: 74px;
   height: 2px;
   background: rgba(255, 255, 255, 0.7);
   box-shadow: 0 0 8px rgba(255, 255, 255, 0.08);
 }
 
 .telemetry-hud__attitude-pitch-label {
-  width: 26px;
+  width: 30px;
   color: rgba(255, 255, 255, 0.76);
   font-size: 0.7rem;
   font-weight: 600;
@@ -766,10 +768,10 @@ button {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 86px;
-  height: 12px;
+  width: 98px;
+  height: 10px;
   border: 1.5px solid rgba(255, 255, 255, 0.8);
-  border-radius: 4px;
+  border-radius: 3px;
   transform: translate(-50%, -50%);
   box-shadow: 0 0 12px rgba(255, 255, 255, 0.08);
   z-index: 2;

@@ -21,7 +21,15 @@ import {
   updateSessionDetails,
   updateConfig
 } from './lib/runtime';
-import type { AlertRecord, AppSnapshot, HudMetricState, OfflineRegionCatalog, RuntimeEvent } from './lib/types';
+import type {
+  AlertRecord,
+  AppSnapshot,
+  HudMetricState,
+  OfflineRegionCatalog,
+  RuntimeEvent,
+  TelemetryEnvelope,
+  TrackPointRecord
+} from './lib/types';
 
 type OverlayPanel = 'flights' | 'settings' | null;
 type FlightNotificationSeverity = 'info' | 'caution' | 'warning';
@@ -212,6 +220,77 @@ function readStringExtra(extras: Record<string, unknown> | null | undefined, key
     return trimmed.length > 0 ? trimmed : null;
   }
   return null;
+}
+
+function isLegacyCompatibilityTelemetry(extras: Record<string, unknown> | null | undefined) {
+  return Boolean(
+    readStringExtra(extras, 'legacy_packet_type') ??
+      readBooleanExtra(extras, 'legacy_armed') ??
+      false
+  );
+}
+
+function normalizeDisplayedPitchDeg(
+  value: number | null,
+  legacyCompatibility: boolean
+) {
+  if (value == null) {
+    return null;
+  }
+  return legacyCompatibility ? -value : value;
+}
+
+function normalizeDisplayedTargetAltitudeMsl(
+  rawTargetMsl: number | null,
+  currentAltitudeMsl: number | null,
+  legacyCompatibility: boolean
+) {
+  if (rawTargetMsl == null) {
+    return null;
+  }
+  if (!legacyCompatibility || currentAltitudeMsl == null) {
+    return rawTargetMsl;
+  }
+  // Legacy sender currently computes demanded altitude as current - alt_error.
+  // For the active airside build, the correct displayed target is the mirrored
+  // value around the current altitude.
+  return currentAltitudeMsl + (currentAltitudeMsl - rawTargetMsl);
+}
+
+function deriveTrackFromRawPackets(rawPackets: string[]): TrackPointRecord[] {
+  const points: TrackPointRecord[] = [];
+
+  for (const rawPacket of rawPackets) {
+    try {
+      const jsonStart = rawPacket.indexOf('{');
+      if (jsonStart === -1) {
+        continue;
+      }
+      const envelope = JSON.parse(rawPacket.slice(jsonStart)) as TelemetryEnvelope & {
+        sent_at?: string;
+        type?: string;
+      };
+      if (envelope.type !== 'telemetry') {
+        continue;
+      }
+      const payload = envelope.payload;
+      if (!payload || !hasValidPosition(payload.lat ?? null, payload.lon ?? null)) {
+        continue;
+      }
+      points.push({
+        lat: payload.lat as number,
+        lon: payload.lon as number,
+        recorded_at: envelope.sent_at ?? new Date().toISOString(),
+        alt_msl_m: payload.alt_msl_m ?? null,
+        heading_deg: payload.heading_deg ?? null,
+        groundspeed_mps: payload.groundspeed_mps ?? null
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  return points;
 }
 
 const ARDUPLANE_FLIGHT_MODE_LABELS: Record<number, string> = {
@@ -463,11 +542,18 @@ export function App() {
     readStringExtra(liveExtras, 'flight_mode');
   const flightModeLabel = formatFlightModeLabel(flightModeRaw);
   const showFlightDirector = shouldShowFlightDirector(flightModeRaw);
-  const pitchDeg = readNumberExtra(liveExtras, 'pitch_deg');
+  const legacyCompatibility = isLegacyCompatibilityTelemetry(liveExtras);
+  const rawPitchDeg = readNumberExtra(liveExtras, 'pitch_deg');
+  const pitchDeg = normalizeDisplayedPitchDeg(rawPitchDeg, legacyCompatibility);
   const rollDeg = readNumberExtra(liveExtras, 'roll_deg');
   const navPitchDeg = readNumberExtra(liveExtras, 'nav_pitch_deg');
   const navRollDeg = readNumberExtra(liveExtras, 'nav_roll_deg');
-  const targetAltitudeMslM = readNumberExtra(liveExtras, 'alt_demanded_m');
+  const rawTargetAltitudeMslM = readNumberExtra(liveExtras, 'alt_demanded_m');
+  const targetAltitudeMslM = normalizeDisplayedTargetAltitudeMsl(
+    rawTargetAltitudeMslM,
+    displayAltitudeMsl,
+    legacyCompatibility
+  );
   const throttlePct = readNumberExtra(liveExtras, 'throttle_pct');
   const verticalSpeedMps = readNumberExtra(liveExtras, 'vspeed_ms');
   const vibrationX = readNumberExtra(liveExtras, 'vib_x');
@@ -479,6 +565,10 @@ export function App() {
   const npuTempC = readNumberExtra(liveExtras, 'npu_temp_c');
   const batteryMahConsumed = readNumberExtra(liveExtras, 'battery_mah');
   const visionActive = readBooleanExtra(liveExtras, 'vision_active');
+  const fallbackTrack = useMemo(
+    () => deriveTrackFromRawPackets(snapshot.raw_telemetry_packets),
+    [snapshot.raw_telemetry_packets]
+  );
   const displayTargetAltitudeAgl = useMemo(() => {
     if (!displayLiveState?.armed || targetAltitudeMslM == null) {
       return null;
@@ -498,13 +588,13 @@ export function App() {
   ]);
   const displayTrack = useMemo(() => {
     if (!reviewMode) {
-      return snapshot.track;
+      return snapshot.track.length >= 2 ? snapshot.track : fallbackTrack;
     }
     if (effectiveReviewFrameIndex == null || reviewFrames.length === 0) {
-      return snapshot.track;
+      return snapshot.track.length >= 2 ? snapshot.track : fallbackTrack;
     }
 
-    return reviewFrames
+    const reviewTrack = reviewFrames
       .slice(0, effectiveReviewFrameIndex + 1)
       .flatMap((frame) => {
         const lat = frame.live_state.lat;
@@ -522,7 +612,14 @@ export function App() {
             ]
           : [];
       });
-  }, [effectiveReviewFrameIndex, reviewFrames, reviewMode, snapshot.track]);
+    if (reviewTrack.length >= 2) {
+      return reviewTrack;
+    }
+    if (snapshot.track.length >= 2) {
+      return snapshot.track;
+    }
+    return fallbackTrack;
+  }, [effectiveReviewFrameIndex, fallbackTrack, reviewFrames, reviewMode, snapshot.track]);
   const selectedAlert = useMemo<AlertRecord | null>(
     () => deferredAlerts.find((alert) => alert.id === selectedAlertId) ?? null,
     [deferredAlerts, selectedAlertId]

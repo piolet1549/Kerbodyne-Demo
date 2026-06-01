@@ -126,16 +126,18 @@ function AttitudeIndicator({ attitude }: { attitude?: AttitudeData | null }) {
     Boolean(attitude?.showFlightDirector) &&
     attitude?.navPitchDeg != null &&
     !Number.isNaN(attitude.navPitchDeg) &&
-    attitude?.navRollDeg != null &&
+      attitude?.navRollDeg != null &&
     !Number.isNaN(attitude.navRollDeg);
   const navPitch = hasCommand ? (attitude?.navPitchDeg as number) : pitch;
   const navRoll = hasCommand ? (attitude?.navRollDeg as number) : roll;
-  const horizonTranslateY = clamp(pitch * 2.4, -58, 58);
-  const horizonRotate = clamp(-roll, -60, 60);
-  const commandTranslateY = clamp((navPitch - pitch) * 2.2, -36, 36);
-  const commandRotate = clamp(roll - navRoll, -42, 42);
-  const commandTranslateX = clamp((roll - navRoll) * 1.1, -36, 36);
-  const pitchMarks = [-20, -10, 10, 20];
+  const pitchScale = 2.2;
+  const horizonTranslateY = clamp(pitch * pitchScale, -188, 188);
+  const horizonRotate = clamp(roll, -85, 85);
+  const commandTranslateY = clamp((pitch - navPitch) * pitchScale, -86, 86);
+  const commandRotate = clamp(navRoll - roll, -70, 70);
+  const pitchMarks = Array.from({ length: 18 }, (_, index) => -90 + index * 10).filter(
+    (mark) => mark !== 0
+  );
 
   return (
     <div className="telemetry-hud__attitude-shell" aria-label="Attitude indicator">
@@ -172,7 +174,7 @@ function AttitudeIndicator({ attitude }: { attitude?: AttitudeData | null }) {
           <div
             className="telemetry-hud__attitude-command"
             style={{
-              transform: `translate(${commandTranslateX}px, ${commandTranslateY}px) rotate(${commandRotate}deg)`
+              transform: `translate(-50%, -50%) translateY(${commandTranslateY}px) rotate(${commandRotate}deg)`
             }}
           />
         ) : null}
