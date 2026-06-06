@@ -122,6 +122,8 @@ function formatSignedPitchLabel(value: number) {
 function AttitudeIndicator({ attitude }: { attitude?: AttitudeData | null }) {
   const pitch = attitude?.pitchDeg ?? 0;
   const roll = attitude?.rollDeg ?? 0;
+  const displayPitch = -pitch;
+  const displayRoll = -roll;
   const hasCommand =
     Boolean(attitude?.showFlightDirector) &&
     attitude?.navPitchDeg != null &&
@@ -131,8 +133,8 @@ function AttitudeIndicator({ attitude }: { attitude?: AttitudeData | null }) {
   const navPitch = hasCommand ? (attitude?.navPitchDeg as number) : pitch;
   const navRoll = hasCommand ? (attitude?.navRollDeg as number) : roll;
   const pitchScale = 2.2;
-  const horizonTranslateY = clamp(pitch * pitchScale, -188, 188);
-  const horizonRotate = clamp(roll, -85, 85);
+  const horizonTranslateY = clamp(displayPitch * pitchScale, -188, 188);
+  const horizonRotate = clamp(displayRoll, -85, 85);
   const commandTranslateY = clamp((pitch - navPitch) * pitchScale, -86, 86);
   const commandRotate = clamp(navRoll - roll, -70, 70);
   const pitchMarks = Array.from({ length: 18 }, (_, index) => -90 + index * 10).filter(
