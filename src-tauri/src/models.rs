@@ -504,6 +504,9 @@ pub struct LegacyTelemetryPacket {
     #[serde(alias = "battery_remaining_pct")]
     pub battery_pct: Option<f64>,
     pub battery_mah: Option<f64>,
+    pub battery_wh: Option<f64>,
+    pub energy_consumed: Option<f64>,
+    pub time_boot_ms: Option<u64>,
     pub armed: Option<bool>,
     pub cpu_temp_c: Option<f64>,
     pub cpu_pct: Option<f64>,
@@ -618,7 +621,10 @@ mod tests {
         }"#;
 
         let packet: LegacyTelemetryPacket = serde_json::from_str(raw).unwrap();
-        assert_eq!(packet.packet_type, Some(LegacyTelemetryPacketType::LowFrequency));
+        assert_eq!(
+            packet.packet_type,
+            Some(LegacyTelemetryPacketType::LowFrequency)
+        );
         assert_eq!(packet.battery_pct, Some(61.0));
         assert_eq!(packet.vision_active, Some(true));
     }

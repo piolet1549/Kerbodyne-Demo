@@ -18,6 +18,7 @@ import {
   listenToRuntimeEvents,
   selectOfflineRegion,
   startLiveIngest,
+  setVisionPipelineEnabled,
   updateSessionDetails,
   updateConfig
 } from './lib/runtime';
@@ -33,6 +34,7 @@ import type {
 
 type OverlayPanel = 'flights' | 'settings' | null;
 type FlightNotificationSeverity = 'info' | 'caution' | 'warning';
+type VisionCommandState = 'idle' | 'starting' | 'stopping';
 
 interface FlightNotificationRecord {
   id: string;
@@ -321,28 +323,6 @@ const ARDUPLANE_FLIGHT_MODE_LABELS: Record<number, string> = {
   27: 'AutoTakeoff'
 };
 
-const ARDUPLANE_FLIGHT_DIRECTOR_MODE_NUMBERS = new Set([
-  1, 7, 10, 11, 12, 15, 18, 19, 20, 21, 24, 25, 26, 27
-]);
-
-const ARDUPLANE_FLIGHT_DIRECTOR_MODE_LABELS = new Set([
-  'circle',
-  'cruise',
-  'auto',
-  'rtl',
-  'loiter',
-  'guided',
-  'qhover',
-  'qloiter',
-  'qland',
-  'qrtl',
-  'thermal',
-  'loiteraltqland',
-  'autoland',
-  'autotakeoff',
-  'takeoff'
-]);
-
 function formatFlightModeLabel(value: string | number | null | undefined) {
   if (typeof value === 'string' && value.trim()) {
     return value.trim();
@@ -352,25 +332,6 @@ function formatFlightModeLabel(value: string | number | null | undefined) {
     return ARDUPLANE_FLIGHT_MODE_LABELS[normalized] ?? `Mode ${normalized}`;
   }
   return '--';
-}
-
-function shouldShowFlightDirector(value: string | number | null | undefined) {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return ARDUPLANE_FLIGHT_DIRECTOR_MODE_NUMBERS.has(Math.round(value));
-  }
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return false;
-    }
-    const parsed = Number(trimmed);
-    if (Number.isFinite(parsed)) {
-      return ARDUPLANE_FLIGHT_DIRECTOR_MODE_NUMBERS.has(Math.round(parsed));
-    }
-    const normalized = trimmed.toLowerCase().replace(/[\s_-]+/g, '');
-    return ARDUPLANE_FLIGHT_DIRECTOR_MODE_LABELS.has(normalized);
-  }
-  return false;
 }
 
 function buildMetricState(
@@ -413,6 +374,19 @@ export function App() {
   const seenSystemStatusIdsRef = useRef<Set<string>>(new Set());
   const armedAltitudeBaselineRef = useRef<number | null>(null);
   const armedAtTimestampRef = useRef<string | null>(null);
+  const efficiencyAccumulatorRef = useRef<{
+    lastTimeMs: number | null;
+    lastBatteryWh: number | null;
+    fallbackEnergyWh: number;
+    averageEnergyWh: number;
+    averageDistanceKm: number;
+  }>({
+    lastTimeMs: null,
+    lastBatteryWh: null,
+    fallbackEnergyWh: 0,
+    averageEnergyWh: 0,
+    averageDistanceKm: 0
+  });
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [offlineCatalog, setOfflineCatalog] = useState<OfflineRegionCatalog>({
     asset_origin: '',
@@ -440,6 +414,13 @@ export function App() {
   const [reviewFrameIndex, setReviewFrameIndex] = useState<number | null>(null);
   const [reviewPlaybackActive, setReviewPlaybackActive] = useState(false);
   const [reviewPlaybackSpeed, setReviewPlaybackSpeed] = useState(1);
+  const [visionCommandState, setVisionCommandState] = useState<VisionCommandState>('idle');
+  const [visionStartupConfirmed, setVisionStartupConfirmed] = useState(false);
+  const [visionStopAcknowledged, setVisionStopAcknowledged] = useState(false);
+  const [efficiencyMetric, setEfficiencyMetric] = useState<{
+    liveWhPerKm: number | null;
+    averageWhPerKm: number | null;
+  }>({ liveWhPerKm: null, averageWhPerKm: null });
   const [lastIdleMapView, setLastIdleMapView] = useState<{
     center: [number, number];
     zoom: number;
@@ -453,6 +434,7 @@ export function App() {
   const previousFocusedSessionIdRef = useRef<string | null>(null);
   const previousActiveSessionIdRef = useRef<string | null>(null);
   const previousActiveFlightRef = useRef(false);
+  const latestVisionStatusIdRef = useRef<string | null>(null);
   const lowSpeedLandingTimerRef = useRef<number | null>(null);
 
   const deferredAlerts = useDeferredValue(snapshot.alerts);
@@ -541,13 +523,10 @@ export function App() {
     readNumberExtra(liveExtras, 'flight_mode') ??
     readStringExtra(liveExtras, 'flight_mode');
   const flightModeLabel = formatFlightModeLabel(flightModeRaw);
-  const showFlightDirector = shouldShowFlightDirector(flightModeRaw);
   const legacyCompatibility = isLegacyCompatibilityTelemetry(liveExtras);
   const rawPitchDeg = readNumberExtra(liveExtras, 'pitch_deg');
   const pitchDeg = normalizeDisplayedPitchDeg(rawPitchDeg, legacyCompatibility);
   const rollDeg = readNumberExtra(liveExtras, 'roll_deg');
-  const navPitchDeg = readNumberExtra(liveExtras, 'nav_pitch_deg');
-  const navRollDeg = readNumberExtra(liveExtras, 'nav_roll_deg');
   const rawTargetAltitudeMslM = readNumberExtra(liveExtras, 'alt_demanded_m');
   const targetAltitudeMslM = normalizeDisplayedTargetAltitudeMsl(
     rawTargetAltitudeMslM,
@@ -564,6 +543,8 @@ export function App() {
   const cpuMhz = readNumberExtra(liveExtras, 'cpu_mhz');
   const npuTempC = readNumberExtra(liveExtras, 'npu_temp_c');
   const batteryMahConsumed = readNumberExtra(liveExtras, 'battery_mah');
+  const batteryWhConsumed = readNumberExtra(liveExtras, 'battery_wh');
+  const timeBootMs = readNumberExtra(liveExtras, 'time_boot_ms');
   const visionActive = readBooleanExtra(liveExtras, 'vision_active');
   const fallbackTrack = useMemo(
     () => deriveTrackFromRawPackets(snapshot.raw_telemetry_packets),
@@ -979,6 +960,14 @@ export function App() {
       seenSystemStatusIdsRef.current = new Set();
       armedAltitudeBaselineRef.current = null;
       armedAtTimestampRef.current = null;
+      efficiencyAccumulatorRef.current = {
+        lastTimeMs: null,
+        lastBatteryWh: null,
+        fallbackEnergyWh: 0,
+        averageEnergyWh: 0,
+        averageDistanceKm: 0
+      };
+      setEfficiencyMetric({ liveWhPerKm: null, averageWhPerKm: null });
       setLowSpeedMonitoringEnabled(false);
       if (lowSpeedLandingTimerRef.current) {
         window.clearTimeout(lowSpeedLandingTimerRef.current);
@@ -996,18 +985,97 @@ export function App() {
       return;
     }
 
-    if (!displayLiveState?.armed) {
-      armedAltitudeBaselineRef.current = null;
-      return;
-    }
-
-    if (armedAltitudeBaselineRef.current == null && displayLiveState.alt_msl_m != null) {
+    if (
+      displayLiveState?.armed &&
+      armedAltitudeBaselineRef.current == null &&
+      displayLiveState.alt_msl_m != null
+    ) {
       armedAltitudeBaselineRef.current = displayLiveState.alt_msl_m;
     }
-    if (armedAtTimestampRef.current == null && displayLiveState.last_update_at) {
+    if (displayLiveState?.armed && armedAtTimestampRef.current == null && displayLiveState.last_update_at) {
       armedAtTimestampRef.current = displayLiveState.last_update_at;
     }
   }, [activeFlight, displayLiveState?.alt_msl_m, displayLiveState?.armed]);
+
+  useEffect(() => {
+    if (!activeFlight || !displayLiveState?.armed) {
+      return;
+    }
+
+    const speedMps = displayLiveState.groundspeed_mps;
+    const voltage = displayLiveState.battery?.voltage_v;
+    const currentA = readNumberExtra(liveExtras, 'battery_a');
+    const packetTimeMs =
+      timeBootMs != null && Number.isFinite(timeBootMs)
+        ? timeBootMs
+        : new Date(displayLiveState.last_update_at).getTime();
+    if (!Number.isFinite(packetTimeMs)) {
+      return;
+    }
+
+    const accumulator = efficiencyAccumulatorRef.current;
+    const lastTimeMs = accumulator.lastTimeMs;
+    const deltaHours =
+      lastTimeMs != null && packetTimeMs > lastTimeMs
+        ? (packetTimeMs - lastTimeMs) / 3_600_000
+        : 0;
+    let deltaEnergyWh = 0;
+
+    if (
+      batteryWhConsumed != null &&
+      Number.isFinite(batteryWhConsumed) &&
+      batteryWhConsumed >= 0
+    ) {
+      if (accumulator.lastBatteryWh != null && batteryWhConsumed >= accumulator.lastBatteryWh) {
+        deltaEnergyWh = batteryWhConsumed - accumulator.lastBatteryWh;
+      }
+      accumulator.lastBatteryWh = batteryWhConsumed;
+      accumulator.fallbackEnergyWh = batteryWhConsumed;
+    } else if (
+      deltaHours > 0 &&
+      voltage != null &&
+      currentA != null &&
+      Number.isFinite(voltage) &&
+      Number.isFinite(currentA)
+    ) {
+      deltaEnergyWh = Math.max(0, voltage * currentA * deltaHours);
+      accumulator.fallbackEnergyWh += deltaEnergyWh;
+    }
+
+    const liveWhPerKm =
+      speedMps != null &&
+      speedMps > 0.5 &&
+      voltage != null &&
+      currentA != null &&
+      Number.isFinite(voltage) &&
+      Number.isFinite(currentA)
+        ? (voltage * currentA) / (speedMps * 3.6)
+        : null;
+
+    if (deltaHours > 0 && speedMps != null && speedMps > 5) {
+      const deltaDistanceKm = (speedMps * deltaHours * 3600) / 1000;
+      if (deltaDistanceKm > 0 && deltaEnergyWh >= 0) {
+        accumulator.averageEnergyWh += deltaEnergyWh;
+        accumulator.averageDistanceKm += deltaDistanceKm;
+      }
+    }
+
+    accumulator.lastTimeMs = packetTimeMs;
+    const averageWhPerKm =
+      accumulator.averageDistanceKm > 0
+        ? accumulator.averageEnergyWh / accumulator.averageDistanceKm
+        : null;
+    setEfficiencyMetric({ liveWhPerKm, averageWhPerKm });
+  }, [
+    activeFlight,
+    batteryWhConsumed,
+    displayLiveState?.armed,
+    displayLiveState?.battery?.voltage_v,
+    displayLiveState?.groundspeed_mps,
+    displayLiveState?.last_update_at,
+    liveExtras,
+    timeBootMs
+  ]);
 
   useEffect(() => {
     if (!activeFlight || lowSpeedMonitoringEnabled || !displayLiveState?.armed) {
@@ -1140,6 +1208,139 @@ export function App() {
       variant: activeFlight ? ('pending' as const) : ('waiting' as const)
     };
   }, [activeFlight, flightHasReceivedConnection, reviewMode, snapshot.connection.status, visionActive]);
+  const visionLinkAvailable =
+    activeFlight && flightHasReceivedConnection && snapshot.connection.status !== 'stale';
+  const visionRunning =
+    !visionStopAcknowledged &&
+    (visionActive === true || (visionStartupConfirmed && visionCommandState !== 'stopping'));
+  const visionBusy = visionCommandState !== 'idle';
+
+  useEffect(() => {
+    if (!activeFlight) {
+      setVisionCommandState('idle');
+      setVisionStartupConfirmed(false);
+      setVisionStopAcknowledged(false);
+      latestVisionStatusIdRef.current = null;
+    }
+  }, [activeFlight]);
+
+  useEffect(() => {
+    if (visionActive === true) {
+      if (visionStopAcknowledged) {
+        return;
+      }
+      if (visionCommandState !== 'stopping') {
+        setVisionStopAcknowledged(false);
+      }
+      setVisionStartupConfirmed(true);
+      if (visionCommandState === 'starting') {
+        setVisionCommandState('idle');
+      }
+      return;
+    }
+
+    if (visionActive === false) {
+      setVisionStartupConfirmed(false);
+      setVisionStopAcknowledged(false);
+      if (visionCommandState === 'stopping') {
+        setVisionCommandState('idle');
+      }
+    }
+  }, [visionActive, visionCommandState, visionStopAcknowledged]);
+
+  useEffect(() => {
+    if (!activeFlight) {
+      return;
+    }
+
+    const latestVisionStatus = snapshot.system_statuses.find((status) => {
+      const normalized = status.status.trim().toUpperCase();
+      return normalized.includes('STARTUP') || normalized.includes('ERROR') || normalized.includes('FAIL');
+    });
+    if (!latestVisionStatus || latestVisionStatus.id === latestVisionStatusIdRef.current) {
+      return;
+    }
+
+    latestVisionStatusIdRef.current = latestVisionStatus.id;
+    const normalized = latestVisionStatus.status.trim().toUpperCase();
+    if (normalized === 'STARTUP_SUCCESS') {
+      setVisionStartupConfirmed(true);
+      setVisionCommandState('idle');
+      return;
+    }
+
+    if (visionCommandState === 'starting' && (normalized.includes('ERROR') || normalized.includes('FAIL'))) {
+      setVisionStartupConfirmed(false);
+      setVisionCommandState('idle');
+    }
+  }, [activeFlight, snapshot.system_statuses, visionCommandState]);
+
+  useEffect(() => {
+    if (visionCommandState === 'idle') {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setVisionCommandState('idle');
+    }, 12000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [visionCommandState]);
+
+  function handleVisionToggle() {
+    if (!visionLinkAvailable || visionBusy) {
+      return;
+    }
+
+    const enable = !visionRunning;
+    setVisionCommandState(enable ? 'starting' : 'stopping');
+    if (enable) {
+      setVisionStopAcknowledged(false);
+    }
+    if (!enable) {
+      setVisionStartupConfirmed(false);
+    }
+
+    void runCommand(async () => {
+      try {
+        const response = await setVisionPipelineEnabled(enable);
+        if (enable && /already\s+(running|active)/i.test(response)) {
+          setVisionStartupConfirmed(true);
+          setVisionCommandState('idle');
+          return;
+        }
+        if (!enable) {
+          setVisionCommandState('idle');
+          setVisionStartupConfirmed(false);
+          setVisionStopAcknowledged(true);
+          if (/not\s+running/i.test(response)) {
+            setVisionStartupConfirmed(false);
+          }
+        }
+      } catch (error) {
+        setVisionCommandState('idle');
+        throw error;
+      }
+    });
+  }
+
+  const visionControl = activeFlight
+    ? {
+        label: !visionLinkAvailable
+          ? 'VISION NA'
+          : visionCommandState === 'starting'
+            ? 'STARTING'
+            : visionCommandState === 'stopping'
+              ? 'STOPPING'
+              : visionRunning
+                ? 'STOP VISION'
+                : 'START VISION',
+        disabled: !visionLinkAvailable,
+        busy: visionBusy,
+        active: visionRunning,
+        onToggle: handleVisionToggle
+      }
+    : null;
   const telemetryMetricStates = useMemo(() => {
     const safeColor = '#f4f4f4';
     const cautionColor = '#ffb347';
@@ -1811,14 +2012,12 @@ export function App() {
             liveConnectionState={liveHudStatus}
             visionStatus={visionHudStatus}
             visionValue={visionActive}
+            visionControl={visionControl}
             flightModeLabel={flightModeLabel}
             batteryPercent={displayLiveState?.battery?.percent ?? null}
               attitude={{
                 pitchDeg,
-                rollDeg,
-                navPitchDeg,
-                navRollDeg,
-                showFlightDirector
+                rollDeg
               }}
             metricStates={activeFlight ? telemetryMetricStates : undefined}
             expandedHud={
@@ -1836,7 +2035,9 @@ export function App() {
                     vibrationZ,
                     altitudeMslM: displayAltitudeMsl,
                     targetAltitudeMslM,
-                    batteryMahConsumed
+                    batteryMahConsumed,
+                    liveEfficiencyWhPerKm: efficiencyMetric.liveWhPerKm,
+                    averageEfficiencyWhPerKm: efficiencyMetric.averageWhPerKm
                   }
                 : null
             }

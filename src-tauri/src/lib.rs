@@ -7,7 +7,10 @@ mod server;
 
 use std::{
     io,
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use models::{AppConfig, AppSnapshot, OfflineRegionCatalog, OfflineRegionManifest};
@@ -123,6 +126,14 @@ async fn export_session_telemetry(
     state.export_session_telemetry(&app, session_id).await
 }
 
+#[tauri::command]
+async fn set_vision_pipeline_enabled(
+    state: State<'_, Arc<AppRuntime>>,
+    enabled: bool,
+) -> Result<String, String> {
+    state.set_vision_pipeline_enabled(enabled).await
+}
+
 #[cfg(windows)]
 fn terminate_stale_ground_station_processes() {
     let Ok(current_exe) = std::env::current_exe() else {
@@ -223,7 +234,8 @@ pub fn run() {
             clear_focused_session,
             update_session_details,
             delete_session,
-            export_session_telemetry
+            export_session_telemetry,
+            set_vision_pipeline_enabled
         ])
         .build(tauri::generate_context!())
         .expect("error while building Kerbodyne Ground Station");

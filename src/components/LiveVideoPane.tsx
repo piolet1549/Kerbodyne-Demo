@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import JMuxer from 'jmuxer';
 import type { VideoPreviewState } from '../lib/types';
 
 interface LiveVideoPaneProps {
@@ -29,6 +30,13 @@ function statusLabel(status: VideoPreviewState['status']) {
 export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
   const [displayUrl, setDisplayUrl] = useState<string | null>(null);
   const displayUrlRef = useRef<string | null>(null);
+  const videoElementRef = useRef<HTMLVideoElement | null>(null);
+  const jmuxerRef = useRef<JMuxer | null>(null);
+  const websocketRef = useRef<WebSocket | null>(null);
+  const directStreamUrl = video.preview_url?.startsWith('ws://') || video.preview_url?.startsWith('wss://')
+    ? video.preview_url
+    : null;
+  const jpegPreviewUrl = directStreamUrl ? null : video.preview_url;
   const waitingForFeed =
     matchesErrorIdle(video.status) ||
     video.status === 'waiting_for_stream' ||
@@ -36,7 +44,7 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
   const WrapperTag = dominant ? 'div' : 'button';
 
   useEffect(() => {
-    if (!video.preview_url) {
+    if (!jpegPreviewUrl) {
       if (displayUrlRef.current) {
         URL.revokeObjectURL(displayUrlRef.current);
         displayUrlRef.current = null;
@@ -52,9 +60,9 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
       while (!cancelled) {
         controller = new AbortController();
         try {
-          const separator = video.preview_url!.includes('?') ? '&' : '?';
+          const separator = jpegPreviewUrl.includes('?') ? '&' : '?';
           const response = await fetch(
-            `${video.preview_url}${separator}frame=${Date.now()}`,
+            `${jpegPreviewUrl}${separator}frame=${Date.now()}`,
             {
               cache: 'no-store',
               signal: controller.signal
@@ -92,7 +100,74 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
       }
       setDisplayUrl(null);
     };
-  }, [video.preview_url, video.recording_active, video.current_clip_id]);
+  }, [jpegPreviewUrl, video.recording_active, video.current_clip_id]);
+
+  useEffect(() => {
+    if (!directStreamUrl || !videoElementRef.current) {
+      websocketRef.current?.close();
+      websocketRef.current = null;
+      jmuxerRef.current?.destroy();
+      jmuxerRef.current = null;
+      return undefined;
+    }
+
+    const videoElement = videoElementRef.current;
+    let cancelled = false;
+
+    const jmuxer = new JMuxer({
+      node: videoElement,
+      mode: 'video',
+      videoCodec: 'H264',
+      flushingTime: 0,
+      maxDelay: 120,
+      clearBuffer: true,
+      fps: 60,
+      debug: false,
+      onError: () => {
+        if (!cancelled) {
+          jmuxerRef.current?.reset();
+        }
+      }
+    });
+    jmuxerRef.current = jmuxer;
+
+    const websocket = new WebSocket(directStreamUrl);
+    websocket.binaryType = 'arraybuffer';
+    websocketRef.current = websocket;
+
+    websocket.onmessage = (event) => {
+      if (cancelled || !(event.data instanceof ArrayBuffer) || event.data.byteLength === 0) {
+        return;
+      }
+
+      jmuxer.feed({
+        video: new Uint8Array(event.data),
+        duration: 17
+      });
+
+      if (videoElement.paused) {
+        void videoElement.play().catch(() => undefined);
+      }
+    };
+
+    websocket.onerror = () => {
+      websocket.close();
+    };
+
+    return () => {
+      cancelled = true;
+      websocket.close();
+      if (websocketRef.current === websocket) {
+        websocketRef.current = null;
+      }
+      jmuxer.destroy();
+      if (jmuxerRef.current === jmuxer) {
+        jmuxerRef.current = null;
+      }
+      videoElement.removeAttribute('src');
+      videoElement.load();
+    };
+  }, [directStreamUrl]);
 
   const streamUrl = useMemo(() => displayUrl, [displayUrl]);
 
@@ -109,7 +184,15 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
           }
         : {})}
     >
-      {streamUrl ? (
+      {directStreamUrl ? (
+        <video
+          ref={videoElementRef}
+          className="live-video-pane__video"
+          muted
+          autoPlay
+          playsInline
+        />
+      ) : streamUrl ? (
         <img
           key={streamUrl}
           className="live-video-pane__image"

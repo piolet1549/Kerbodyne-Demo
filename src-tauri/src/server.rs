@@ -5,23 +5,27 @@ use hyper::{
     body::Bytes,
     header::{
         HeaderValue, ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
-        ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, CONTENT_LENGTH,
-        CONTENT_RANGE, CONTENT_TYPE, RANGE,
+        ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, CONTENT_LENGTH, CONTENT_RANGE,
+        CONTENT_TYPE, RANGE,
     },
     service::service_fn,
-    HeaderMap,
-    Body, Method, Request, Response, StatusCode,
+    Body, HeaderMap, Method, Request, Response, StatusCode,
 };
 use tauri::{async_runtime::spawn, AppHandle};
 use tokio::{
     fs::{metadata, File},
-    io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::broadcast,
+    time::{timeout, Duration},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::runtime::{AppRuntime, IngestSource};
+
+const LEGACY_ALERT_LENGTH_TIMEOUT_SECS: u64 = 5;
+const LEGACY_ALERT_PAYLOAD_TIMEOUT_SECS: u64 = 20;
+const MAX_LEGACY_ALERT_PAYLOAD_BYTES: usize = 24 * 1024 * 1024;
 
 pub fn spawn_websocket_server(
     runtime: Arc<AppRuntime>,
@@ -159,7 +163,11 @@ pub fn spawn_offline_asset_server(
             spawn(async move {
                 let service = service_fn(move |request| {
                     let runtime = runtime.clone();
-                    async move { Ok::<_, std::convert::Infallible>(handle_asset_request(runtime, request).await) }
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            handle_asset_request(runtime, request).await,
+                        )
+                    }
                 });
 
                 if let Err(error) = hyper::server::conn::Http::new()
@@ -249,7 +257,10 @@ pub fn spawn_legacy_alert_listener(
             spawn(async move {
                 if let Err(error) = receive_legacy_alert_stream(&runtime, &app, stream).await {
                     runtime
-                        .push_warning(&app, format!("Error parsing incoming alert from {addr}: {error}"))
+                        .push_warning(
+                            &app,
+                            format!("Error parsing incoming alert from {addr}: {error}"),
+                        )
                         .await;
                 }
             });
@@ -262,29 +273,59 @@ async fn receive_legacy_alert_stream(
     app: &AppHandle,
     mut stream: TcpStream,
 ) -> Result<(), String> {
-    let mut length_bytes = [0_u8; 4];
-    stream
-        .read_exact(&mut length_bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    let message_length = u32::from_be_bytes(length_bytes) as usize;
+    let _ = stream.set_nodelay(true);
 
-    let mut payload = vec![0_u8; message_length];
-    stream
-        .read_exact(&mut payload)
+    loop {
+        let mut length_bytes = [0_u8; 4];
+        match timeout(
+            Duration::from_secs(LEGACY_ALERT_LENGTH_TIMEOUT_SECS),
+            stream.read_exact(&mut length_bytes),
+        )
         .await
-        .map_err(|error| error.to_string())?;
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(_) => return Err("timed out waiting for TCP alert frame length".into()),
+        }
 
-    let raw_json = String::from_utf8(payload).map_err(|error| error.to_string())?;
-    runtime
-        .ingest_legacy_alert(app, &raw_json, IngestSource::CompatibilityAlert)
+        let message_length = u32::from_be_bytes(length_bytes) as usize;
+        if message_length == 0 {
+            return Err("received empty TCP alert frame".into());
+        }
+        if message_length > MAX_LEGACY_ALERT_PAYLOAD_BYTES {
+            return Err(format!(
+                "TCP alert frame too large: {} bytes exceeds {} byte limit",
+                message_length, MAX_LEGACY_ALERT_PAYLOAD_BYTES
+            ));
+        }
+
+        let mut payload = vec![0_u8; message_length];
+        match timeout(
+            Duration::from_secs(LEGACY_ALERT_PAYLOAD_TIMEOUT_SECS),
+            stream.read_exact(&mut payload),
+        )
         .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(_) => {
+                return Err(format!(
+                    "timed out waiting for {} byte TCP alert payload",
+                    message_length
+                ))
+            }
+        }
+
+        let raw_json = String::from_utf8(payload).map_err(|error| error.to_string())?;
+        runtime
+            .ingest_legacy_alert(app, &raw_json, IngestSource::CompatibilityAlert)
+            .await?;
+        let _ = stream.write_all(b"OK\n").await;
+    }
 }
 
-async fn handle_asset_request(
-    runtime: Arc<AppRuntime>,
-    request: Request<Body>,
-) -> Response<Body> {
+async fn handle_asset_request(runtime: Arc<AppRuntime>, request: Request<Body>) -> Response<Body> {
     if request.method() == Method::OPTIONS {
         return with_cors(
             Response::builder()
@@ -309,7 +350,10 @@ async fn handle_asset_request(
         return handle_live_preview_frame_request(runtime, request).await;
     }
 
-    let asset_path = match runtime.resolve_offline_asset_path(request.uri().path()).await {
+    let asset_path = match runtime
+        .resolve_offline_asset_path(request.uri().path())
+        .await
+    {
         Ok(Some(path)) => path,
         Ok(None) => {
             return build_response(

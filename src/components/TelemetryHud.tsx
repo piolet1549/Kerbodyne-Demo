@@ -21,14 +21,21 @@ interface ExpandedHudData {
   altitudeMslM?: number | null;
   targetAltitudeMslM?: number | null;
   batteryMahConsumed?: number | null;
+  liveEfficiencyWhPerKm?: number | null;
+  averageEfficiencyWhPerKm?: number | null;
+}
+
+interface VisionControlState {
+  label: string;
+  disabled: boolean;
+  busy: boolean;
+  active: boolean;
+  onToggle: () => void;
 }
 
 interface AttitudeData {
   pitchDeg?: number | null;
   rollDeg?: number | null;
-  navPitchDeg?: number | null;
-  navRollDeg?: number | null;
-  showFlightDirector?: boolean;
 }
 
 interface TelemetryHudProps {
@@ -40,6 +47,7 @@ interface TelemetryHudProps {
   liveConnectionState?: HudStatus | null;
   visionStatus?: HudStatus | null;
   visionValue?: boolean | null;
+  visionControl?: VisionControlState | null;
   flightModeLabel: string;
   batteryPercent?: number | null;
   attitude?: AttitudeData | null;
@@ -87,11 +95,9 @@ function renderSpeedMph(value?: number | null): string {
   return `${(value * 2.2369362920544).toFixed(1)} mph`;
 }
 
-function renderGpsPosition(lat?: number | null, lon?: number | null): string {
-  if (lat == null || lon == null || Number.isNaN(lat) || Number.isNaN(lon)) {
-    return '--';
-  }
-  return `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+function renderEfficiency(value?: number | null): string {
+  if (value == null || Number.isNaN(value)) return '--';
+  return `${value.toFixed(1)} Wh/km`;
 }
 
 function metricClasses(state?: HudMetricState) {
@@ -124,19 +130,9 @@ function AttitudeIndicator({ attitude }: { attitude?: AttitudeData | null }) {
   const roll = attitude?.rollDeg ?? 0;
   const displayPitch = -pitch;
   const displayRoll = -roll;
-  const hasCommand =
-    Boolean(attitude?.showFlightDirector) &&
-    attitude?.navPitchDeg != null &&
-    !Number.isNaN(attitude.navPitchDeg) &&
-      attitude?.navRollDeg != null &&
-    !Number.isNaN(attitude.navRollDeg);
-  const navPitch = hasCommand ? (attitude?.navPitchDeg as number) : pitch;
-  const navRoll = hasCommand ? (attitude?.navRollDeg as number) : roll;
   const pitchScale = 2.2;
   const horizonTranslateY = clamp(displayPitch * pitchScale, -188, 188);
   const horizonRotate = clamp(displayRoll, -85, 85);
-  const commandTranslateY = clamp((pitch - navPitch) * pitchScale, -86, 86);
-  const commandRotate = clamp(navRoll - roll, -70, 70);
   const pitchMarks = Array.from({ length: 18 }, (_, index) => -90 + index * 10).filter(
     (mark) => mark !== 0
   );
@@ -147,39 +143,33 @@ function AttitudeIndicator({ attitude }: { attitude?: AttitudeData | null }) {
         <div className="telemetry-hud__attitude-roll-arc" />
         <div className="telemetry-hud__attitude-roll-notch" />
         <div className="telemetry-hud__attitude-mask">
-          <div
-            className="telemetry-hud__attitude-horizon"
-            style={{ transform: `translateY(${horizonTranslateY}px) rotate(${horizonRotate}deg)` }}
-          >
-            <div className="telemetry-hud__attitude-sky" />
-            <div className="telemetry-hud__attitude-ground" />
-            <div className="telemetry-hud__attitude-line" />
-            {pitchMarks.map((mark) => (
-              <div
-                key={mark}
-                className="telemetry-hud__attitude-pitch-mark"
-                style={{ top: `calc(50% + ${mark * -2.4}px)` }}
-              >
-                <span className="telemetry-hud__attitude-pitch-label">
-                  {formatSignedPitchLabel(mark)}
-                </span>
-                <span className="telemetry-hud__attitude-pitch-bar" />
-                <span className="telemetry-hud__attitude-pitch-label">
-                  {formatSignedPitchLabel(mark)}
-                </span>
-              </div>
-            ))}
+          <div className="telemetry-hud__attitude-roll-plane" style={{ transform: `rotate(${horizonRotate}deg)` }}>
+            <div
+              className="telemetry-hud__attitude-horizon"
+              style={{ transform: `translateY(${horizonTranslateY}px)` }}
+            >
+              <div className="telemetry-hud__attitude-sky" />
+              <div className="telemetry-hud__attitude-ground" />
+              <div className="telemetry-hud__attitude-line" />
+              {pitchMarks.map((mark) => (
+                <div
+                  key={mark}
+                  className="telemetry-hud__attitude-pitch-mark"
+                  style={{ top: `calc(50% + ${mark * -2.4}px)` }}
+                >
+                  <span className="telemetry-hud__attitude-pitch-label">
+                    {formatSignedPitchLabel(mark)}
+                  </span>
+                  <span className="telemetry-hud__attitude-pitch-bar" />
+                  <span className="telemetry-hud__attitude-pitch-label">
+                    {formatSignedPitchLabel(mark)}
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
         <div className="telemetry-hud__attitude-aircraft" />
-        {hasCommand ? (
-          <div
-            className="telemetry-hud__attitude-command"
-            style={{
-              transform: `translate(-50%, -50%) translateY(${commandTranslateY}px) rotate(${commandRotate}deg)`
-            }}
-          />
-        ) : null}
       </div>
     </div>
   );
@@ -188,11 +178,13 @@ function AttitudeIndicator({ attitude }: { attitude?: AttitudeData | null }) {
 function VisionIndicator({
   mode,
   status,
-  value
+  value,
+  control
 }: {
   mode: 'live' | 'review';
   status?: HudStatus | null;
   value?: boolean | null;
+  control?: VisionControlState | null;
 }) {
   if (mode === 'review') {
     return (
@@ -202,6 +194,31 @@ function VisionIndicator({
           {value == null ? '--' : value ? 'on' : 'off'}
         </strong>
       </div>
+    );
+  }
+
+  if (control) {
+    const className = [
+      'telemetry-hud__vision-indicator',
+      'telemetry-hud__vision-indicator--button',
+      control.active ? 'telemetry-hud__vision-indicator--active' : '',
+      control.busy ? 'telemetry-hud__vision-indicator--busy' : '',
+      control.disabled ? 'telemetry-hud__vision-indicator--disabled' : ''
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    return (
+      <button
+        type="button"
+        className={className}
+        title={status?.label}
+        aria-label={status?.label ?? control.label}
+        disabled={control.disabled || control.busy}
+        onClick={control.onToggle}
+      >
+        <span className="telemetry-hud__vision-label">{control.label}</span>
+      </button>
     );
   }
 
@@ -307,10 +324,13 @@ function ExpandedHudPanel({
                 </span>
               </div>
               <div>
-                <span className="telemetry-hud__label">GPS position</span>
+                <span className="telemetry-hud__label">Efficiency</span>
                 <strong className="telemetry-hud__metric-value">
-                  {renderGpsPosition(liveState?.lat, liveState?.lon)}
+                  {renderEfficiency(expandedHud.liveEfficiencyWhPerKm)}
                 </strong>
+                <span className="telemetry-hud__subvalue">
+                  {renderEfficiency(expandedHud.averageEfficiencyWhPerKm)}
+                </span>
               </div>
               <div className="telemetry-hud__vibration">
                 <span className="telemetry-hud__label">Vibration</span>
@@ -351,6 +371,7 @@ export function TelemetryHud({
   liveConnectionState,
   visionStatus,
   visionValue,
+  visionControl,
   flightModeLabel,
   batteryPercent,
   attitude,
@@ -383,7 +404,12 @@ export function TelemetryHud({
             </div>
 
             <div className="telemetry-hud__topline-actions">
-              <VisionIndicator mode={mode} status={visionStatus} value={visionValue} />
+              <VisionIndicator
+                mode={mode}
+                status={visionStatus}
+                value={visionValue}
+                control={visionControl}
+              />
             </div>
           </div>
 

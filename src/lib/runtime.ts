@@ -70,6 +70,10 @@ export async function exportSessionTelemetry(sessionId: string): Promise<string>
   });
 }
 
+export async function setVisionPipelineEnabled(enabled: boolean): Promise<string> {
+  return invoke<string>('set_vision_pipeline_enabled', { enabled });
+}
+
 export async function listenToRuntimeEvents(
   handler: (event: RuntimeEvent) => void
 ): Promise<UnlistenFn> {

@@ -127,7 +127,10 @@ pub fn load_region(config: &AppConfig, region_id: &str) -> Result<OfflineRegionM
     read_manifest_from_path(&region_dir, region_id)
 }
 
-pub fn resolve_asset_path(config: &AppConfig, request_path: &str) -> Result<Option<PathBuf>, String> {
+pub fn resolve_asset_path(
+    config: &AppConfig,
+    request_path: &str,
+) -> Result<Option<PathBuf>, String> {
     let segments = request_path
         .trim_start_matches('/')
         .split('/')
@@ -182,11 +185,7 @@ fn validate_manifest(
     }
 
     validate_relative_asset(region_dir, &manifest.street_pmtiles, "street_pmtiles")?;
-    validate_relative_asset(
-        region_dir,
-        &manifest.satellite_pmtiles,
-        "satellite_pmtiles",
-    )?;
+    validate_relative_asset(region_dir, &manifest.satellite_pmtiles, "satellite_pmtiles")?;
 
     if let Some(style_path) = manifest.street_style_path.as_deref() {
         validate_relative_asset(region_dir, style_path, "street_style_path")?;
@@ -195,7 +194,11 @@ fn validate_manifest(
     Ok(manifest)
 }
 
-fn validate_relative_asset(region_dir: &Path, relative_path: &str, field_name: &str) -> Result<(), String> {
+fn validate_relative_asset(
+    region_dir: &Path,
+    relative_path: &str,
+    field_name: &str,
+) -> Result<(), String> {
     let safe_relative = safe_relative_path(relative_path)?;
     let full_path = region_dir.join(safe_relative);
     if !full_path.is_file() {
@@ -269,10 +272,7 @@ fn safe_relative_path(relative_path: &str) -> Result<PathBuf, String> {
 }
 
 fn is_safe_segment(value: &str) -> bool {
-    !value.is_empty()
-        && !value.contains(['\\', '/', ':'])
-        && value != "."
-        && value != ".."
+    !value.is_empty() && !value.contains(['\\', '/', ':']) && value != "." && value != ".."
 }
 
 #[cfg(test)]

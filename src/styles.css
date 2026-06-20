@@ -511,6 +511,28 @@ button {
   box-sizing: border-box;
 }
 
+.telemetry-hud__vision-indicator--button {
+  appearance: none;
+  cursor: pointer;
+  font: inherit;
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  transition:
+    background 160ms ease,
+    color 160ms ease,
+    opacity 160ms ease,
+    transform 160ms ease;
+}
+
+.telemetry-hud__vision-indicator--button:not(:disabled):hover {
+  transform: translateY(-1px);
+}
+
+.telemetry-hud__vision-indicator--button:disabled {
+  cursor: not-allowed;
+}
+
 .telemetry-hud__vision-label {
   font-size: 0.8rem;
   font-weight: 600;
@@ -550,6 +572,24 @@ button {
   --telemetry-hud-vision-shadow: rgba(104, 222, 146, 0.34);
   --telemetry-hud-vision-glow: rgba(104, 222, 146, 0.3);
   --telemetry-hud-vision-color: #68de92;
+}
+
+.telemetry-hud__vision-indicator--disabled {
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: rgba(255, 255, 255, 0.28);
+  opacity: 0.72;
+}
+
+.telemetry-hud__vision-indicator--active {
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  box-shadow: none;
+}
+
+.telemetry-hud__vision-indicator--busy {
+  color: var(--muted);
 }
 
 .telemetry-hud__vision-indicator--connected::after,
@@ -645,6 +685,7 @@ button {
   border-radius: 14px;
 }
 
+.telemetry-hud__attitude-roll-plane,
 .telemetry-hud__attitude-horizon {
   position: absolute;
   left: 50%;
@@ -654,6 +695,13 @@ button {
   margin-left: -220px;
   margin-top: -230px;
   transform-origin: center center;
+}
+
+.telemetry-hud__attitude-horizon {
+  left: 0;
+  top: 0;
+  margin-left: 0;
+  margin-top: 0;
 }
 
 .telemetry-hud__attitude-sky,
@@ -3518,6 +3566,7 @@ button {
 .flight-surface--corner .map-stage,
 .flight-surface--corner .map-canvas,
 .flight-surface--corner .live-video-pane,
+.flight-surface--corner .live-video-pane__video,
 .flight-surface--corner .live-video-pane__image,
 .flight-surface--corner .live-video-pane__empty {
   width: 100%;
@@ -3554,6 +3603,7 @@ button {
   cursor: pointer;
 }
 
+.live-video-pane__video,
 .live-video-pane__image,
 .live-video-pane__empty {
   display: block;
@@ -3561,6 +3611,7 @@ button {
   height: 100%;
 }
 
+.live-video-pane__video,
 .live-video-pane__image {
   object-fit: cover;
   background: #020202;

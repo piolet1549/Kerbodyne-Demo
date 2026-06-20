@@ -7,6 +7,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
@@ -16,20 +17,20 @@ use tokio::{
     sync::{broadcast, watch, Mutex, RwLock},
     time::{sleep, timeout, Duration},
 };
+use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
 
 use crate::{
     db::Database,
     geometry::distance_m,
     models::{
-        AlertPayload, AlertRecord, AppConfig, AppSnapshot, AircraftLiveState, BatterySummary,
-        ConnectionHealth, ConnectionStatus, DEFAULT_AIRCRAFT_ID, LegacyAlertPacket,
-        LegacySystemStatusPacket,
+        AircraftLiveState, AlertPayload, AlertRecord, AppConfig, AppSnapshot, BatterySummary,
+        ConnectionHealth, ConnectionStatus, LegacyAlertPacket, LegacySystemStatusPacket,
         LegacyTelemetryPacket, LegacyTelemetryPacketType, MapAlertSector, MissionSession,
         OfflineRegionCatalog, OfflineRegionManifest, ReplayFrame, ReviewTelemetryFrame,
-        RuntimeEvent, RuntimeMode, SCHEMA_VERSION, SessionVideoClip, SystemStatusPayload,
-        SystemStatusRecord, TelemetryPayload, TrackPointRecord, VideoPreviewState,
-        VideoPreviewStatus, WireEnvelope,
+        RuntimeEvent, RuntimeMode, SessionVideoClip, SystemStatusPayload, SystemStatusRecord,
+        TelemetryPayload, TrackPointRecord, VideoPreviewState, VideoPreviewStatus, WireEnvelope,
+        DEFAULT_AIRCRAFT_ID, SCHEMA_VERSION,
     },
     offline_maps,
     server::{
@@ -45,12 +46,17 @@ const MAX_WARNINGS: usize = 12;
 const MAX_SESSION_HISTORY: usize = 200;
 const MAX_RAW_TELEMETRY_PACKETS: usize = 160;
 const LIVE_VIDEO_RTP_PORT: u16 = 5600;
+const AIRSIDE_VISION_COMMAND_HOST: &str = "192.168.1.11";
+const AIRSIDE_VISION_COMMAND_PORT: u16 = 45105;
+const AIRSIDE_VISION_COMMAND_TIMEOUT_SECS: u64 = 5;
 const VIDEO_STALE_AFTER_SECS: i64 = 3;
 const COMPAT_HF_STALE_SECS: i64 = 2;
 const COMPAT_MF_STALE_SECS: i64 = 4;
 const COMPAT_LF_STALE_SECS: i64 = 8;
 const VIDEO_PREVIEW_PATH: &str = "/live.mjpg";
 const APP_VIDEO_PREVIEW_FRAME_PATH: &str = "/__preview__/live.jpg";
+const DIRECT_VIDEO_WS_PATH: &str = "/live.h264";
+const DIRECT_VIDEO_CHANNEL_CAPACITY: usize = 12;
 const VLC_HTTP_PROBE_INTERVAL_MS: u64 = 300;
 const VLC_HTTP_PROBE_TIMEOUT_MS: u64 = 2200;
 const VLC_SHUTDOWN_TIMEOUT_SECS: u64 = 8;
@@ -80,6 +86,8 @@ struct CompatibilityTelemetryState {
     battery_a: Option<f64>,
     battery_pct: Option<f64>,
     battery_mah: Option<f64>,
+    battery_wh: Option<f64>,
+    time_boot_ms: Option<u64>,
     cpu_temp_c: Option<f64>,
     cpu_pct: Option<f64>,
     cpu_mhz: Option<f64>,
@@ -103,7 +111,10 @@ impl CompatibilityTelemetryState {
             self.has_split_packets = true;
         }
 
-        match packet.packet_type.unwrap_or(LegacyTelemetryPacketType::Unknown) {
+        match packet
+            .packet_type
+            .unwrap_or(LegacyTelemetryPacketType::Unknown)
+        {
             LegacyTelemetryPacketType::HighFrequency => self.last_hf_at = Some(received_at),
             LegacyTelemetryPacketType::MediumFrequency => self.last_mf_at = Some(received_at),
             LegacyTelemetryPacketType::LowFrequency => self.last_lf_at = Some(received_at),
@@ -132,6 +143,13 @@ impl CompatibilityTelemetryState {
         update_if_some(&mut self.battery_a, packet.battery_a);
         update_if_some(&mut self.battery_pct, packet.battery_pct);
         update_if_some(&mut self.battery_mah, packet.battery_mah);
+        update_if_some(
+            &mut self.battery_wh,
+            packet
+                .battery_wh
+                .or_else(|| packet.energy_consumed.map(hectojoules_to_watt_hours)),
+        );
+        update_if_some(&mut self.time_boot_ms, packet.time_boot_ms);
         update_if_some(&mut self.cpu_temp_c, packet.cpu_temp_c);
         update_if_some(&mut self.cpu_pct, packet.cpu_pct);
         update_if_some(&mut self.cpu_mhz, packet.cpu_mhz);
@@ -155,6 +173,8 @@ impl CompatibilityTelemetryState {
             || self.battery_pct.is_some()
             || self.battery_a.is_some()
             || self.battery_mah.is_some()
+            || self.battery_wh.is_some()
+            || self.time_boot_ms.is_some()
             || self.cpu_temp_c.is_some()
             || self.cpu_pct.is_some()
             || self.cpu_mhz.is_some()
@@ -238,7 +258,11 @@ impl CompatibilityTelemetryState {
         insert_optional_number(&mut extras, "vspeed_ms", self.vspeed_ms);
         insert_optional_number(&mut extras, "pitch_deg", self.pitch_deg);
         insert_optional_number(&mut extras, "roll_deg", self.roll_deg);
-        insert_optional_number(&mut extras, "flight_mode", self.flight_mode.map(|value| value as f64));
+        insert_optional_number(
+            &mut extras,
+            "flight_mode",
+            self.flight_mode.map(|value| value as f64),
+        );
         insert_optional_number(&mut extras, "throttle_pct", self.throttle_pct);
         insert_optional_number(&mut extras, "nav_pitch_deg", self.nav_pitch_deg);
         insert_optional_number(&mut extras, "nav_roll_deg", self.nav_roll_deg);
@@ -248,6 +272,12 @@ impl CompatibilityTelemetryState {
         insert_optional_number(&mut extras, "vib_z", self.vib_z);
         insert_optional_number(&mut extras, "battery_a", self.battery_a);
         insert_optional_number(&mut extras, "battery_mah", self.battery_mah);
+        insert_optional_number(&mut extras, "battery_wh", self.battery_wh);
+        insert_optional_number(
+            &mut extras,
+            "time_boot_ms",
+            self.time_boot_ms.map(|value| value as f64),
+        );
         insert_optional_number(&mut extras, "cpu_temp_c", self.cpu_temp_c);
         insert_optional_number(&mut extras, "cpu_pct", self.cpu_pct);
         insert_optional_number(&mut extras, "cpu_mhz", self.cpu_mhz);
@@ -283,9 +313,13 @@ struct RecordingRunState {
 #[derive(Default)]
 struct VideoRuntimeState {
     preview_monitor_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    direct_ingest_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    direct_ws_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    direct_shutdown: Option<broadcast::Sender<()>>,
     preview_child: Option<Child>,
     recording: Option<RecordingRunState>,
     last_preview_frame_at: Option<DateTime<Utc>>,
+    direct_ws_port: Option<u16>,
     preview_http_port: Option<u16>,
     sdp_path: Option<PathBuf>,
     log_path: Option<PathBuf>,
@@ -459,9 +493,7 @@ impl AppRuntime {
             port,
             self.shutdown_signal.subscribe(),
         );
-        self.background_tasks
-            .blocking_lock()
-            .push(websocket_handle);
+        self.background_tasks.blocking_lock().push(websocket_handle);
 
         let runtime = self.clone();
         let mut shutdown_receiver = self.shutdown_signal.subscribe();
@@ -731,11 +763,7 @@ impl AppRuntime {
         Ok(())
     }
 
-    pub async fn delete_session(
-        &self,
-        app: &AppHandle,
-        session_id: String,
-    ) -> Result<(), String> {
+    pub async fn delete_session(&self, app: &AppHandle, session_id: String) -> Result<(), String> {
         if self.current_session_id.read().await.as_deref() == Some(session_id.as_str()) {
             return Err("Stop the active flight before deleting it.".into());
         }
@@ -745,7 +773,11 @@ impl AppRuntime {
         let next_focus = {
             let focused = self.focused_session_id.read().await.clone();
             if focused.as_deref() == Some(session_id.as_str()) {
-                self.sessions.read().await.first().map(|session| session.id.clone())
+                self.sessions
+                    .read()
+                    .await
+                    .first()
+                    .map(|session| session.id.clone())
             } else {
                 focused
             }
@@ -823,8 +855,8 @@ impl AppRuntime {
         write_csv_row(&mut rows, &header);
 
         for (raw_json, envelope) in telemetry_rows {
-            let extras_json =
-                serde_json::to_string(&envelope.payload.extras).map_err(|error| error.to_string())?;
+            let extras_json = serde_json::to_string(&envelope.payload.extras)
+                .map_err(|error| error.to_string())?;
             let mut fields = vec![
                 normalize_timestamp(&envelope.sent_at),
                 envelope.message_id,
@@ -877,6 +909,75 @@ impl AppRuntime {
         Ok(path.to_string_lossy().to_string())
     }
 
+    pub async fn set_vision_pipeline_enabled(&self, enabled: bool) -> Result<String, String> {
+        let command = if enabled {
+            "start_vision"
+        } else {
+            "stop_vision"
+        };
+        let payload = serde_json::to_vec(&json!({ "command": command }))
+            .map_err(|error| error.to_string())?;
+        let address = (AIRSIDE_VISION_COMMAND_HOST, AIRSIDE_VISION_COMMAND_PORT);
+        let mut stream = timeout(
+            Duration::from_secs(AIRSIDE_VISION_COMMAND_TIMEOUT_SECS),
+            TcpStream::connect(address),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "Timed out connecting to vision command listener at {}:{}.",
+                AIRSIDE_VISION_COMMAND_HOST, AIRSIDE_VISION_COMMAND_PORT
+            )
+        })?
+        .map_err(|error| {
+            format!(
+                "Unable to connect to vision command listener at {}:{}: {error}",
+                AIRSIDE_VISION_COMMAND_HOST, AIRSIDE_VISION_COMMAND_PORT
+            )
+        })?;
+
+        timeout(
+            Duration::from_secs(AIRSIDE_VISION_COMMAND_TIMEOUT_SECS),
+            stream.write_all(&payload),
+        )
+        .await
+        .map_err(|_| "Timed out sending vision command.".to_string())?
+        .map_err(|error| format!("Unable to send vision command: {error}"))?;
+
+        let mut response = vec![0_u8; 1024];
+        let bytes_read = timeout(
+            Duration::from_secs(AIRSIDE_VISION_COMMAND_TIMEOUT_SECS),
+            stream.read(&mut response),
+        )
+        .await
+        .map_err(|_| "Timed out waiting for vision command response.".to_string())?
+        .map_err(|error| format!("Unable to read vision command response: {error}"))?;
+
+        if bytes_read == 0 {
+            return Ok("Vision command sent.".into());
+        }
+
+        let response_text = String::from_utf8(response[..bytes_read].to_vec())
+            .map_err(|error| error.to_string())?;
+        let value: Value = serde_json::from_str(&response_text)
+            .map_err(|error| format!("Vision command listener returned invalid JSON: {error}"))?;
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Vision command acknowledged.")
+            .to_string();
+
+        if status.eq_ignore_ascii_case("error") {
+            Err(message)
+        } else {
+            Ok(message)
+        }
+    }
+
     pub async fn complete_active_stream(
         &self,
         app: &AppHandle,
@@ -916,7 +1017,8 @@ impl AppRuntime {
             )?;
             {
                 let mut sessions = self.sessions.write().await;
-                if let Some(session) = sessions.iter_mut().find(|session| session.id == session_id) {
+                if let Some(session) = sessions.iter_mut().find(|session| session.id == session_id)
+                {
                     session.name = normalized_name;
                     session.description = normalized_description;
                 }
@@ -1066,18 +1168,19 @@ impl AppRuntime {
         };
 
         if needs_udp_listener {
-            let udp_socket = bind_legacy_udp_listener(
-                ("0.0.0.0", legacy_telemetry_port),
-                legacy_telemetry_port,
-            )
-            .await?;
+            let udp_socket =
+                bind_legacy_udp_listener(("0.0.0.0", legacy_telemetry_port), legacy_telemetry_port)
+                    .await?;
             let telemetry_handle = spawn_legacy_telemetry_listener(
                 runtime.clone(),
                 app.clone(),
                 udp_socket,
                 shutdown_signal.subscribe(),
             );
-            self.legacy_listener_tasks.lock().await.push(telemetry_handle);
+            self.legacy_listener_tasks
+                .lock()
+                .await
+                .push(telemetry_handle);
             *self.legacy_udp_listener_ready.write().await = true;
         }
 
@@ -1262,8 +1365,11 @@ impl AppRuntime {
                 }
             }
 
+            let direct_running =
+                runtime.direct_ingest_handle.is_some() && runtime.direct_ws_handle.is_some();
+
             (
-                runtime.preview_child.is_some(),
+                runtime.preview_child.is_some() || direct_running,
                 runtime.last_preview_frame_at,
                 runtime.recording.is_some(),
             )
@@ -1322,16 +1428,38 @@ impl AppRuntime {
     }
 
     async fn stop_preview_process(&self) {
-        let (monitor_handle, mut preview_child, sdp_path) = {
+        let (
+            monitor_handle,
+            direct_ingest_handle,
+            direct_ws_handle,
+            direct_shutdown,
+            mut preview_child,
+            sdp_path,
+        ) = {
             let mut runtime = self.video_runtime.lock().await;
             (
                 runtime.preview_monitor_handle.take(),
+                runtime.direct_ingest_handle.take(),
+                runtime.direct_ws_handle.take(),
+                runtime.direct_shutdown.take(),
                 runtime.preview_child.take(),
                 runtime.sdp_path.take(),
             )
         };
 
+        if let Some(shutdown) = direct_shutdown {
+            let _ = shutdown.send(());
+        }
+
         if let Some(handle) = monitor_handle {
+            handle.abort();
+        }
+
+        if let Some(handle) = direct_ingest_handle {
+            handle.abort();
+        }
+
+        if let Some(handle) = direct_ws_handle {
             handle.abort();
         }
 
@@ -1355,9 +1483,78 @@ impl AppRuntime {
         }
 
         let mut runtime = self.video_runtime.lock().await;
+        runtime.direct_ws_port = None;
         runtime.preview_http_port = None;
         runtime.last_preview_frame_at = None;
         runtime.log_path = None;
+    }
+
+    async fn launch_direct_preview_bridge(&self, app: &AppHandle) -> Result<(), String> {
+        self.stop_preview_process().await;
+
+        let udp_socket = UdpSocket::bind(("0.0.0.0", LIVE_VIDEO_RTP_PORT))
+            .await
+            .map_err(|error| {
+                let owner_note = detect_external_udp_port_owner(LIVE_VIDEO_RTP_PORT)
+                    .map(|pid| format!(" Port owner: {}.", describe_port_owner(Some(pid))))
+                    .unwrap_or_default();
+                format!(
+                    "Unable to bind live video RTP receiver on UDP {}: {error}{owner_note}",
+                    LIVE_VIDEO_RTP_PORT,
+                )
+            })?;
+        let ws_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|error| format!("Unable to bind live video bridge WebSocket: {error}"))?;
+        let ws_port = ws_listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+
+        let (video_sender, _) = broadcast::channel(DIRECT_VIDEO_CHANNEL_CAPACITY);
+        let (direct_shutdown, _) = broadcast::channel(4);
+        let ingest_shutdown = direct_shutdown.subscribe();
+        let ws_shutdown = direct_shutdown.subscribe();
+        let runtime_for_ingest = app.state::<Arc<AppRuntime>>().inner().clone();
+        let app_for_ingest = app.clone();
+        let video_sender_for_ingest = video_sender.clone();
+
+        let direct_ingest_handle = tauri::async_runtime::spawn(async move {
+            receive_direct_rtp_video(
+                runtime_for_ingest,
+                &app_for_ingest,
+                udp_socket,
+                video_sender_for_ingest,
+                ingest_shutdown,
+            )
+            .await;
+        });
+        let direct_ws_handle = tauri::async_runtime::spawn(async move {
+            serve_direct_video_websocket(ws_listener, video_sender, ws_shutdown).await;
+        });
+
+        {
+            *self.video_preview.write().await = VideoPreviewState {
+                status: VideoPreviewStatus::WaitingForStream,
+                preview_url: Some(format!("ws://127.0.0.1:{ws_port}{DIRECT_VIDEO_WS_PATH}")),
+                recording_active: false,
+                current_clip_id: None,
+                message: Some(
+                    video_status_message(&VideoPreviewStatus::WaitingForStream).to_string(),
+                ),
+            };
+        }
+        *self.latest_preview_frame.write().await = None;
+        let _ = self.preview_frame_sender.send(None);
+
+        let mut runtime = self.video_runtime.lock().await;
+        runtime.direct_ingest_handle = Some(direct_ingest_handle);
+        runtime.direct_ws_handle = Some(direct_ws_handle);
+        runtime.direct_shutdown = Some(direct_shutdown);
+        runtime.direct_ws_port = Some(ws_port);
+        runtime.last_preview_frame_at = None;
+
+        Ok(())
     }
 
     async fn launch_preview_process(
@@ -1387,7 +1584,10 @@ impl AppRuntime {
             let runtime = self.video_runtime.lock().await;
             (
                 runtime.recording.is_some(),
-                runtime.recording.as_ref().map(|recording| recording.clip_id.clone()),
+                runtime
+                    .recording
+                    .as_ref()
+                    .map(|recording| recording.clip_id.clone()),
             )
         };
 
@@ -1399,7 +1599,9 @@ impl AppRuntime {
                 preview_url,
                 recording_active,
                 current_clip_id,
-                message: Some(video_status_message(&VideoPreviewStatus::WaitingForStream).to_string()),
+                message: Some(
+                    video_status_message(&VideoPreviewStatus::WaitingForStream).to_string(),
+                ),
             };
         }
         *self.latest_preview_frame.write().await = None;
@@ -1429,11 +1631,23 @@ impl AppRuntime {
     ) -> Result<(), String> {
         self.stop_video_subsystem(app).await?;
 
-        if let Some(owner_pid) = detect_external_udp_port_owner(LIVE_VIDEO_RTP_PORT) {
-            return Err(format!(
-                "Live video port {} is already in use by another application (PID {}). Close the VLC test or any other program using the feed and try again.",
-                LIVE_VIDEO_RTP_PORT, owner_pid
-            ));
+        match self.launch_direct_preview_bridge(app).await {
+            Ok(()) => {
+                self.emit_snapshot(app).await?;
+                return Ok(());
+            }
+            Err(direct_error) => {
+                if detect_external_udp_port_owner(LIVE_VIDEO_RTP_PORT).is_some() {
+                    return Err(direct_error);
+                }
+                self.push_warning(
+                    app,
+                    format!(
+                        "Direct video bridge unavailable ({direct_error}); falling back to VLC preview."
+                    ),
+                )
+                .await;
+            }
         }
 
         let vlc_executable = resolve_vlc_executable(app).ok_or_else(|| {
@@ -1441,7 +1655,8 @@ impl AppRuntime {
                 .to_string()
         })?;
         *self.vlc_path.write().await = Some(vlc_executable.clone());
-        self.launch_preview_process(app, &vlc_executable, None).await?;
+        self.launch_preview_process(app, &vlc_executable, None)
+            .await?;
 
         self.emit_snapshot(app).await?;
         Ok(())
@@ -1499,8 +1714,8 @@ impl AppRuntime {
         let ended_at = Utc::now().to_rfc3339();
         let duration_ms = (parse_timestamp(&ended_at).unwrap_or_else(|_| Utc::now())
             - parse_timestamp(&recording.started_at).unwrap_or_else(|_| Utc::now()))
-            .num_milliseconds()
-            .max(0) as u64;
+        .num_milliseconds()
+        .max(0) as u64;
         let bytes_written = fs::metadata(&recording.mp4_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -1521,9 +1736,12 @@ impl AppRuntime {
             };
             self.db.upsert_session_video_clip(&clip)?;
             *self.sessions.write().await = self.db.load_sessions(MAX_SESSION_HISTORY)?;
-            if self.focused_session_id.read().await.as_deref() == Some(recording.session_id.as_str()) {
-                *self.review_video_clips.write().await =
-                    self.db.load_video_clips_for_session(&recording.session_id)?;
+            if self.focused_session_id.read().await.as_deref()
+                == Some(recording.session_id.as_str())
+            {
+                *self.review_video_clips.write().await = self
+                    .db
+                    .load_video_clips_for_session(&recording.session_id)?;
             }
         }
 
@@ -1534,8 +1752,11 @@ impl AppRuntime {
                 .await
                 .clone()
                 .or_else(|| resolve_vlc_executable(app))
-                .ok_or_else(|| "Live video runtime unavailable while restarting preview.".to_string())?;
-            self.launch_preview_process(app, &vlc_executable, None).await?;
+                .ok_or_else(|| {
+                    "Live video runtime unavailable while restarting preview.".to_string()
+                })?;
+            self.launch_preview_process(app, &vlc_executable, None)
+                .await?;
         } else {
             let mut preview = self.video_preview.write().await;
             preview.recording_active = false;
@@ -1614,7 +1835,8 @@ impl AppRuntime {
             "telemetry" => {
                 let envelope: WireEnvelope<TelemetryPayload> =
                     serde_json::from_value(value).map_err(|error| error.to_string())?;
-                self.ingest_telemetry(app, envelope, raw_json, source).await?;
+                self.ingest_telemetry(app, envelope, raw_json, source)
+                    .await?;
             }
             "alert" => {
                 let envelope: WireEnvelope<AlertPayload> =
@@ -1661,7 +1883,9 @@ impl AppRuntime {
 
         if !has_any_state {
             let _ = self
-                .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
+                .refresh_compatibility_connection_health(
+                    self.config.read().await.stale_after_seconds,
+                )
                 .await;
             self.emit_snapshot(app).await?;
             return Ok(());
@@ -1807,10 +2031,7 @@ impl AppRuntime {
     ) -> Result<(), String> {
         let reported_at = normalize_timestamp(&packet.timestamp);
         let mut extras = packet.extras;
-        extras.insert(
-            "legacy_status".into(),
-            Value::String(packet.status.clone()),
-        );
+        extras.insert("legacy_status".into(), Value::String(packet.status.clone()));
         extras.insert(
             "legacy_telemetry".into(),
             serde_json::to_value(&packet.telemetry).map_err(|error| error.to_string())?,
@@ -1896,7 +2117,9 @@ impl AppRuntime {
 
         if matches!(source, IngestSource::CompatibilityTelemetry) {
             let _ = self
-                .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
+                .refresh_compatibility_connection_health(
+                    self.config.read().await.stale_after_seconds,
+                )
                 .await;
         } else {
             self.update_runtime_status(source, &sent_at).await;
@@ -1981,7 +2204,9 @@ impl AppRuntime {
             && self.current_session_source.read().await.as_deref() == Some(LEGACY_SOURCE_LABEL)
         {
             let _ = self
-                .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
+                .refresh_compatibility_connection_health(
+                    self.config.read().await.stale_after_seconds,
+                )
                 .await;
         } else {
             self.update_runtime_status(source, &sent_at).await;
@@ -2029,7 +2254,9 @@ impl AppRuntime {
             && self.current_session_source.read().await.as_deref() == Some(LEGACY_SOURCE_LABEL)
         {
             let _ = self
-                .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
+                .refresh_compatibility_connection_health(
+                    self.config.read().await.stale_after_seconds,
+                )
                 .await;
         } else {
             self.update_runtime_status(source, &sent_at).await;
@@ -2051,19 +2278,11 @@ impl AppRuntime {
         let (port, note) = match source {
             IngestSource::CompatibilityTelemetry => (
                 config.legacy_telemetry_port,
-                format!(
-                    "{} on UDP {}",
-                    source.note(),
-                    config.legacy_telemetry_port
-                ),
+                format!("{} on UDP {}", source.note(), config.legacy_telemetry_port),
             ),
             IngestSource::CompatibilityAlert => (
                 config.legacy_alert_port,
-                format!(
-                    "{} on TCP {}",
-                    source.note(),
-                    config.legacy_alert_port
-                ),
+                format!("{} on TCP {}", source.note(), config.legacy_alert_port),
             ),
             _ => (config.listen_port, source.note().to_string()),
         };
@@ -2189,7 +2408,9 @@ impl AppRuntime {
                 let elapsed_s = parse_timestamp(recorded_at)
                     .ok()
                     .zip(parse_timestamp(&last_point.recorded_at).ok())
-                    .map(|(current, previous)| (current - previous).num_milliseconds().max(0) as f64 / 1000.0)
+                    .map(|(current, previous)| {
+                        (current - previous).num_milliseconds().max(0) as f64 / 1000.0
+                    })
                     .unwrap_or(0.0);
                 distance >= 1.5 || elapsed_s >= 1.0
             })
@@ -2276,10 +2497,7 @@ impl AppRuntime {
     }
 }
 
-async fn bind_legacy_udp_listener(
-    address: (&str, u16),
-    port: u16,
-) -> Result<UdpSocket, String> {
+async fn bind_legacy_udp_listener(address: (&str, u16), port: u16) -> Result<UdpSocket, String> {
     for attempt in 0..20 {
         match UdpSocket::bind(address).await {
             Ok(socket) => return Ok(socket),
@@ -2288,7 +2506,10 @@ async fn bind_legacy_udp_listener(
             }
             Err(error) => {
                 let owner = if error.kind() == std::io::ErrorKind::AddrInUse {
-                    format!(" Port owner: {}.", describe_port_owner(detect_port_owner("udp", port)))
+                    format!(
+                        " Port owner: {}.",
+                        describe_port_owner(detect_port_owner("udp", port))
+                    )
                 } else {
                     String::new()
                 };
@@ -2319,7 +2540,10 @@ async fn bind_legacy_alert_listener(
             }
             Err(error) => {
                 let owner = if error.kind() == std::io::ErrorKind::AddrInUse {
-                    format!(" Port owner: {}.", describe_port_owner(detect_port_owner("tcp", port)))
+                    format!(
+                        " Port owner: {}.",
+                        describe_port_owner(detect_port_owner("tcp", port))
+                    )
                 } else {
                     String::new()
                 };
@@ -2356,6 +2580,10 @@ fn insert_optional_bool(target: &mut HashMap<String, Value>, key: &str, value: O
     }
 }
 
+fn hectojoules_to_watt_hours(value: f64) -> f64 {
+    (value * 100.0) / 3600.0
+}
+
 fn video_status_message(status: &VideoPreviewStatus) -> &'static str {
     match status {
         VideoPreviewStatus::Idle => "Video idle",
@@ -2390,7 +2618,13 @@ fn resolve_vlc_executable(app: &AppHandle) -> Option<PathBuf> {
     }
 
     if let Ok(current_dir) = std::env::current_dir() {
-        candidates.push(current_dir.join("src-tauri").join("resources").join("vlc").join("vlc.exe"));
+        candidates.push(
+            current_dir
+                .join("src-tauri")
+                .join("resources")
+                .join("vlc")
+                .join("vlc.exe"),
+        );
         candidates.push(current_dir.join("resources").join("vlc").join("vlc.exe"));
     }
 
@@ -2450,11 +2684,7 @@ fn vlc_sout_file_path(path: &Path) -> String {
 }
 
 fn build_vlc_sout(preview_http_port: u16, recording_mp4_path: Option<&Path>) -> String {
-    let preview_dst = format!(
-        ":{}{}",
-        preview_http_port,
-        VIDEO_PREVIEW_PATH
-    );
+    let preview_dst = format!(":{}{}", preview_http_port, VIDEO_PREVIEW_PATH);
     let preview_branch = format!(
         "transcode{{vcodec=MJPG,vb=24000,fps=15,scale=1,acodec=none}}:standard{{access=http{{mime=multipart/x-mixed-replace;boundary=--frame}},mux=mpjpeg,dst={preview_dst}}}"
     );
@@ -2511,9 +2741,12 @@ fn spawn_vlc_preview_process(
 }
 
 fn allocate_loopback_port() -> Result<u16, String> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|error| error.to_string())?;
-    let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
     drop(listener);
     Ok(port)
 }
@@ -2645,11 +2878,7 @@ fn describe_port_owner(owner_pid: Option<u32>) -> String {
     }
 }
 
-async fn monitor_preview_stream(
-    runtime: Arc<AppRuntime>,
-    app: &AppHandle,
-    preview_http_port: u16,
-) {
+async fn monitor_preview_stream(runtime: Arc<AppRuntime>, app: &AppHandle, preview_http_port: u16) {
     let request = preview_stream_request(preview_http_port);
     let mut read_buffer = vec![0_u8; 65_536];
     let mut stream_buffer = Vec::with_capacity(262_144);
@@ -2699,6 +2928,375 @@ async fn monitor_preview_stream(
     }
 }
 
+async fn serve_direct_video_websocket(
+    listener: TcpListener,
+    video_sender: broadcast::Sender<Vec<u8>>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    loop {
+        let (stream, _) = tokio::select! {
+            _ = shutdown.recv() => break,
+            accept_result = listener.accept() => match accept_result {
+                Ok(parts) => parts,
+                Err(_) => break,
+            }
+        };
+
+        let mut video_receiver = video_sender.subscribe();
+        tauri::async_runtime::spawn(async move {
+            let websocket = match accept_async(stream).await {
+                Ok(socket) => socket,
+                Err(_) => return,
+            };
+            let (mut writer, mut reader) = websocket.split();
+
+            loop {
+                tokio::select! {
+                    frame = video_receiver.recv() => {
+                        match frame {
+                            Ok(frame) => {
+                                if writer.send(Message::Binary(frame.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                continue;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    inbound = reader.next() => {
+                        match inbound {
+                            Some(Ok(Message::Close(_))) | None => break,
+                            Some(Ok(Message::Ping(payload))) => {
+                                if writer.send(Message::Pong(payload)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Err(_)) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+async fn receive_direct_rtp_video(
+    runtime: Arc<AppRuntime>,
+    app: &AppHandle,
+    socket: UdpSocket,
+    video_sender: broadcast::Sender<Vec<u8>>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    let mut packet_buffer = vec![0_u8; 65_536];
+    let mut depacketizer = RtpH264Depacketizer::default();
+
+    loop {
+        let size = tokio::select! {
+            _ = shutdown.recv() => break,
+            recv_result = socket.recv(&mut packet_buffer) => match recv_result {
+                Ok(size) => size,
+                Err(error) => {
+                    runtime
+                        .push_warning(app, format!("Live video RTP receiver failed: {error}"))
+                        .await;
+                    break;
+                }
+            }
+        };
+
+        for access_unit in depacketizer.push_rtp_packet(&packet_buffer[..size]) {
+            let _ = video_sender.send(access_unit);
+            runtime.register_preview_activity(app).await;
+        }
+    }
+}
+
+#[derive(Default)]
+struct RtpH264Depacketizer {
+    expected_sequence: Option<u16>,
+    current_access_unit: PendingAccessUnit,
+    fragmented_nal: Option<FragmentedNal>,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    waiting_for_keyframe: bool,
+}
+
+#[derive(Default)]
+struct PendingAccessUnit {
+    timestamp: Option<u32>,
+    nalus: Vec<Vec<u8>>,
+    damaged: bool,
+}
+
+struct FragmentedNal {
+    timestamp: u32,
+    data: Vec<u8>,
+    damaged: bool,
+}
+
+struct RtpPacket {
+    marker: bool,
+    sequence: u16,
+    timestamp: u32,
+    payload: Vec<u8>,
+}
+
+impl RtpH264Depacketizer {
+    fn push_rtp_packet(&mut self, packet: &[u8]) -> Vec<Vec<u8>> {
+        let Some(packet) = parse_rtp_packet(packet) else {
+            return Vec::new();
+        };
+
+        if let Some(expected_sequence) = self.expected_sequence {
+            if packet.sequence != expected_sequence {
+                self.mark_packet_loss();
+            }
+        }
+        self.expected_sequence = Some(packet.sequence.wrapping_add(1));
+
+        self.push_h264_payload(packet.timestamp, packet.marker, &packet.payload)
+    }
+
+    fn push_h264_payload(&mut self, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<Vec<u8>> {
+        let Some((&nal_header, rest)) = payload.split_first() else {
+            return Vec::new();
+        };
+        let nal_type = nal_header & 0x1f;
+
+        match nal_type {
+            1..=23 => self.push_complete_nal(timestamp, marker, payload.to_vec()),
+            24 => self.push_stap_a(timestamp, marker, rest),
+            28 => self.push_fu_a(timestamp, marker, nal_header, rest),
+            _ => {
+                self.mark_packet_loss();
+                Vec::new()
+            }
+        }
+    }
+
+    fn push_complete_nal(&mut self, timestamp: u32, marker: bool, nal: Vec<u8>) -> Vec<Vec<u8>> {
+        let mut output = Vec::new();
+        if self.current_access_unit.timestamp.is_some()
+            && self.current_access_unit.timestamp != Some(timestamp)
+        {
+            if let Some(access_unit) = self.finish_access_unit() {
+                output.push(access_unit);
+            }
+        }
+
+        self.cache_parameter_set(&nal);
+        self.current_access_unit.timestamp = Some(timestamp);
+        self.current_access_unit.nalus.push(nal);
+
+        if marker {
+            if let Some(access_unit) = self.finish_access_unit() {
+                output.push(access_unit);
+            }
+        }
+
+        output
+    }
+
+    fn push_stap_a(&mut self, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<Vec<u8>> {
+        let mut offset = 0;
+        let mut nalus = Vec::new();
+        while offset + 2 <= payload.len() {
+            let size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+            offset += 2;
+            if size == 0 || offset + size > payload.len() {
+                self.mark_packet_loss();
+                return Vec::new();
+            }
+            nalus.push(payload[offset..offset + size].to_vec());
+            offset += size;
+        }
+
+        let mut output = Vec::new();
+        let last_index = nalus.len().saturating_sub(1);
+        for (index, nal) in nalus.into_iter().enumerate() {
+            output.extend(self.push_complete_nal(timestamp, marker && index == last_index, nal));
+        }
+        output
+    }
+
+    fn push_fu_a(
+        &mut self,
+        timestamp: u32,
+        marker: bool,
+        fu_indicator: u8,
+        payload: &[u8],
+    ) -> Vec<Vec<u8>> {
+        let Some((&fu_header, fragment_payload)) = payload.split_first() else {
+            self.mark_packet_loss();
+            return Vec::new();
+        };
+        let start = fu_header & 0x80 != 0;
+        let end = fu_header & 0x40 != 0;
+        let nal_type = fu_header & 0x1f;
+
+        if start {
+            let reconstructed_header = (fu_indicator & 0xe0) | nal_type;
+            let mut data = Vec::with_capacity(fragment_payload.len() + 1);
+            data.push(reconstructed_header);
+            data.extend_from_slice(fragment_payload);
+            self.fragmented_nal = Some(FragmentedNal {
+                timestamp,
+                data,
+                damaged: false,
+            });
+            return Vec::new();
+        }
+
+        let Some(fragment) = self.fragmented_nal.as_mut() else {
+            self.mark_packet_loss();
+            return Vec::new();
+        };
+
+        if fragment.timestamp != timestamp {
+            self.mark_packet_loss();
+            return Vec::new();
+        }
+
+        fragment.data.extend_from_slice(fragment_payload);
+        if !end {
+            return Vec::new();
+        }
+
+        let Some(fragment) = self.fragmented_nal.take() else {
+            self.mark_packet_loss();
+            return Vec::new();
+        };
+        if fragment.damaged {
+            self.current_access_unit.damaged = true;
+            return Vec::new();
+        }
+
+        self.push_complete_nal(timestamp, marker, fragment.data)
+    }
+
+    fn finish_access_unit(&mut self) -> Option<Vec<u8>> {
+        let access_unit = std::mem::take(&mut self.current_access_unit);
+        if access_unit.nalus.is_empty() || access_unit.damaged {
+            self.waiting_for_keyframe = true;
+            return None;
+        }
+
+        let has_idr = access_unit.nalus.iter().any(|nal| nal_type(nal) == Some(5));
+        let has_sps = access_unit.nalus.iter().any(|nal| nal_type(nal) == Some(7));
+        let has_pps = access_unit.nalus.iter().any(|nal| nal_type(nal) == Some(8));
+        let has_config = (has_sps && has_pps) || (self.sps.is_some() && self.pps.is_some());
+
+        if self.waiting_for_keyframe && (!has_idr || !has_config) {
+            return None;
+        }
+        if has_idr && !has_config {
+            self.waiting_for_keyframe = true;
+            return None;
+        }
+
+        let mut output = Vec::new();
+        if has_idr {
+            if !has_sps {
+                if let Some(sps) = &self.sps {
+                    append_annex_b_nal(&mut output, sps);
+                }
+            }
+            if !has_pps {
+                if let Some(pps) = &self.pps {
+                    append_annex_b_nal(&mut output, pps);
+                }
+            }
+            self.waiting_for_keyframe = false;
+        }
+
+        for nal in access_unit.nalus {
+            append_annex_b_nal(&mut output, &nal);
+        }
+
+        Some(output)
+    }
+
+    fn cache_parameter_set(&mut self, nal: &[u8]) {
+        match nal_type(nal) {
+            Some(7) => self.sps = Some(nal.to_vec()),
+            Some(8) => self.pps = Some(nal.to_vec()),
+            _ => {}
+        }
+    }
+
+    fn mark_packet_loss(&mut self) {
+        self.current_access_unit.damaged = true;
+        if let Some(fragment) = self.fragmented_nal.as_mut() {
+            fragment.damaged = true;
+        }
+        self.waiting_for_keyframe = true;
+    }
+}
+
+fn parse_rtp_packet(packet: &[u8]) -> Option<RtpPacket> {
+    if packet.len() < 12 || packet[0] >> 6 != 2 {
+        return None;
+    }
+
+    let padding = packet[0] & 0x20 != 0;
+    let extension = packet[0] & 0x10 != 0;
+    let csrc_count = (packet[0] & 0x0f) as usize;
+    let marker = packet[1] & 0x80 != 0;
+    let sequence = u16::from_be_bytes([packet[2], packet[3]]);
+    let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+    let mut payload_offset = 12 + csrc_count * 4;
+
+    if packet.len() < payload_offset {
+        return None;
+    }
+
+    if extension {
+        if packet.len() < payload_offset + 4 {
+            return None;
+        }
+        let extension_words =
+            u16::from_be_bytes([packet[payload_offset + 2], packet[payload_offset + 3]]) as usize;
+        payload_offset += 4 + extension_words * 4;
+    }
+
+    if packet.len() <= payload_offset {
+        return None;
+    }
+
+    let payload_end = if padding {
+        let padding_len = *packet.last()? as usize;
+        if padding_len == 0 || padding_len >= packet.len().saturating_sub(payload_offset) {
+            return None;
+        }
+        packet.len() - padding_len
+    } else {
+        packet.len()
+    };
+
+    if payload_end <= payload_offset {
+        return None;
+    }
+
+    Some(RtpPacket {
+        marker,
+        sequence,
+        timestamp,
+        payload: packet[payload_offset..payload_end].to_vec(),
+    })
+}
+
+fn nal_type(nal: &[u8]) -> Option<u8> {
+    nal.first().map(|header| header & 0x1f)
+}
+
+fn append_annex_b_nal(output: &mut Vec<u8>, nal: &[u8]) {
+    output.extend_from_slice(&[0, 0, 0, 1]);
+    output.extend_from_slice(nal);
+}
+
 fn extract_latest_jpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let mut latest_frame = None;
     while let Some(frame) = extract_next_jpeg_frame(buffer) {
@@ -2708,7 +3306,9 @@ fn extract_latest_jpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
 }
 
 fn extract_next_jpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let start = buffer.windows(2).position(|window| window == [0xFF, 0xD8])?;
+    let start = buffer
+        .windows(2)
+        .position(|window| window == [0xFF, 0xD8])?;
     if start > 0 {
         buffer.drain(..start);
     }
@@ -2853,7 +3453,10 @@ fn is_error_status(status: &str) -> bool {
 }
 
 fn generate_session_name(timestamp: DateTime<Utc>) -> String {
-    format!("Flight {}", timestamp.with_timezone(&Local).format("%b %-d, %Y %H:%M"))
+    format!(
+        "Flight {}",
+        timestamp.with_timezone(&Local).format("%b %-d, %Y %H:%M")
+    )
 }
 
 fn normalize_required_name(value: Option<String>, fallback: &str) -> String {

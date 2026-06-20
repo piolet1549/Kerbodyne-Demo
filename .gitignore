@@ -1,6 +1,7 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/target-codex-check*/
 src-tauri/resources/gstreamer/
 src-tauri/resources/vlc/
 *.log

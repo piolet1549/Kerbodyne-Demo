@@ -1,11 +1,11 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 use crate::models::{
     AlertRecord, AppConfig, MapAlertSector, MissionSession, ReplayFrame, SessionVideoClip,
     SystemStatusRecord, TrackPointRecord,
 };
+use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -22,7 +22,10 @@ impl Database {
     }
 
     fn initialize(&self) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
 
         connection
             .execute_batch(
@@ -126,7 +129,10 @@ impl Database {
     }
 
     pub fn load_config(&self) -> Result<Option<AppConfig>, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         let raw: Option<String> = connection
             .query_row(
                 "SELECT value FROM app_meta WHERE key = 'config'",
@@ -136,12 +142,17 @@ impl Database {
             .optional()
             .map_err(|error| error.to_string())?;
 
-        raw.map(|value| serde_json::from_str::<AppConfig>(&value).map_err(|error| error.to_string()))
-            .transpose()
+        raw.map(|value| {
+            serde_json::from_str::<AppConfig>(&value).map_err(|error| error.to_string())
+        })
+        .transpose()
     }
 
     pub fn save_config(&self, config: &AppConfig) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         let raw = serde_json::to_string(config).map_err(|error| error.to_string())?;
         connection
             .execute(
@@ -154,7 +165,10 @@ impl Database {
     }
 
     pub fn load_sessions(&self, limit: usize) -> Result<Vec<MissionSession>, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         let mut statement = connection
             .prepare(
                 "SELECT id, name, description, aircraft_id, source, started_at, ended_at, event_count, alert_count
@@ -190,7 +204,10 @@ impl Database {
     }
 
     pub fn close_active_sessions(&self, ended_at: &str) -> Result<usize, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
                 "UPDATE sessions SET ended_at = ?1 WHERE ended_at IS NULL",
@@ -200,7 +217,10 @@ impl Database {
     }
 
     pub fn delete_empty_sessions(&self) -> Result<usize, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
                 "DELETE FROM sessions
@@ -212,7 +232,10 @@ impl Database {
     }
 
     pub fn load_alerts_for_session(&self, session_id: &str) -> Result<Vec<AlertRecord>, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         let mut statement = connection
             .prepare(
                 "SELECT id, session_id, aircraft_id, class_label, confidence, detected_at, alt_msl_m,
@@ -259,7 +282,10 @@ impl Database {
         &self,
         session_id: &str,
     ) -> Result<Vec<SystemStatusRecord>, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         let mut statement = connection
             .prepare(
                 "SELECT id, session_id, aircraft_id, status, message, reported_at, lat, lon, alt_msl_m,
@@ -295,7 +321,10 @@ impl Database {
     }
 
     pub fn upsert_session(&self, session: &MissionSession) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
                 "INSERT INTO sessions (id, name, description, aircraft_id, source, started_at, ended_at, event_count, alert_count)
@@ -331,7 +360,10 @@ impl Database {
         event_count: u32,
         alert_count: u32,
     ) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
                 "UPDATE sessions SET event_count = ?2, alert_count = ?3 WHERE id = ?1",
@@ -342,7 +374,10 @@ impl Database {
     }
 
     pub fn end_session(&self, session_id: &str, ended_at: &str) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
                 "UPDATE sessions SET ended_at = ?2 WHERE id = ?1",
@@ -358,7 +393,10 @@ impl Database {
         name: &str,
         description: Option<&str>,
     ) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
                 "UPDATE sessions SET name = ?2, description = ?3 WHERE id = ?1",
@@ -369,8 +407,12 @@ impl Database {
     }
 
     pub fn insert_alert(&self, alert: &AlertRecord, raw_json: &str) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
-        let extras_json = serde_json::to_string(&alert.extras).map_err(|error| error.to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
+        let extras_json =
+            serde_json::to_string(&alert.extras).map_err(|error| error.to_string())?;
 
         connection
             .execute(
@@ -408,7 +450,10 @@ impl Database {
         status: &SystemStatusRecord,
         raw_json: &str,
     ) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         let extras_json =
             serde_json::to_string(&status.extras).map_err(|error| error.to_string())?;
 
@@ -448,7 +493,10 @@ impl Database {
         heading_deg: Option<f64>,
         groundspeed_mps: Option<f64>,
     ) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
                 "INSERT INTO track_points (
@@ -469,7 +517,10 @@ impl Database {
     }
 
     pub fn load_track(&self, session_id: &str) -> Result<Vec<TrackPointRecord>, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         let mut statement = connection
             .prepare(
                 "SELECT recorded_at, lat, lon, alt_msl_m, heading_deg, groundspeed_mps
@@ -502,7 +553,10 @@ impl Database {
         sent_at: &str,
         envelope_json: &str,
     ) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
                 "INSERT INTO replay_events (session_id, sent_at, envelope_json) VALUES (?1, ?2, ?3)",
@@ -513,7 +567,10 @@ impl Database {
     }
 
     pub fn load_replay_events(&self, session_id: &str) -> Result<Vec<ReplayFrame>, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         let mut statement = connection
             .prepare(
                 "SELECT envelope_json
@@ -536,7 +593,10 @@ impl Database {
     }
 
     pub fn session_has_armed_replay_events(&self, session_id: &str) -> Result<bool, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .query_row(
                 "SELECT EXISTS(
@@ -554,7 +614,10 @@ impl Database {
     }
 
     pub fn upsert_session_video_clip(&self, clip: &SessionVideoClip) -> Result<(), String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
                 "INSERT INTO session_video_clips (
@@ -593,7 +656,10 @@ impl Database {
         &self,
         session_id: &str,
     ) -> Result<Vec<SessionVideoClip>, String> {
-        let connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
         let mut statement = connection
             .prepare(
                 "SELECT id, session_id, file_path, started_at, ended_at, duration_ms, width, height, fps, codec, bytes
@@ -626,11 +692,18 @@ impl Database {
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<(Vec<String>, Vec<String>), String> {
-        let mut connection = self.connection.lock().map_err(|_| "database mutex poisoned".to_string())?;
-        let transaction = connection.transaction().map_err(|error| error.to_string())?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
 
         let mut statement = transaction
-            .prepare("SELECT image_path FROM alerts WHERE session_id = ?1 AND image_path IS NOT NULL")
+            .prepare(
+                "SELECT image_path FROM alerts WHERE session_id = ?1 AND image_path IS NOT NULL",
+            )
             .map_err(|error| error.to_string())?;
         let image_paths = statement
             .query_map([session_id], |row| row.get::<_, String>(0))
@@ -650,7 +723,10 @@ impl Database {
         drop(statement);
 
         transaction
-            .execute("DELETE FROM alerts WHERE session_id = ?1", params![session_id])
+            .execute(
+                "DELETE FROM alerts WHERE session_id = ?1",
+                params![session_id],
+            )
             .map_err(|error| error.to_string())?;
         transaction
             .execute(
@@ -659,13 +735,22 @@ impl Database {
             )
             .map_err(|error| error.to_string())?;
         transaction
-            .execute("DELETE FROM track_points WHERE session_id = ?1", params![session_id])
+            .execute(
+                "DELETE FROM track_points WHERE session_id = ?1",
+                params![session_id],
+            )
             .map_err(|error| error.to_string())?;
         transaction
-            .execute("DELETE FROM replay_events WHERE session_id = ?1", params![session_id])
+            .execute(
+                "DELETE FROM replay_events WHERE session_id = ?1",
+                params![session_id],
+            )
             .map_err(|error| error.to_string())?;
         transaction
-            .execute("DELETE FROM session_video_clips WHERE session_id = ?1", params![session_id])
+            .execute(
+                "DELETE FROM session_video_clips WHERE session_id = ?1",
+                params![session_id],
+            )
             .map_err(|error| error.to_string())?;
         transaction
             .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
@@ -674,7 +759,6 @@ impl Database {
 
         Ok((image_paths, video_paths))
     }
-
 }
 
 fn session_storage_bytes(connection: &Connection, session_id: &str) -> Result<u64, SqlError> {
@@ -712,9 +796,8 @@ fn session_storage_bytes(connection: &Connection, session_id: &str) -> Result<u6
     }
 
     let mut video_bytes = 0u64;
-    let mut statement = connection.prepare(
-        "SELECT file_path, bytes FROM session_video_clips WHERE session_id = ?1",
-    )?;
+    let mut statement = connection
+        .prepare("SELECT file_path, bytes FROM session_video_clips WHERE session_id = ?1")?;
     let video_entries = statement.query_map([session_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
