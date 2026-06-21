@@ -435,6 +435,7 @@ export function App() {
   const previousActiveSessionIdRef = useRef<string | null>(null);
   const previousActiveFlightRef = useRef(false);
   const latestVisionStatusIdRef = useRef<string | null>(null);
+  const previousVisionActiveRef = useRef<boolean | null>(null);
   const lowSpeedLandingTimerRef = useRef<number | null>(null);
 
   const deferredAlerts = useDeferredValue(snapshot.alerts);
@@ -682,6 +683,10 @@ export function App() {
     }
 
   function handleFlightNotificationAction(notification: FlightNotificationRecord, action: 'open' | 'dismiss') {
+    if (!notification.actionType) {
+      dismissFlightNotification(notification.id);
+      return;
+    }
     if (notification.actionType === 'open-detections' && action === 'open') {
       setUnacknowledgedDetectionIds([]);
       openDetectionPanel();
@@ -1221,14 +1226,23 @@ export function App() {
       setVisionStartupConfirmed(false);
       setVisionStopAcknowledged(false);
       latestVisionStatusIdRef.current = null;
+      previousVisionActiveRef.current = null;
     }
   }, [activeFlight]);
 
   useEffect(() => {
+    if (!activeFlight) {
+      return;
+    }
+
+    const linkHealthy = flightHasReceivedConnection && snapshot.connection.status !== 'stale';
+    const previousVisionActive = previousVisionActiveRef.current;
+
     if (visionActive === true) {
       if (visionStopAcknowledged) {
         return;
       }
+      previousVisionActiveRef.current = true;
       if (visionCommandState !== 'stopping') {
         setVisionStopAcknowledged(false);
       }
@@ -1236,17 +1250,50 @@ export function App() {
       if (visionCommandState === 'starting') {
         setVisionCommandState('idle');
       }
+      dismissFlightNotification('vision:pipeline-failed');
       return;
     }
 
     if (visionActive === false) {
+      if (visionCommandState === 'starting') {
+        return;
+      }
+
+      if (visionStartupConfirmed && previousVisionActive !== true) {
+        return;
+      }
+
+      if (visionCommandState === 'stopping') {
+        previousVisionActiveRef.current = false;
+        setVisionCommandState('idle');
+        setVisionStartupConfirmed(false);
+        setVisionStopAcknowledged(true);
+        return;
+      }
+
+      if (previousVisionActive === true && linkHealthy && !visionStopAcknowledged) {
+        upsertFlightNotification({
+          id: 'vision:pipeline-failed',
+          message: 'Vision pipeline stopped unexpectedly',
+          severity: 'warning',
+          persistent: true,
+          dismissLabel: 'Dismiss'
+        });
+      }
+
+      previousVisionActiveRef.current = false;
       setVisionStartupConfirmed(false);
       setVisionStopAcknowledged(false);
-      if (visionCommandState === 'stopping') {
-        setVisionCommandState('idle');
-      }
     }
-  }, [visionActive, visionCommandState, visionStopAcknowledged]);
+  }, [
+    activeFlight,
+    flightHasReceivedConnection,
+    snapshot.connection.status,
+    visionActive,
+    visionCommandState,
+    visionStartupConfirmed,
+    visionStopAcknowledged
+  ]);
 
   useEffect(() => {
     if (!activeFlight) {
@@ -1266,12 +1313,22 @@ export function App() {
     if (normalized === 'STARTUP_SUCCESS') {
       setVisionStartupConfirmed(true);
       setVisionCommandState('idle');
+      setVisionStopAcknowledged(false);
+      dismissFlightNotification('vision:pipeline-failed');
       return;
     }
 
-    if (visionCommandState === 'starting' && (normalized.includes('ERROR') || normalized.includes('FAIL'))) {
+    if (normalized.includes('ERROR') || normalized.includes('FAIL')) {
       setVisionStartupConfirmed(false);
       setVisionCommandState('idle');
+      setVisionStopAcknowledged(false);
+      upsertFlightNotification({
+        id: 'vision:pipeline-failed',
+        message: visionCommandState === 'starting' ? 'Vision failed to start' : 'Vision pipeline reported a failure',
+        severity: 'warning',
+        persistent: true,
+        dismissLabel: 'Dismiss'
+      });
     }
   }, [activeFlight, snapshot.system_statuses, visionCommandState]);
 
@@ -1281,8 +1338,27 @@ export function App() {
     }
 
     const timeoutId = window.setTimeout(() => {
+      const timedOutState = visionCommandState;
       setVisionCommandState('idle');
-    }, 12000);
+      if (timedOutState === 'starting') {
+        setVisionStartupConfirmed(false);
+        upsertFlightNotification({
+          id: 'vision:pipeline-failed',
+          message: 'Vision startup timed out',
+          severity: 'warning',
+          persistent: true,
+          dismissLabel: 'Dismiss'
+        });
+      } else if (timedOutState === 'stopping') {
+        upsertFlightNotification({
+          id: 'vision:command-timeout',
+          message: 'Vision stop command timed out',
+          severity: 'warning',
+          persistent: true,
+          dismissLabel: 'Dismiss'
+        });
+      }
+    }, 30000);
 
     return () => window.clearTimeout(timeoutId);
   }, [visionCommandState]);
@@ -1296,9 +1372,13 @@ export function App() {
     setVisionCommandState(enable ? 'starting' : 'stopping');
     if (enable) {
       setVisionStopAcknowledged(false);
+      setVisionStartupConfirmed(false);
+      dismissFlightNotification('vision:pipeline-failed');
+      dismissFlightNotification('vision:command-timeout');
     }
     if (!enable) {
-      setVisionStartupConfirmed(false);
+      setVisionStopAcknowledged(false);
+      dismissFlightNotification('vision:command-timeout');
     }
 
     void runCommand(async () => {
@@ -1310,15 +1390,18 @@ export function App() {
           return;
         }
         if (!enable) {
-          setVisionCommandState('idle');
-          setVisionStartupConfirmed(false);
-          setVisionStopAcknowledged(true);
           if (/not\s+running/i.test(response)) {
+            setVisionCommandState('idle');
             setVisionStartupConfirmed(false);
+            setVisionStopAcknowledged(true);
+            previousVisionActiveRef.current = false;
           }
         }
       } catch (error) {
         setVisionCommandState('idle');
+        if (enable) {
+          setVisionStartupConfirmed(false);
+        }
         throw error;
       }
     });
@@ -1327,7 +1410,7 @@ export function App() {
   const visionControl = activeFlight
     ? {
         label: !visionLinkAvailable
-          ? 'VISION NA'
+          ? 'UNAVAILABLE'
           : visionCommandState === 'starting'
             ? 'STARTING'
             : visionCommandState === 'stopping'

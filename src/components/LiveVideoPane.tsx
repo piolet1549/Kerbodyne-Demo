@@ -13,7 +13,7 @@ function statusLabel(status: VideoPreviewState['status']) {
     case 'waiting_for_stream':
       return 'Waiting for feed';
     case 'waiting_for_keyframe':
-      return 'Waiting for feed';
+      return 'Waiting for keyframe';
     case 'live':
       return 'Live video';
     case 'recording':

@@ -497,8 +497,9 @@ button {
   flex: 0 0 auto;
   height: 56px;
   min-height: 56px;
-  min-width: 108px;
-  padding: 0 14px;
+  width: 132px;
+  min-width: 132px;
+  padding: 0 10px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -582,13 +583,15 @@ button {
 }
 
 .telemetry-hud__vision-indicator--active {
-  border-color: rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.03);
-  color: var(--muted);
-  box-shadow: none;
+  border-color: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.94);
+  color: #090909;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.16),
+    0 0 18px rgba(255, 255, 255, 0.18);
 }
 
-.telemetry-hud__vision-indicator--busy {
+.telemetry-hud__vision-indicator--busy:not(.telemetry-hud__vision-indicator--active) {
   color: var(--muted);
 }
 

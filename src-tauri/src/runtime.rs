@@ -15,7 +15,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     process::{Child, Command},
     sync::{broadcast, watch, Mutex, RwLock},
-    time::{sleep, timeout, Duration},
+    time::{sleep, timeout, Duration, Instant},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
@@ -57,6 +57,7 @@ const VIDEO_PREVIEW_PATH: &str = "/live.mjpg";
 const APP_VIDEO_PREVIEW_FRAME_PATH: &str = "/__preview__/live.jpg";
 const DIRECT_VIDEO_WS_PATH: &str = "/live.h264";
 const DIRECT_VIDEO_CHANNEL_CAPACITY: usize = 12;
+const DIRECT_VIDEO_STATS_INTERVAL_MS: u64 = 750;
 const VLC_HTTP_PROBE_INTERVAL_MS: u64 = 300;
 const VLC_HTTP_PROBE_TIMEOUT_MS: u64 = 2200;
 const VLC_SHUTDOWN_TIMEOUT_SECS: u64 = 8;
@@ -310,6 +311,16 @@ struct RecordingRunState {
     mp4_path: PathBuf,
 }
 
+#[derive(Clone, Default)]
+struct DirectVideoStats {
+    started_at: Option<DateTime<Utc>>,
+    last_packet_at: Option<DateTime<Utc>>,
+    last_packet_source: Option<String>,
+    packet_count: u64,
+    access_unit_count: u64,
+    waiting_for_keyframe: bool,
+}
+
 #[derive(Default)]
 struct VideoRuntimeState {
     preview_monitor_handle: Option<tauri::async_runtime::JoinHandle<()>>,
@@ -319,6 +330,7 @@ struct VideoRuntimeState {
     preview_child: Option<Child>,
     recording: Option<RecordingRunState>,
     last_preview_frame_at: Option<DateTime<Utc>>,
+    direct_stats: DirectVideoStats,
     direct_ws_port: Option<u16>,
     preview_http_port: Option<u16>,
     sdp_path: Option<PathBuf>,
@@ -1331,7 +1343,13 @@ impl AppRuntime {
 
     async fn refresh_video_health(&self, app: &AppHandle) -> bool {
         let mut exited_log_path = None;
-        let (preview_running, last_preview_frame_at, recording_active) = {
+        let (
+            preview_running,
+            direct_running,
+            last_preview_frame_at,
+            recording_active,
+            direct_stats,
+        ) = {
             let mut runtime = self.video_runtime.lock().await;
             if let Some(child) = runtime.preview_child.as_mut() {
                 match child.try_wait() {
@@ -1370,8 +1388,10 @@ impl AppRuntime {
 
             (
                 runtime.preview_child.is_some() || direct_running,
+                direct_running,
                 runtime.last_preview_frame_at,
                 runtime.recording.is_some(),
+                runtime.direct_stats.clone(),
             )
         };
 
@@ -1384,25 +1404,61 @@ impl AppRuntime {
         }
 
         let mut preview = self.video_preview.write().await;
-        let next_status = if !preview_running {
+        let (next_status, next_message) = if !preview_running {
             if preview.preview_url.is_some() {
-                VideoPreviewStatus::Error
+                (
+                    VideoPreviewStatus::Error,
+                    video_status_message(&VideoPreviewStatus::Error).to_string(),
+                )
             } else {
-                VideoPreviewStatus::Idle
+                (
+                    VideoPreviewStatus::Idle,
+                    video_status_message(&VideoPreviewStatus::Idle).to_string(),
+                )
             }
         } else if let Some(last_frame) = last_preview_frame_at {
             if (Utc::now() - last_frame).num_seconds() > VIDEO_STALE_AFTER_SECS {
-                VideoPreviewStatus::Stale
+                (
+                    VideoPreviewStatus::Stale,
+                    video_status_message(&VideoPreviewStatus::Stale).to_string(),
+                )
             } else if recording_active {
-                VideoPreviewStatus::Recording
+                (
+                    VideoPreviewStatus::Recording,
+                    video_status_message(&VideoPreviewStatus::Recording).to_string(),
+                )
             } else {
-                VideoPreviewStatus::Live
+                (
+                    VideoPreviewStatus::Live,
+                    video_status_message(&VideoPreviewStatus::Live).to_string(),
+                )
+            }
+        } else if direct_running && direct_stats.last_packet_at.is_some() {
+            let packet_age_seconds = direct_stats
+                .last_packet_at
+                .map(|last_packet| (Utc::now() - last_packet).num_seconds())
+                .unwrap_or_default();
+            if packet_age_seconds > VIDEO_STALE_AFTER_SECS {
+                (
+                    VideoPreviewStatus::Stale,
+                    format!(
+                        "Video packets stopped after {} RTP packets",
+                        direct_stats.packet_count
+                    ),
+                )
+            } else {
+                (
+                    VideoPreviewStatus::WaitingForKeyframe,
+                    direct_video_waiting_message(&direct_stats),
+                )
             }
         } else {
-            VideoPreviewStatus::WaitingForStream
+            (
+                VideoPreviewStatus::WaitingForStream,
+                video_status_message(&VideoPreviewStatus::WaitingForStream).to_string(),
+            )
         };
 
-        let next_message = video_status_message(&next_status).to_string();
         let changed = preview.status != next_status
             || preview.message.as_deref() != Some(next_message.as_str())
             || preview.recording_active != recording_active;
@@ -1486,6 +1542,7 @@ impl AppRuntime {
         runtime.direct_ws_port = None;
         runtime.preview_http_port = None;
         runtime.last_preview_frame_at = None;
+        runtime.direct_stats = DirectVideoStats::default();
         runtime.log_path = None;
     }
 
@@ -1553,6 +1610,11 @@ impl AppRuntime {
         runtime.direct_shutdown = Some(direct_shutdown);
         runtime.direct_ws_port = Some(ws_port);
         runtime.last_preview_frame_at = None;
+        runtime.direct_stats = DirectVideoStats {
+            started_at: Some(Utc::now()),
+            waiting_for_keyframe: true,
+            ..DirectVideoStats::default()
+        };
 
         Ok(())
     }
@@ -1771,6 +1833,11 @@ impl AppRuntime {
         let recording_active = {
             let mut runtime = self.video_runtime.lock().await;
             runtime.last_preview_frame_at = Some(Utc::now());
+            if runtime.direct_ingest_handle.is_some() {
+                runtime.direct_stats.access_unit_count =
+                    runtime.direct_stats.access_unit_count.saturating_add(1);
+                runtime.direct_stats.waiting_for_keyframe = false;
+            }
             runtime.recording.is_some()
         };
         {
@@ -1789,6 +1856,19 @@ impl AppRuntime {
         if should_emit {
             let _ = self.emit_snapshot(app).await;
         }
+    }
+
+    async fn update_direct_video_stats(
+        &self,
+        packet_count: u64,
+        last_packet_source: Option<String>,
+        waiting_for_keyframe: bool,
+    ) {
+        let mut runtime = self.video_runtime.lock().await;
+        runtime.direct_stats.packet_count = packet_count;
+        runtime.direct_stats.last_packet_at = Some(Utc::now());
+        runtime.direct_stats.last_packet_source = last_packet_source;
+        runtime.direct_stats.waiting_for_keyframe = waiting_for_keyframe;
     }
 
     async fn publish_preview_frame(&self, app: &AppHandle, frame: Vec<u8>) {
@@ -2587,12 +2667,35 @@ fn hectojoules_to_watt_hours(value: f64) -> f64 {
 fn video_status_message(status: &VideoPreviewStatus) -> &'static str {
     match status {
         VideoPreviewStatus::Idle => "Video idle",
-        VideoPreviewStatus::WaitingForStream => "Waiting for video stream",
-        VideoPreviewStatus::WaitingForKeyframe => "Waiting for keyframe",
+        VideoPreviewStatus::WaitingForStream => "Waiting for video packets on UDP 5600",
+        VideoPreviewStatus::WaitingForKeyframe => "Receiving video packets; waiting for keyframe",
         VideoPreviewStatus::Live => "Live video",
         VideoPreviewStatus::Recording => "Recording live video",
         VideoPreviewStatus::Stale => "Video stream stale",
         VideoPreviewStatus::Error => "Video unavailable",
+    }
+}
+
+fn direct_video_waiting_message(stats: &DirectVideoStats) -> String {
+    let source = stats
+        .last_packet_source
+        .as_deref()
+        .map(|source| format!(" from {source}"))
+        .unwrap_or_default();
+    let elapsed = stats
+        .started_at
+        .map(|started_at| (Utc::now() - started_at).num_seconds().max(0))
+        .unwrap_or_default();
+    if stats.waiting_for_keyframe {
+        format!(
+            "Receiving RTP{source}; waiting for H.264 keyframe ({}, {}s)",
+            stats.packet_count, elapsed
+        )
+    } else {
+        format!(
+            "Receiving RTP{source}; waiting for complete H.264 frame ({}, {}s)",
+            stats.packet_count, elapsed
+        )
     }
 }
 
@@ -2992,12 +3095,14 @@ async fn receive_direct_rtp_video(
 ) {
     let mut packet_buffer = vec![0_u8; 65_536];
     let mut depacketizer = RtpH264Depacketizer::default();
+    let mut packet_count = 0_u64;
+    let mut last_stats_update = Instant::now();
 
     loop {
-        let size = tokio::select! {
+        let (size, source) = tokio::select! {
             _ = shutdown.recv() => break,
-            recv_result = socket.recv(&mut packet_buffer) => match recv_result {
-                Ok(size) => size,
+            recv_result = socket.recv_from(&mut packet_buffer) => match recv_result {
+                Ok(parts) => parts,
                 Err(error) => {
                     runtime
                         .push_warning(app, format!("Live video RTP receiver failed: {error}"))
@@ -3007,6 +3112,21 @@ async fn receive_direct_rtp_video(
             }
         };
 
+        packet_count = packet_count.saturating_add(1);
+        let packet_source = Some(source.to_string());
+        if packet_count == 1
+            || last_stats_update.elapsed() >= Duration::from_millis(DIRECT_VIDEO_STATS_INTERVAL_MS)
+        {
+            runtime
+                .update_direct_video_stats(
+                    packet_count,
+                    packet_source,
+                    depacketizer.waiting_for_keyframe(),
+                )
+                .await;
+            last_stats_update = Instant::now();
+        }
+
         for access_unit in depacketizer.push_rtp_packet(&packet_buffer[..size]) {
             let _ = video_sender.send(access_unit);
             runtime.register_preview_activity(app).await;
@@ -3014,7 +3134,6 @@ async fn receive_direct_rtp_video(
     }
 }
 
-#[derive(Default)]
 struct RtpH264Depacketizer {
     expected_sequence: Option<u16>,
     current_access_unit: PendingAccessUnit,
@@ -3022,6 +3141,19 @@ struct RtpH264Depacketizer {
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
     waiting_for_keyframe: bool,
+}
+
+impl Default for RtpH264Depacketizer {
+    fn default() -> Self {
+        Self {
+            expected_sequence: None,
+            current_access_unit: PendingAccessUnit::default(),
+            fragmented_nal: None,
+            sps: None,
+            pps: None,
+            waiting_for_keyframe: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3045,6 +3177,10 @@ struct RtpPacket {
 }
 
 impl RtpH264Depacketizer {
+    fn waiting_for_keyframe(&self) -> bool {
+        self.waiting_for_keyframe
+    }
+
     fn push_rtp_packet(&mut self, packet: &[u8]) -> Vec<Vec<u8>> {
         let Some(packet) = parse_rtp_packet(packet) else {
             return Vec::new();
@@ -3052,7 +3188,7 @@ impl RtpH264Depacketizer {
 
         if let Some(expected_sequence) = self.expected_sequence {
             if packet.sequence != expected_sequence {
-                self.mark_packet_loss();
+                self.mark_sequence_gap(packet.timestamp);
             }
         }
         self.expected_sequence = Some(packet.sequence.wrapping_add(1));
@@ -3217,6 +3353,28 @@ impl RtpH264Depacketizer {
         }
 
         Some(output)
+    }
+
+    fn mark_sequence_gap(&mut self, next_timestamp: u32) {
+        let gap_is_before_next_frame = self
+            .current_access_unit
+            .timestamp
+            .map(|timestamp| timestamp != next_timestamp)
+            .unwrap_or(true)
+            && self
+                .fragmented_nal
+                .as_ref()
+                .map(|fragment| fragment.timestamp != next_timestamp)
+                .unwrap_or(true);
+
+        if gap_is_before_next_frame {
+            self.current_access_unit = PendingAccessUnit::default();
+            self.fragmented_nal = None;
+            self.waiting_for_keyframe = true;
+            return;
+        }
+
+        self.mark_packet_loss();
     }
 
     fn cache_parameter_set(&mut self, nal: &[u8]) {
@@ -3436,6 +3594,56 @@ fn review_frames_from_replay(frames: Vec<ReplayFrame>) -> Vec<ReviewTelemetryFra
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rtp_packet(sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(12 + payload.len());
+        packet.push(0x80);
+        packet.push(if marker { 0xe0 } else { 0x60 });
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&timestamp.to_be_bytes());
+        packet.extend_from_slice(&1_u32.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn direct_h264_waits_for_keyframe_before_output() {
+        let mut depacketizer = RtpH264Depacketizer::default();
+        let non_idr = rtp_packet(1, 100, true, &[0x41, 0x9a, 0x22]);
+        assert!(depacketizer.push_rtp_packet(&non_idr).is_empty());
+        assert!(depacketizer.waiting_for_keyframe());
+
+        let sps = rtp_packet(2, 200, false, &[0x67, 0x42, 0x00, 0x1f]);
+        let pps = rtp_packet(3, 200, false, &[0x68, 0xce, 0x06, 0xe2]);
+        let idr = rtp_packet(4, 200, true, &[0x65, 0x88, 0x84]);
+        assert!(depacketizer.push_rtp_packet(&sps).is_empty());
+        assert!(depacketizer.push_rtp_packet(&pps).is_empty());
+        let output = depacketizer.push_rtp_packet(&idr);
+        assert_eq!(output.len(), 1);
+        assert!(!depacketizer.waiting_for_keyframe());
+        assert!(output[0].windows(4).any(|window| window == [0, 0, 0, 1]));
+    }
+
+    #[test]
+    fn sequence_gap_does_not_poison_keyframe_on_new_timestamp() {
+        let mut depacketizer = RtpH264Depacketizer::default();
+        let non_idr = rtp_packet(1, 100, true, &[0x41, 0x9a, 0x22]);
+        assert!(depacketizer.push_rtp_packet(&non_idr).is_empty());
+
+        let sps = rtp_packet(5, 200, false, &[0x67, 0x42, 0x00, 0x1f]);
+        let pps = rtp_packet(6, 200, false, &[0x68, 0xce, 0x06, 0xe2]);
+        let idr = rtp_packet(7, 200, true, &[0x65, 0x88, 0x84]);
+        assert!(depacketizer.push_rtp_packet(&sps).is_empty());
+        assert!(depacketizer.push_rtp_packet(&pps).is_empty());
+        let output = depacketizer.push_rtp_packet(&idr);
+        assert_eq!(output.len(), 1);
+        assert!(!depacketizer.waiting_for_keyframe());
+    }
 }
 
 fn normalize_class_label(label: &str) -> String {
