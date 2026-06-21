@@ -7,8 +7,16 @@ declare module 'jmuxer' {
     maxDelay?: number;
     clearBuffer?: boolean;
     fps?: number;
+    live?: boolean;
+    readFpsFromTrack?: boolean;
     debug?: boolean;
+    onReady?: (isReset?: boolean) => void;
+    onData?: (data?: Uint8Array) => void;
     onError?: (error?: unknown) => void;
+    onUnsupportedCodec?: (codec?: string) => void;
+    onMissingVideoFrames?: () => void;
+    onLoggerLog?: (...args: unknown[]) => void;
+    onLoggerErr?: (...args: unknown[]) => void;
   }
 
   export interface JMuxerFeedData {

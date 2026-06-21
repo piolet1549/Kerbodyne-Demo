@@ -3666,9 +3666,24 @@ button {
 }
 
 .live-video-pane__status--stale,
-.live-video-pane__status--error {
+.live-video-pane__status--error,
+.live-video-pane__status--decoder-warning,
+.live-video-pane__status--decoder-error {
   border-color: rgba(255, 123, 69, 0.45);
   color: #ffd6c8;
+}
+
+.live-video-pane__status--decoder-info {
+  border-color: rgba(255, 255, 255, 0.18);
+  color: #f3f3f3;
+}
+
+.live-video-pane__status--decoder-warning {
+  background: rgba(32, 18, 8, 0.9);
+}
+
+.live-video-pane__status--decoder-error {
+  background: rgba(36, 6, 6, 0.9);
 }
 
 .flight-detections-button {
