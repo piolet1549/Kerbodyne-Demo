@@ -45,6 +45,7 @@ interface FlightNotificationRecord {
   actionLabel?: string;
   dismissLabel?: string;
   actionType?: 'open-detections' | 'dismiss-detection';
+  durationMs?: number;
   closing?: boolean;
 }
 
@@ -342,30 +343,6 @@ function buildMetricState(
   return { tone, color_hex: color_hex ?? null, pulse };
 }
 
-function findNearestFrameIndex(frames: AppSnapshot['review_frames'], timestamp: string) {
-  if (frames.length === 0) {
-    return 0;
-  }
-  const target = new Date(timestamp).getTime();
-  if (!Number.isFinite(target)) {
-    return frames.length - 1;
-  }
-  let bestIndex = 0;
-  let bestDistance = Number.POSITIVE_INFINITY;
-  frames.forEach((frame, index) => {
-    const current = new Date(frame.recorded_at).getTime();
-    if (!Number.isFinite(current)) {
-      return;
-    }
-    const distance = Math.abs(current - target);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      bestIndex = index;
-    }
-  });
-  return bestIndex;
-}
-
 export function App() {
   const measureToolbarHostRef = useRef<HTMLDivElement | null>(null);
   const rawTelemetryLogRef = useRef<HTMLDivElement | null>(null);
@@ -398,6 +375,12 @@ export function App() {
   const [alertDetailVisible, setAlertDetailVisible] = useState(false);
   const [activeFlightLayout, setActiveFlightLayout] = useState<'video-dominant' | 'map-dominant'>(
     'video-dominant'
+  );
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window === 'undefined' ? 1600 : window.innerWidth
+  );
+  const [viewportHeight, setViewportHeight] = useState(() =>
+    typeof window === 'undefined' ? 1000 : window.innerHeight
   );
   const [bannerMessage, setBannerMessage] = useState<string | null>(null);
   const [stopFlightOpen, setStopFlightOpen] = useState(false);
@@ -667,6 +650,7 @@ export function App() {
           existing.actionLabel === notification.actionLabel &&
           existing.dismissLabel === notification.dismissLabel &&
           existing.actionType === notification.actionType &&
+          existing.durationMs === notification.durationMs &&
           !existing.closing
         ) {
         return current;
@@ -678,7 +662,7 @@ export function App() {
       if (!notification.persistent) {
         notificationTimersRef.current[notification.id] = window.setTimeout(() => {
           dismissFlightNotification(notification.id);
-        }, 5000);
+        }, notification.durationMs ?? 5000);
       }
     }
 
@@ -690,6 +674,10 @@ export function App() {
     if (notification.actionType === 'open-detections' && action === 'open') {
       setUnacknowledgedDetectionIds([]);
       openDetectionPanel();
+      dismissFlightNotification(notification.id);
+      return;
+    }
+    if (notification.actionType === 'open-detections' && action === 'dismiss') {
       dismissFlightNotification(notification.id);
       return;
     }
@@ -810,12 +798,6 @@ export function App() {
           setSelectedAlertId((current) => {
             previousAlertCountRef.current = event.snapshot.alerts.length;
 
-            const mostRecent = findMostRecentAlert(event.snapshot.alerts);
-            if (!Boolean(event.snapshot.active_session_id) && mostRecent && event.snapshot.alerts.length > previousAlertCount) {
-              setAlertDetailVisible(true);
-              return mostRecent.id;
-            }
-
             if (!current) {
               return null;
             }
@@ -913,6 +895,35 @@ export function App() {
   const hasDetections = hasFlightContext && deferredAlerts.length > 0;
   const activeFlightHasDetections = activeFlight && deferredAlerts.length > 0;
   const activeFlightDetectionFlash = activeFlight && unacknowledgedDetectionIds.length > 0;
+  const activeDetectionDetailOpen = activeFlight && alertDetailVisible && Boolean(selectedAlert);
+  const reviewDetectionDetailOpen = reviewMode && alertDetailVisible && Boolean(selectedAlert);
+  const reviewExpandedHudOccluded =
+    reviewDetectionDetailOpen && (viewportWidth < 1180 || viewportHeight < 900);
+  const suppressExpandedHud = activeDetectionDetailOpen || reviewExpandedHudOccluded;
+  const visibleMapAlerts = useMemo(() => {
+    if (reviewMode) {
+      return reviewDetectionDetailOpen ? deferredAlerts : [];
+    }
+    if (activeFlight) {
+      if (activeDetectionDetailOpen) {
+        return deferredAlerts;
+      }
+      const unacknowledgedIds = new Set(unacknowledgedDetectionIds);
+      return deferredAlerts.filter((alert) => unacknowledgedIds.has(alert.id));
+    }
+    return deferredAlerts;
+  }, [
+    activeDetectionDetailOpen,
+    activeFlight,
+    deferredAlerts,
+    reviewDetectionDetailOpen,
+    reviewMode,
+    unacknowledgedDetectionIds
+  ]);
+  const visibleMapAlertIds = useMemo(
+    () => visibleMapAlerts.map((alert) => alert.id),
+    [visibleMapAlerts]
+  );
   const reviewHasVideoClips = reviewMode && snapshot.review_video_clips.length > 0;
   const flightHasReceivedConnection = Boolean(snapshot.connection.last_packet_at);
   const flightHasArmedTelemetry = snapshot.active_session_has_armed_telemetry;
@@ -921,6 +932,17 @@ export function App() {
   const videoIsCornerPane = activeFlight && !videoDominant;
   const toolbarVideoMode = activeFlight && videoDominant;
   const videoPreview = snapshot.video_preview;
+
+  useEffect(() => {
+    const handleResize = () => {
+      setViewportWidth(window.innerWidth);
+      setViewportHeight(window.innerHeight);
+    };
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
   useEffect(() => {
     if (activeFlight && !previousActiveFlightRef.current) {
       setActiveFlightLayout('video-dominant');
@@ -1557,22 +1579,6 @@ export function App() {
     snapshot.config.flight_alerts.low_speed_warning_mps,
     snapshot.connection.status
   ]);
-  const reviewDetectionMarkers = useMemo(
-    () =>
-      reviewMode && reviewFrames.length > 0
-        ? deferredAlerts
-            .map((alert) => ({
-              id: alert.id,
-              index: findNearestFrameIndex(reviewFrames, alert.detected_at)
-            }))
-            .sort((first, second) => first.index - second.index)
-        : [],
-    [deferredAlerts, reviewFrames, reviewMode]
-  );
-  const reviewDetectionMarkerIndex = useMemo(
-    () => new Map(reviewDetectionMarkers.map((marker) => [marker.id, marker.index])),
-    [reviewDetectionMarkers]
-  );
   const linkPulseActive =
     activeFlight &&
     flightHasReceivedConnection &&
@@ -1642,25 +1648,6 @@ export function App() {
     });
   }, [flightNotifications, telemetryMetricStates.notifications]);
 
-  useEffect(() => {
-    if (!reviewMode || !selectedAlertId || effectiveReviewFrameIndex == null) {
-      return;
-    }
-    const selectedMarkerFrame = reviewDetectionMarkerIndex.get(selectedAlertId);
-    if (selectedMarkerFrame == null) {
-      return;
-    }
-    if (selectedMarkerFrame !== effectiveReviewFrameIndex) {
-      setSelectedAlertId(null);
-      setAlertDetailVisible(false);
-    }
-  }, [
-    effectiveReviewFrameIndex,
-    reviewDetectionMarkerIndex,
-    reviewMode,
-    selectedAlertId
-  ]);
-
   function togglePanel(panel: Exclude<OverlayPanel, null>) {
     if (panel === 'flights' && activeFlight) {
       return;
@@ -1669,25 +1656,40 @@ export function App() {
   }
 
   function handleSelectAlert(alertId: string) {
+    if (reviewMode && alertDetailVisible && selectedAlertId === alertId) {
+      closeDetectionPanel();
+      return;
+    }
     setSelectedAlertId(alertId);
     setAlertDetailVisible(true);
     setActivePanel(null);
-    if (reviewMode) {
-      const markerIndex = reviewDetectionMarkerIndex.get(alertId);
-      if (markerIndex != null) {
-        setReviewFrameIndex(markerIndex);
-      }
-    }
   }
 
   function openDetectionPanel() {
-    const firstAlert = deferredAlerts[0];
-    if (!firstAlert) {
+    const targetAlert =
+      [...deferredAlerts].reverse().find((alert) => unacknowledgedDetectionIds.includes(alert.id)) ??
+      deferredAlerts[0];
+    if (!targetAlert) {
       return;
     }
     setUnacknowledgedDetectionIds([]);
     dismissFlightNotification('active-flight-detection');
-    handleSelectAlert(firstAlert.id);
+    handleSelectAlert(targetAlert.id);
+  }
+
+  function closeDetectionPanel() {
+    setAlertDetailVisible(false);
+    setSelectedAlertId(null);
+  }
+
+  function handleFollowModeChange(enabled: boolean) {
+    upsertFlightNotification({
+      id: 'follow-mode',
+      message: enabled ? 'follow enabled' : 'follow disabled',
+      severity: 'info',
+      persistent: false,
+      durationMs: 3000
+    });
   }
 
   function stepDetection(direction: -1 | 1) {
@@ -1725,14 +1727,6 @@ export function App() {
 
   function handleReviewFrameChange(index: number) {
     setReviewFrameIndex(index);
-    if (!selectedAlertId) {
-      return;
-    }
-    const selectedMarkerFrame = reviewDetectionMarkerIndex.get(selectedAlertId);
-    if (selectedMarkerFrame == null || selectedMarkerFrame !== index) {
-      setSelectedAlertId(null);
-      setAlertDetailVisible(false);
-    }
   }
 
   function handleToggleReviewPlayback() {
@@ -1801,8 +1795,9 @@ export function App() {
       config={snapshot.config}
       liveState={displayLiveState}
       track={displayTrack}
-      alerts={deferredAlerts}
+      alerts={visibleMapAlerts}
       selectedAlertId={selectedAlertId}
+      highlightedAlertIds={visibleMapAlertIds}
       enabledRegions={mapRegionReady ? enabledRegions : []}
       selectedRegion={mapRegionReady ? selectedRegion : null}
       assetOrigin={mapRegionReady ? offlineCatalog.asset_origin : null}
@@ -1821,6 +1816,7 @@ export function App() {
           setLastIdleMapView(view);
         }
       }}
+      onFollowModeChange={handleFollowModeChange}
       onSelectAlert={handleSelectAlert}
     />
   );
@@ -2104,7 +2100,7 @@ export function App() {
               }}
             metricStates={activeFlight ? telemetryMetricStates : undefined}
             expandedHud={
-              (activeFlight || reviewMode)
+              (activeFlight || reviewMode) && !suppressExpandedHud
                 ? {
                     open: activeFlight ? expandedHudOpen : reviewMode,
                     cpuTempC,
@@ -2131,22 +2127,36 @@ export function App() {
           />
         ) : null}
 
+        {activeDetectionDetailOpen && selectedAlert ? (
+          <div className="telemetry-hud-layer telemetry-hud-layer--detection-detail">
+            <div className="telemetry-hud-stack telemetry-hud-stack--detection-detail">
+              <AlertDetail
+                alert={selectedAlert}
+                config={snapshot.config}
+                alertIndex={Math.max(selectedAlertIndex, 0)}
+                alertCount={deferredAlerts.length}
+                onPrevious={() => stepDetection(-1)}
+                onNext={() => stepDetection(1)}
+                canPrevious={selectedAlertIndex > 0}
+                canNext={selectedAlertIndex >= 0 && selectedAlertIndex < deferredAlerts.length - 1}
+                onClose={closeDetectionPanel}
+              />
+            </div>
+          </div>
+        ) : null}
+
         {reviewMode && reviewFrames.length > 0 && effectiveReviewFrameIndex != null ? (
           <ReplayTimeline
             flightName={focusedSession?.name ?? 'Saved flight'}
             frames={reviewFrames}
             selectedIndex={effectiveReviewFrameIndex}
-            markers={reviewDetectionMarkers}
-            selectedMarkerId={selectedAlertId}
+            markers={[]}
+            selectedMarkerId={null}
             hasRecordings={reviewHasVideoClips}
             playbackActive={reviewPlaybackActive}
             playbackSpeed={reviewPlaybackSpeed}
             onChange={handleReviewFrameChange}
-            onSelectMarker={(markerId, markerIndex) => {
-              setReviewFrameIndex(markerIndex);
-              setSelectedAlertId(markerId);
-              setAlertDetailVisible(true);
-            }}
+            onSelectMarker={() => {}}
             onRenameFlightName={(name) => {
               if (!focusedSession?.id) {
                 return;
@@ -2161,35 +2171,7 @@ export function App() {
           />
         ) : null}
 
-        {alertDetailVisible && selectedAlert ? (
-          activeFlight ? (
-            <>
-              <button
-                className="modal-backdrop"
-                onClick={() => {
-                  setAlertDetailVisible(false);
-                  setSelectedAlertId(null);
-                }}
-                aria-label="Close detection details"
-              />
-              <div className="alert-detail-modal">
-                <AlertDetail
-                  alert={selectedAlert}
-                  config={snapshot.config}
-                  alertIndex={Math.max(selectedAlertIndex, 0)}
-                  alertCount={deferredAlerts.length}
-                  onPrevious={() => stepDetection(-1)}
-                  onNext={() => stepDetection(1)}
-                  canPrevious={selectedAlertIndex > 0}
-                  canNext={selectedAlertIndex >= 0 && selectedAlertIndex < deferredAlerts.length - 1}
-                  onClose={() => {
-                    setAlertDetailVisible(false);
-                    setSelectedAlertId(null);
-                  }}
-                />
-              </div>
-            </>
-          ) : (
+        {alertDetailVisible && selectedAlert && !activeFlight ? (
             <AlertDetail
               alert={selectedAlert}
               config={snapshot.config}
@@ -2199,12 +2181,8 @@ export function App() {
               onNext={() => stepDetection(1)}
               canPrevious={selectedAlertIndex > 0}
               canNext={selectedAlertIndex >= 0 && selectedAlertIndex < deferredAlerts.length - 1}
-              onClose={() => {
-                setAlertDetailVisible(false);
-                setSelectedAlertId(null);
-              }}
+              onClose={closeDetectionPanel}
             />
-          )
         ) : null}
 
         {reviewMode && hasDetections && !alertDetailVisible ? (

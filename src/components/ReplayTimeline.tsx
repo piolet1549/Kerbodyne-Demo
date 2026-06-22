@@ -159,13 +159,12 @@ export function ReplayTimeline({
           const left = `calc((100% - var(--replay-thumb-size, 16px)) * ${
             marker.index / denominator
           } + (var(--replay-thumb-size, 16px) / 2))`;
-          const isDimmed = Boolean(selectedMarkerId) && selectedMarkerId !== marker.id;
           return (
             <button
               key={marker.id}
               className={`replay-timeline__marker ${
-                isDimmed ? 'replay-timeline__marker--dimmed' : ''
-              } ${selectedMarkerId === marker.id ? 'replay-timeline__marker--active' : ''}`}
+                selectedMarkerId === marker.id ? 'replay-timeline__marker--active' : ''
+              }`}
               style={{ left }}
               onClick={() => onSelectMarker(marker.id, marker.index)}
               aria-label="Jump to detection"

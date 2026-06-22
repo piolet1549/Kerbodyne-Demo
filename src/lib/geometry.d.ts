@@ -2,7 +2,8 @@ import type { AircraftLiveState, AlertRecord, TrackPointRecord } from './types';
 
 export function buildAlertSectorsGeoJson(
   alerts: AlertRecord[],
-  selectedAlertId?: string | null
+  selectedAlertId?: string | null,
+  highlightedAlertIds?: string[] | Set<string> | null
 ): any;
 
 export function buildTrackGeoJson(
@@ -12,7 +13,8 @@ export function buildTrackGeoJson(
 
 export function buildAlertsGeoJson(
   alerts: AlertRecord[],
-  selectedAlertId?: string | null
+  selectedAlertId?: string | null,
+  highlightedAlertIds?: string[] | Set<string> | null
 ): any;
 
 export function buildCoverageMaskGeoJson(enabledRegions?: Array<{

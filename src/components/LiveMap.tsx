@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import maplibregl, { type GeoJSONSource, type Map } from 'maplibre-gl';
+import maplibregl, { type GeoJSONSource, type LayerSpecification, type Map } from 'maplibre-gl';
 import {
   buildAlertSectorsGeoJson,
   buildAlertsGeoJson,
@@ -24,6 +24,7 @@ interface LiveMapProps {
   track: TrackPointRecord[];
   alerts: AlertRecord[];
   selectedAlertId?: string | null;
+  highlightedAlertIds?: string[];
   enabledRegions: OfflineRegionManifest[];
   selectedRegion?: OfflineRegionManifest | null;
   assetOrigin?: string | null;
@@ -38,6 +39,7 @@ interface LiveMapProps {
   focusTarget?: [number, number] | null;
   focusKey?: string | null;
   onViewStateChange?: (view: { center: [number, number]; zoom: number; bearing: number }) => void;
+  onFollowModeChange?: (enabled: boolean) => void;
   onSelectAlert: (alertId: string) => void;
 }
 
@@ -47,7 +49,7 @@ const SOURCE_SECTOR = 'sector-source';
 const SOURCE_COVERAGE_MASK = 'coverage-mask-source';
 const SOURCE_COVERAGE_BOUNDS = 'coverage-bounds-source';
 const SOURCE_MEASURE = 'measure-source';
-const INTERACTIVE_LAYERS = ['alerts-layer', 'alerts-halo-layer', 'sector-mask', 'sector-fill'];
+const INTERACTIVE_LAYERS = ['alerts-layer', 'alerts-halo-layer', 'sector-mask', 'sector-fill', 'sector-border'];
 type MeasureUnit = 'nm' | 'mi' | 'm' | 'km';
 const MEASURE_UNIT_LABELS: Record<MeasureUnit, string> = {
   nm: 'Nautical Miles',
@@ -56,9 +58,10 @@ const MEASURE_UNIT_LABELS: Record<MeasureUnit, string> = {
   km: 'Kilometers'
 };
 
+/*
 function RotateLeftIcon() {
   return (
-    <span className="map-control-wheel__rotate-symbol map-control-wheel__rotate-symbol--left" aria-hidden="true">
+    <span className="legacy-rotate-symbol legacy-rotate-symbol--left" aria-hidden="true">
       ↶
     </span>
   );
@@ -66,18 +69,20 @@ function RotateLeftIcon() {
 
 function RotateRightIcon() {
   return (
-    <span className="map-control-wheel__rotate-symbol map-control-wheel__rotate-symbol--right" aria-hidden="true">
+    <span className="legacy-rotate-symbol legacy-rotate-symbol--right" aria-hidden="true">
       ↷
     </span>
   );
 }
 
+*/
 export function LiveMap({
   config,
   liveState,
   track,
   alerts,
   selectedAlertId,
+  highlightedAlertIds = [],
   enabledRegions,
   selectedRegion,
   assetOrigin,
@@ -92,6 +97,7 @@ export function LiveMap({
   focusTarget,
   focusKey,
   onViewStateChange,
+  onFollowModeChange,
   onSelectAlert
 }: LiveMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -106,6 +112,7 @@ export function LiveMap({
   const trackRef = useRef(track);
   const alertsRef = useRef(alerts);
   const selectedAlertIdRef = useRef(selectedAlertId);
+  const highlightedAlertIdsRef = useRef(highlightedAlertIds);
   const mapModeRef = useRef(mapMode);
   const reviewModeRef = useRef(reviewMode);
   const configRef = useRef(config);
@@ -114,11 +121,13 @@ export function LiveMap({
   const enabledRegionsRef = useRef(enabledRegions);
   const selectedRegionRef = useRef(selectedRegion);
   const onViewStateChangeRef = useRef(onViewStateChange);
+  const onFollowModeChangeRef = useRef(onFollowModeChange);
   const previousFollowAvailabilityRef = useRef(false);
   const measureEnabledRef = useRef(false);
   const measurePointsRef = useRef<Array<[number, number]>>([]);
   const measureUnitRef = useRef<MeasureUnit>('nm');
   const lastFocusKeyRef = useRef<string | null>(null);
+  const lastAlertFocusKeyRef = useRef<string | null>(null);
   const lastSelectedRegionIdRef = useRef<string | null>(null);
   const measureShellRef = useRef<HTMLDivElement | null>(null);
   const [mapError, setMapError] = useState<string | null>(null);
@@ -289,6 +298,7 @@ export function LiveMap({
     trackRef.current = filteredTrack;
     alertsRef.current = filteredAlerts;
     selectedAlertIdRef.current = selectedAlertId;
+    highlightedAlertIdsRef.current = highlightedAlertIds;
     mapModeRef.current = mapMode;
     reviewModeRef.current = reviewMode;
     configRef.current = config;
@@ -297,6 +307,7 @@ export function LiveMap({
     enabledRegionsRef.current = enabledRegions;
     selectedRegionRef.current = selectedRegion;
     onViewStateChangeRef.current = onViewStateChange;
+    onFollowModeChangeRef.current = onFollowModeChange;
     measureEnabledRef.current = measureOpen;
     measurePointsRef.current = measurePoints;
     measureUnitRef.current = measureUnit;
@@ -314,8 +325,10 @@ export function LiveMap({
     measureUnit,
     reviewMode,
     selectedAlertId,
+    highlightedAlertIds,
     selectedRegion,
-    onViewStateChange
+    onViewStateChange,
+    onFollowModeChange
   ]);
 
   useEffect(() => {
@@ -417,6 +430,7 @@ export function LiveMap({
           trackRef.current,
           alertsRef.current,
           selectedAlertIdRef.current,
+          highlightedAlertIdsRef.current,
           enabledRegionsRef.current,
           configRef.current.stale_after_seconds
         );
@@ -577,7 +591,7 @@ export function LiveMap({
     try {
       map.once('styledata', clearLoading);
       map.once('idle', clearLoading);
-      map.setStyle(style);
+      map.setStyle(style, { diff: false });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to switch map style';
       console.error('Kerbodyne map style update failed:', error);
@@ -599,6 +613,7 @@ export function LiveMap({
       filteredTrack,
       filteredAlerts,
       selectedAlertId,
+      highlightedAlertIds,
       enabledRegions,
       config.stale_after_seconds
     );
@@ -612,7 +627,8 @@ export function LiveMap({
     mapMode,
     measurePoints,
     measureUnit,
-    selectedAlertId
+    selectedAlertId,
+    highlightedAlertIds
   ]);
 
   useEffect(() => {
@@ -674,8 +690,77 @@ export function LiveMap({
   }, [filteredLiveState, followAvailable]);
 
   useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.ctrlKey || event.metaKey || event.altKey) {
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      const tagName = target?.tagName?.toLowerCase();
+      if (
+        target?.isContentEditable ||
+        tagName === 'input' ||
+        tagName === 'textarea' ||
+        tagName === 'select'
+      ) {
+        return;
+      }
+
+      const map = mapRef.current;
+      if (!map) {
+        return;
+      }
+
+      if (event.key === '+' || event.key === '=') {
+        event.preventDefault();
+        map.zoomIn({ duration: 220 });
+        return;
+      }
+      if (event.key === '-' || event.key === '_') {
+        event.preventDefault();
+        map.zoomOut({ duration: 220 });
+        return;
+      }
+      if (event.key === '.' || event.key === '>') {
+        event.preventDefault();
+        map.easeTo({ bearing: map.getBearing() + 20, duration: 240 });
+        return;
+      }
+      if (event.key === ',' || event.key === '<') {
+        event.preventDefault();
+        map.easeTo({ bearing: map.getBearing() - 20, duration: 240 });
+        return;
+      }
+      if (event.key.toLowerCase() === 'f') {
+        if (event.repeat || !followAvailable) {
+          return;
+        }
+        event.preventDefault();
+        setFollowEnabled((current) => {
+          const nextFollow = !current;
+          onFollowModeChangeRef.current?.(nextFollow);
+          const currentState = liveStateRef.current;
+          if (
+            nextFollow &&
+            currentState &&
+            isValidCoordinate(currentState.lat, currentState.lon)
+          ) {
+            map.easeTo({
+              center: [currentState.lon as number, currentState.lat as number],
+              duration: 320
+            });
+          }
+          return nextFollow;
+        });
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [followAvailable]);
+
+  useEffect(() => {
     const map = mapRef.current;
-    if (!map || !activeFlight || !effectiveFollowEnabled || !filteredLiveState?.armed) {
+    if (!map || !activeFlight || selectedAlertId || !effectiveFollowEnabled || !filteredLiveState?.armed) {
       return;
     }
 
@@ -692,7 +777,8 @@ export function LiveMap({
     effectiveFollowEnabled,
     filteredLiveState?.armed,
     filteredLiveState?.lat,
-    filteredLiveState?.lon
+    filteredLiveState?.lon,
+    selectedAlertId
   ]);
 
   useEffect(() => {
@@ -700,6 +786,7 @@ export function LiveMap({
     if (
       !map ||
       !forceFollow ||
+      selectedAlertId ||
       !activeFlight ||
       !filteredLiveState?.armed ||
       !isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)
@@ -711,7 +798,31 @@ export function LiveMap({
       center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
       duration: 240
     });
-  }, [activeFlight, filteredLiveState, forceFollow]);
+  }, [activeFlight, filteredLiveState, forceFollow, selectedAlertId]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !activeFlight || !selectedAlertId) {
+      if (!selectedAlertId) {
+        lastAlertFocusKeyRef.current = null;
+      }
+      return;
+    }
+    const selectedAlert = filteredAlerts.find((alert) => alert.id === selectedAlertId);
+    if (!selectedAlert || !isValidAlertRecord(selectedAlert)) {
+      return;
+    }
+    const focusKeyForAlert = `${selectedAlert.id}:${selectedAlert.detected_at}`;
+    if (lastAlertFocusKeyRef.current === focusKeyForAlert) {
+      return;
+    }
+    map.easeTo({
+      center: [selectedAlert.sector.center_lon, selectedAlert.sector.center_lat],
+      zoom: Math.max(map.getZoom(), compactFlightView ? 14.6 : 15.1),
+      duration: 520
+    });
+    lastAlertFocusKeyRef.current = focusKeyForAlert;
+  }, [activeFlight, compactFlightView, filteredAlerts, selectedAlertId]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -808,78 +919,6 @@ export function LiveMap({
         </div>
       ) : null}
       {!compactFlightView ? (
-      <div className="map-control-wheel">
-        <button
-          className="map-control-wheel__button map-control-wheel__button--top"
-          onClick={() => mapRef.current?.zoomIn({ duration: 220 })}
-          aria-label="Zoom in"
-        >
-          <span className="map-control-wheel__button-glyph" aria-hidden="true">+</span>
-        </button>
-        <button
-          className="map-control-wheel__button map-control-wheel__button--bottom"
-          onClick={() => mapRef.current?.zoomOut({ duration: 220 })}
-          aria-label="Zoom out"
-        >
-          <span className="map-control-wheel__button-glyph map-control-wheel__button-glyph--minus" aria-hidden="true">
-            -
-          </span>
-        </button>
-        <button
-          className="map-control-wheel__button map-control-wheel__button--left"
-          onClick={() =>
-            mapRef.current?.easeTo({
-              bearing: (mapRef.current?.getBearing() ?? 0) - 20,
-              duration: 240
-            })
-          }
-          aria-label="Rotate left"
-        >
-          <RotateLeftIcon />
-        </button>
-        <button
-          className="map-control-wheel__button map-control-wheel__button--right"
-          onClick={() =>
-            mapRef.current?.easeTo({
-              bearing: (mapRef.current?.getBearing() ?? 0) + 20,
-              duration: 240
-            })
-          }
-          aria-label="Rotate right"
-        >
-          <RotateRightIcon />
-        </button>
-        {followAvailable ? (
-          <button
-            className={`map-control-wheel__follow ${
-              followAvailable ? 'map-control-wheel__follow--available' : 'map-control-wheel__follow--unavailable'
-            } ${followEnabled ? 'map-control-wheel__follow--active' : ''}`}
-            onClick={() => {
-              if (!followAvailable) {
-                return;
-              }
-              const nextFollow = !followEnabled;
-              setFollowEnabled(nextFollow);
-              if (
-                nextFollow &&
-                filteredLiveState &&
-                isValidCoordinate(filteredLiveState.lat, filteredLiveState.lon)
-              ) {
-                mapRef.current?.easeTo({
-                  center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
-                  duration: 320
-                });
-              }
-            }}
-            aria-label={followEnabled ? 'Disable follow mode' : 'Enable follow mode'}
-            disabled={!followAvailable}
-          >
-            <span className="map-control-wheel__follow-core" aria-hidden="true" />
-          </button>
-        ) : null}
-      </div>
-      ) : null}
-      {!compactFlightView ? (
       <div className="map-bottom-strip">
         {scaleIndicator ? (
           <div className="map-scale-indicator">
@@ -909,23 +948,32 @@ function buildMapLoadingLabel(mapMode: MapMode) {
   return `Loading ${mapMode === 'satellite' ? 'satellite' : 'street'} map`;
 }
 
+function toFiniteNumber(value: number | string | null | undefined) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 function isValidCoordinate(
-  lat: number | null | undefined,
-  lon: number | null | undefined
+  lat: number | string | null | undefined,
+  lon: number | string | null | undefined
 ) {
-  if (typeof lat !== 'number' || typeof lon !== 'number') {
+  const normalizedLat = toFiniteNumber(lat);
+  const normalizedLon = toFiniteNumber(lon);
+  if (normalizedLat == null || normalizedLon == null) {
     return false;
   }
 
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+  if (normalizedLat < -90 || normalizedLat > 90 || normalizedLon < -180 || normalizedLon > 180) {
     return false;
   }
 
-  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
-    return false;
-  }
-
-  return !(Math.abs(lat) < 0.000001 && Math.abs(lon) < 0.000001);
+  return !(Math.abs(normalizedLat) < 0.000001 && Math.abs(normalizedLon) < 0.000001);
 }
 
 function isValidTrackPoint(point: TrackPointRecord) {
@@ -936,13 +984,28 @@ function isValidAlertRecord(alert: AlertRecord) {
   return isValidCoordinate(alert.sector.center_lat, alert.sector.center_lon);
 }
 
+function ensureGeoJsonSource(map: Map, sourceId: string, data: GeoJSON.GeoJSON) {
+  if (map.getSource(sourceId)) {
+    return;
+  }
+  map.addSource(sourceId, {
+    type: 'geojson',
+    data
+  });
+}
+
+function ensureLayer(map: Map, layer: LayerSpecification) {
+  if (map.getLayer(layer.id)) {
+    return;
+  }
+  map.addLayer(layer);
+}
+
 function ensureSources(map: Map) {
-  if (!map.getSource(SOURCE_SECTOR)) {
-    map.addSource(SOURCE_SECTOR, {
-      type: 'geojson',
-      data: buildAlertSectorsGeoJson([], null)
-    });
-    map.addLayer({
+  ensureGeoJsonSource(map, SOURCE_SECTOR, buildAlertSectorsGeoJson([], null));
+  ensureLayer(
+    map,
+    {
       id: 'sector-mask',
       type: 'fill',
       source: SOURCE_SECTOR,
@@ -950,8 +1013,11 @@ function ensureSources(map: Map) {
         'fill-color': '#020202',
         'fill-opacity': ['coalesce', ['get', 'mask_opacity_street'], 0.06]
       }
-    });
-    map.addLayer({
+    }
+  );
+  ensureLayer(
+    map,
+    {
       id: 'sector-fill',
       type: 'fill',
       source: SOURCE_SECTOR,
@@ -959,15 +1025,26 @@ function ensureSources(map: Map) {
         'fill-color': ['coalesce', ['get', 'fill_color'], '#d5d5d5'],
         'fill-opacity': ['coalesce', ['get', 'tint_opacity'], 0.08]
       }
-    });
-  }
+    }
+  );
+  ensureLayer(
+    map,
+    {
+      id: 'sector-border',
+      type: 'line',
+      source: SOURCE_SECTOR,
+      paint: {
+        'line-color': ['coalesce', ['get', 'border_color'], '#fff4e8'],
+        'line-width': ['coalesce', ['get', 'border_width'], 0],
+        'line-opacity': ['coalesce', ['get', 'border_opacity'], 0]
+      }
+    }
+  );
 
-  if (!map.getSource(SOURCE_COVERAGE_MASK)) {
-    map.addSource(SOURCE_COVERAGE_MASK, {
-      type: 'geojson',
-      data: buildCoverageMaskGeoJson(null)
-    });
-    map.addLayer({
+  ensureGeoJsonSource(map, SOURCE_COVERAGE_MASK, buildCoverageMaskGeoJson(null));
+  ensureLayer(
+    map,
+    {
       id: 'coverage-mask-layer',
       type: 'fill',
       source: SOURCE_COVERAGE_MASK,
@@ -975,15 +1052,13 @@ function ensureSources(map: Map) {
         'fill-color': '#040404',
         'fill-opacity': 0.58
       }
-    });
-  }
+    }
+  );
 
-  if (!map.getSource(SOURCE_COVERAGE_BOUNDS)) {
-    map.addSource(SOURCE_COVERAGE_BOUNDS, {
-      type: 'geojson',
-      data: buildCoverageBoundsGeoJson(null)
-    });
-    map.addLayer({
+  ensureGeoJsonSource(map, SOURCE_COVERAGE_BOUNDS, buildCoverageBoundsGeoJson(null));
+  ensureLayer(
+    map,
+    {
       id: 'coverage-bounds-layer',
       type: 'line',
       source: SOURCE_COVERAGE_BOUNDS,
@@ -993,15 +1068,13 @@ function ensureSources(map: Map) {
         'line-opacity': 0.52,
         'line-dasharray': [2, 2]
       }
-    });
-  }
+    }
+  );
 
-  if (!map.getSource(SOURCE_MEASURE)) {
-    map.addSource(SOURCE_MEASURE, {
-      type: 'geojson',
-      data: buildMeasureGeoJson([])
-    });
-    map.addLayer({
+  ensureGeoJsonSource(map, SOURCE_MEASURE, buildMeasureGeoJson([]));
+  ensureLayer(
+    map,
+    {
       id: 'measure-line',
       type: 'line',
       source: SOURCE_MEASURE,
@@ -1011,8 +1084,11 @@ function ensureSources(map: Map) {
         'line-width': 2.6,
         'line-dasharray': [2, 1.4]
       }
-    });
-    map.addLayer({
+    }
+  );
+  ensureLayer(
+    map,
+    {
       id: 'measure-points',
       type: 'circle',
       source: SOURCE_MEASURE,
@@ -1023,15 +1099,13 @@ function ensureSources(map: Map) {
         'circle-stroke-color': '#050505',
         'circle-stroke-width': 1.6
       }
-    });
-  }
+    }
+  );
 
-  if (!map.getSource(SOURCE_TRACK)) {
-    map.addSource(SOURCE_TRACK, {
-      type: 'geojson',
-      data: buildTrackGeoJson([])
-    });
-    map.addLayer({
+  ensureGeoJsonSource(map, SOURCE_TRACK, buildTrackGeoJson([]));
+  ensureLayer(
+    map,
+    {
       id: 'track-casing',
       type: 'line',
       source: SOURCE_TRACK,
@@ -1041,8 +1115,11 @@ function ensureSources(map: Map) {
         'line-color': '#050505',
         'line-opacity': 0.48
       }
-    });
-    map.addLayer({
+    }
+  );
+  ensureLayer(
+    map,
+    {
       id: 'track-layer',
       type: 'line',
       source: SOURCE_TRACK,
@@ -1052,8 +1129,26 @@ function ensureSources(map: Map) {
         'line-color': '#f0f0f0',
         'line-opacity': 0.94
       }
-    });
-    map.addLayer({
+    }
+  );
+  ensureLayer(
+    map,
+    {
+      id: 'track-layer-dashed',
+      type: 'line',
+      source: SOURCE_TRACK,
+      filter: ['==', ['get', 'kind'], 'segment'],
+      paint: {
+        'line-width': 2.8,
+        'line-color': '#f0f0f0',
+        'line-opacity': 0,
+        'line-dasharray': [3.2, 2.2]
+      }
+    }
+  );
+  ensureLayer(
+    map,
+    {
       id: 'track-gap-casing',
       type: 'line',
       source: SOURCE_TRACK,
@@ -1063,8 +1158,11 @@ function ensureSources(map: Map) {
         'line-color': '#050505',
         'line-opacity': 0.66
       }
-    });
-    map.addLayer({
+    }
+  );
+  ensureLayer(
+    map,
+    {
       id: 'track-gap-layer',
       type: 'line',
       source: SOURCE_TRACK,
@@ -1074,15 +1172,13 @@ function ensureSources(map: Map) {
         'line-color': '#ff6b63',
         'line-opacity': 0.96
       }
-    });
-  }
+    }
+  );
 
-  if (!map.getSource(SOURCE_ALERTS)) {
-    map.addSource(SOURCE_ALERTS, {
-      type: 'geojson',
-      data: buildAlertsGeoJson([])
-    });
-    map.addLayer({
+  ensureGeoJsonSource(map, SOURCE_ALERTS, buildAlertsGeoJson([]));
+  ensureLayer(
+    map,
+    {
       id: 'alerts-halo-layer',
       type: 'circle',
       source: SOURCE_ALERTS,
@@ -1091,8 +1187,11 @@ function ensureSources(map: Map) {
         'circle-color': '#030303',
         'circle-opacity': ['coalesce', ['get', 'halo_opacity'], 0.24]
       }
-    });
-    map.addLayer({
+    }
+  );
+  ensureLayer(
+    map,
+    {
       id: 'alerts-layer',
       type: 'circle',
       source: SOURCE_ALERTS,
@@ -1103,9 +1202,22 @@ function ensureSources(map: Map) {
         'circle-stroke-width': ['coalesce', ['get', 'stroke_width'], 1.5],
         'circle-opacity': ['coalesce', ['get', 'opacity'], 0.58]
       }
-    });
-  }
+    }
+  );
+}
 
+function safeSetPaintProperty(map: Map, layerId: string, property: string, value: unknown) {
+  if (!map.getLayer(layerId)) {
+    return;
+  }
+  map.setPaintProperty(layerId, property, value as never);
+}
+
+function safeSetLayoutProperty(map: Map, layerId: string, property: string, value: unknown) {
+  if (!map.getLayer(layerId)) {
+    return;
+  }
+  map.setLayoutProperty(layerId, property, value as never);
 }
 
 function applyOverlayAppearance(
@@ -1114,44 +1226,50 @@ function applyOverlayAppearance(
   trackDisplay: AppConfig['track_display']
 ) {
   const satellite = mapMode === 'satellite';
-  map.setPaintProperty(
+  safeSetPaintProperty(
+    map,
     'sector-mask',
     'fill-opacity',
     ['coalesce', ['get', satellite ? 'mask_opacity_satellite' : 'mask_opacity_street'], 0.08]
   );
   const baseWidth = Math.max(trackDisplay.width_px, 1.2);
   const lineColor = trackDisplay.color_hex || (satellite ? '#ffffff' : '#ededed');
-  map.setPaintProperty('track-casing', 'line-width', trackDisplay.enabled ? baseWidth + 2.4 : 0.2);
-  map.setPaintProperty('track-casing', 'line-opacity', trackDisplay.enabled ? (satellite ? 0.62 : 0.42) : 0);
-  map.setPaintProperty('track-layer', 'line-width', trackDisplay.enabled ? baseWidth : 0.2);
-  map.setPaintProperty('track-layer', 'line-color', lineColor);
-  map.setPaintProperty('track-layer', 'line-opacity', trackDisplay.enabled ? 0.96 : 0);
-  map.setPaintProperty('track-gap-casing', 'line-width', trackDisplay.enabled ? baseWidth + 2.8 : 0.2);
-  map.setPaintProperty('track-gap-casing', 'line-opacity', trackDisplay.enabled ? 0.72 : 0);
-  map.setPaintProperty('track-gap-layer', 'line-width', trackDisplay.enabled ? baseWidth + 0.4 : 0.2);
-  map.setPaintProperty('track-gap-layer', 'line-opacity', trackDisplay.enabled ? 0.96 : 0);
-  map.setLayoutProperty(
+  const showSolidTrack = trackDisplay.enabled && trackDisplay.style !== 'dashed';
+  const showDashedTrack = trackDisplay.enabled && trackDisplay.style === 'dashed';
+  safeSetPaintProperty(map, 'track-casing', 'line-width', trackDisplay.enabled ? baseWidth + 2.4 : 0.2);
+  safeSetPaintProperty(map, 'track-casing', 'line-opacity', trackDisplay.enabled ? (satellite ? 0.62 : 0.42) : 0);
+  safeSetPaintProperty(map, 'track-layer', 'line-width', trackDisplay.enabled ? baseWidth : 0.2);
+  safeSetPaintProperty(map, 'track-layer', 'line-color', lineColor);
+  safeSetPaintProperty(map, 'track-layer', 'line-opacity', showSolidTrack ? 0.96 : 0);
+  safeSetPaintProperty(map, 'track-layer-dashed', 'line-width', trackDisplay.enabled ? baseWidth : 0.2);
+  safeSetPaintProperty(map, 'track-layer-dashed', 'line-color', lineColor);
+  safeSetPaintProperty(map, 'track-layer-dashed', 'line-opacity', showDashedTrack ? 0.96 : 0);
+  safeSetPaintProperty(map, 'track-gap-casing', 'line-width', trackDisplay.enabled ? baseWidth + 2.8 : 0.2);
+  safeSetPaintProperty(map, 'track-gap-casing', 'line-opacity', trackDisplay.enabled ? 0.72 : 0);
+  safeSetPaintProperty(map, 'track-gap-layer', 'line-width', trackDisplay.enabled ? baseWidth + 0.4 : 0.2);
+  safeSetPaintProperty(map, 'track-gap-layer', 'line-opacity', trackDisplay.enabled ? 0.96 : 0);
+  safeSetLayoutProperty(
+    map,
     'track-layer',
     'line-cap',
-    trackDisplay.style === 'dashed' ? 'butt' : 'round'
+    'round'
   );
-  map.setLayoutProperty(
+  safeSetLayoutProperty(
+    map,
     'track-layer',
     'line-join',
-    trackDisplay.style === 'dashed' ? 'miter' : 'round'
+    'round'
   );
-  map.setPaintProperty(
-    'track-layer',
-    'line-dasharray',
-    trackDisplay.style === 'dashed' ? [3.2, 2.2] : [1, 0.001]
-  );
-  map.setLayoutProperty('track-gap-layer', 'line-cap', 'round');
-  map.setLayoutProperty('track-gap-layer', 'line-join', 'round');
-  map.setLayoutProperty('track-gap-casing', 'line-cap', 'round');
-  map.setLayoutProperty('track-gap-casing', 'line-join', 'round');
-  map.setPaintProperty('alerts-halo-layer', 'circle-opacity', satellite ? 0.34 : 0.22);
-  map.setPaintProperty('coverage-mask-layer', 'fill-opacity', satellite ? 0.64 : 0.56);
-  map.setPaintProperty('coverage-bounds-layer', 'line-opacity', satellite ? 0.6 : 0.5);
+  safeSetLayoutProperty(map, 'track-layer-dashed', 'line-cap', 'butt');
+  safeSetLayoutProperty(map, 'track-layer-dashed', 'line-join', 'miter');
+  safeSetPaintProperty(map, 'track-layer-dashed', 'line-dasharray', [3.2, 2.2]);
+  safeSetLayoutProperty(map, 'track-gap-layer', 'line-cap', 'round');
+  safeSetLayoutProperty(map, 'track-gap-layer', 'line-join', 'round');
+  safeSetLayoutProperty(map, 'track-gap-casing', 'line-cap', 'round');
+  safeSetLayoutProperty(map, 'track-gap-casing', 'line-join', 'round');
+  safeSetPaintProperty(map, 'alerts-halo-layer', 'circle-opacity', satellite ? 0.34 : 0.22);
+  safeSetPaintProperty(map, 'coverage-mask-layer', 'fill-opacity', satellite ? 0.64 : 0.56);
+  safeSetPaintProperty(map, 'coverage-bounds-layer', 'line-opacity', satellite ? 0.6 : 0.5);
 }
 
 function syncMapData(
@@ -1159,15 +1277,16 @@ function syncMapData(
   track: TrackPointRecord[],
   alerts: AlertRecord[],
   selectedAlertId?: string | null,
+  highlightedAlertIds: string[] = [],
   enabledRegions: OfflineRegionManifest[] = [],
   staleAfterSeconds = 10
 ) {
   (map.getSource(SOURCE_TRACK) as GeoJSONSource).setData(buildTrackGeoJson(track, staleAfterSeconds));
   (map.getSource(SOURCE_ALERTS) as GeoJSONSource).setData(
-    buildAlertsGeoJson(alerts, selectedAlertId)
+    buildAlertsGeoJson(alerts, selectedAlertId, highlightedAlertIds)
   );
   (map.getSource(SOURCE_SECTOR) as GeoJSONSource).setData(
-    buildAlertSectorsGeoJson(alerts, selectedAlertId)
+    buildAlertSectorsGeoJson(alerts, selectedAlertId, highlightedAlertIds)
   );
   (map.getSource(SOURCE_COVERAGE_MASK) as GeoJSONSource).setData(
     buildCoverageMaskGeoJson(enabledRegions)

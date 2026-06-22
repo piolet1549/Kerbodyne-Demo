@@ -1,5 +1,6 @@
 const EARTH_RADIUS_M = 6378137;
 const DISPLAY_CONE_RANGE_M = 1000;
+const DEFAULT_CONE_FOV_DEG = 38;
 
 function toRadians(value) {
   return (value * Math.PI) / 180;
@@ -7,6 +8,60 @@ function toRadians(value) {
 
 function toDegrees(value) {
   return (value * 180) / Math.PI;
+}
+
+function toFiniteNumber(value, fallback = null) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : fallback;
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizeBearing(value) {
+  const normalized = value % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+}
+
+function normalizeCoordinate(latitude, longitude) {
+  const lat = toFiniteNumber(latitude);
+  const lon = toFiniteNumber(longitude);
+  if (lat == null || lon == null) {
+    return null;
+  }
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    return null;
+  }
+  if (Math.abs(lat) < 0.000001 && Math.abs(lon) < 0.000001) {
+    return null;
+  }
+  return { lat, lon };
+}
+
+function normalizeAlertSector(alert) {
+  const sector = alert?.sector;
+  const coordinate = normalizeCoordinate(sector?.center_lat, sector?.center_lon);
+  if (!coordinate) {
+    return null;
+  }
+  const bearing = normalizeBearing(toFiniteNumber(sector?.bearing_deg, 0));
+  const fov = clamp(toFiniteNumber(sector?.fov_deg, DEFAULT_CONE_FOV_DEG), 1, 160);
+  return {
+    id: alert.id,
+    class_label: alert.class_label,
+    confidence: toFiniteNumber(alert.confidence, 0),
+    center_lat: coordinate.lat,
+    center_lon: coordinate.lon,
+    bearing_deg: bearing,
+    fov_deg: fov
+  };
 }
 
 function projectCoordinate(latitude, longitude, bearingDeg, distanceM) {
@@ -84,7 +139,7 @@ function buildSectorBandPolygon(
   return [...outerArc, ...innerArc, outerArc[0] || [longitude, latitude]];
 }
 
-export function buildAlertSectorsGeoJson(alerts, selectedAlertId) {
+export function buildAlertSectorsGeoJson(alerts, selectedAlertId, highlightedAlertIds) {
   if (!alerts || alerts.length === 0) {
     return {
       type: 'FeatureCollection',
@@ -95,30 +150,36 @@ export function buildAlertSectorsGeoJson(alerts, selectedAlertId) {
   const bandCount = 7;
   const bandWidth = DISPLAY_CONE_RANGE_M / bandCount;
   const features = [];
+  const highlightedIds = normalizeIdSet(highlightedAlertIds);
+  const selectedConeColors = [
+    '#ff6f18',
+    '#ff781e',
+    '#ff8126',
+    '#ff8b30',
+    '#ff953c',
+    '#ffa04a',
+    '#ffad5c'
+  ];
 
   for (const alert of alerts) {
+    const sector = normalizeAlertSector(alert);
+    if (!sector) {
+      continue;
+    }
     const selected = selectedAlertId != null && alert.id === selectedAlertId;
+    const highlighted = selected || highlightedIds.has(alert.id);
 
     for (let bandIndex = 0; bandIndex < bandCount; bandIndex += 1) {
       const innerRadiusM = bandIndex * bandWidth;
       const outerRadiusM = (bandIndex + 1) * bandWidth;
-      const tintBase = selected ? 0.18 : 0.07;
-      const tintStep = selected ? 0.022 : 0.01;
+      const tintBase = 0.78;
+      const tintStep = 0.095;
       const tintOpacity = Math.max(
-        selected ? 0.05 : 0.015,
+        0.18,
         tintBase - bandIndex * tintStep
       );
-      const streetMaskBase = selected ? 0.12 : 0.08;
-      const satelliteMaskBase = selected ? 0.34 : 0.22;
-      const maskStep = selected ? 0.015 : 0.012;
-      const maskOpacityStreet = Math.max(
-        selected ? 0.035 : 0.02,
-        streetMaskBase - bandIndex * maskStep
-      );
-      const maskOpacitySatellite = Math.max(
-        selected ? 0.14 : 0.08,
-        satelliteMaskBase - bandIndex * (maskStep * 1.35)
-      );
+      const maskOpacityStreet = 0;
+      const maskOpacitySatellite = 0.012;
 
       features.push({
         type: 'Feature',
@@ -126,19 +187,23 @@ export function buildAlertSectorsGeoJson(alerts, selectedAlertId) {
           id: alert.id,
           class_label: alert.class_label,
           selected,
+          highlighted,
           tint_opacity: tintOpacity,
           mask_opacity_street: maskOpacityStreet,
           mask_opacity_satellite: maskOpacitySatellite,
-          fill_color: selected ? '#ff8c57' : '#d5d5d5'
+          fill_color: selectedConeColors[bandIndex],
+          border_color: selected ? '#fff4e8' : '#ff9a45',
+          border_opacity: selected ? 0.95 : 0,
+          border_width: selected ? 2.6 : 0
         },
         geometry: {
           type: 'Polygon',
           coordinates: [
             buildSectorBandPolygon(
-              alert.sector.center_lat,
-              alert.sector.center_lon,
-              alert.sector.bearing_deg,
-              alert.sector.fov_deg,
+              sector.center_lat,
+              sector.center_lon,
+              sector.bearing_deg,
+              sector.fov_deg,
               innerRadiusM,
               outerRadiusM
             )
@@ -229,13 +294,7 @@ export function buildCoverageBoundsGeoJson(enabledRegions) {
 
 export function buildTrackGeoJson(track, staleAfterSeconds = 10) {
   const normalizedTrack = Array.isArray(track)
-    ? track.filter(
-        (point) =>
-          point &&
-          Number.isFinite(point.lat) &&
-          Number.isFinite(point.lon) &&
-          typeof point.recorded_at === 'string'
-      )
+    ? track.map(normalizeTrackPoint).filter(Boolean)
     : [];
   if (normalizedTrack.length < 2) {
     return {
@@ -271,6 +330,26 @@ export function buildTrackGeoJson(track, staleAfterSeconds = 10) {
   return {
     type: 'FeatureCollection',
     features
+  };
+}
+
+function normalizeTrackPoint(point) {
+  const coordinate = normalizeCoordinate(point?.lat, point?.lon);
+  if (!coordinate) {
+    return null;
+  }
+  const recordedAt =
+    typeof point.recorded_at === 'string' && point.recorded_at.trim() !== ''
+      ? point.recorded_at
+      : new Date(0).toISOString();
+  return {
+    ...point,
+    lat: coordinate.lat,
+    lon: coordinate.lon,
+    recorded_at: recordedAt,
+    alt_msl_m: toFiniteNumber(point.alt_msl_m),
+    heading_deg: toFiniteNumber(point.heading_deg),
+    groundspeed_mps: toFiniteNumber(point.groundspeed_mps)
   };
 }
 
@@ -391,34 +470,56 @@ function haversineDistanceM(startLat, startLon, endLat, endLon) {
   return EARTH_RADIUS_M * c;
 }
 
-export function buildAlertsGeoJson(alerts, selectedAlertId) {
+export function buildAlertsGeoJson(alerts, selectedAlertId, highlightedAlertIds) {
+  const highlightedIds = normalizeIdSet(highlightedAlertIds);
   return {
     type: 'FeatureCollection',
-    features: alerts.map((alert) => ({
-      type: 'Feature',
-      properties: (() => {
-        const selected = selectedAlertId != null && alert.id === selectedAlertId;
-        return {
-          id: alert.id,
-          class_label: alert.class_label,
-          confidence: alert.confidence,
-          selected,
-          fill_color: selected ? '#ff7b45' : '#cecece',
-          stroke_color: selected ? '#fff4ec' : '#6b6b6b',
-          radius: selected ? 7.5 : 5.25,
-          stroke_width: selected ? 2.6 : 1.35,
-          opacity: selected ? 0.98 : 0.42,
-          halo_radius: selected ? 10.5 : 7.4,
-          halo_color: selected ? 'rgba(0, 0, 0, 0.42)' : 'rgba(0, 0, 0, 0.2)',
-          halo_opacity: selected ? 0.45 : 0.22
-        };
-      })(),
-      geometry: {
-        type: 'Point',
-        coordinates: [alert.sector.center_lon, alert.sector.center_lat]
+    features: alerts.flatMap((alert) => {
+      const sector = normalizeAlertSector(alert);
+      if (!sector) {
+        return [];
       }
-    }))
+      const selected = selectedAlertId != null && alert.id === selectedAlertId;
+      const highlighted = selected || highlightedIds.has(alert.id);
+      return [
+        {
+          type: 'Feature',
+          properties: {
+            id: alert.id,
+            class_label: alert.class_label,
+            confidence: sector.confidence,
+            selected,
+            highlighted,
+            fill_color: '#ff7b22',
+            stroke_color: selected ? '#ffffff' : '#ffb06a',
+            radius: selected ? 8.8 : 7.4,
+            stroke_width: selected ? 3.4 : 1.6,
+            opacity: 1,
+            halo_radius: selected ? 12.6 : 10.8,
+            halo_color: selected ? 'rgba(255, 255, 255, 0.44)' : 'rgba(255, 122, 34, 0.38)',
+            halo_opacity: selected ? 0.72 : 0.48
+          },
+          geometry: {
+            type: 'Point',
+            coordinates: [sector.center_lon, sector.center_lat]
+          }
+        }
+      ];
+    })
   };
+}
+
+function normalizeIdSet(value) {
+  if (!value) {
+    return new Set();
+  }
+  if (value instanceof Set) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return new Set(value);
+  }
+  return new Set();
 }
 
 function buildAircraftPolygon(latitude, longitude, headingDeg) {

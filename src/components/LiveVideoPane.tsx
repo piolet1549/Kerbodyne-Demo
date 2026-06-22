@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import JMuxer from 'jmuxer';
 import type { VideoPreviewState } from '../lib/types';
 
@@ -61,7 +61,14 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
   const overlayToneClass = waitingForDirectDecode
     ? `live-video-pane__status--decoder-${decoderDiagnostic?.tone ?? 'info'}`
     : `live-video-pane__status--${video.status}`;
-  const WrapperTag = dominant ? 'div' : 'button';
+
+  const handleCornerKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (dominant || (event.key !== 'Enter' && event.key !== ' ')) {
+      return;
+    }
+    event.preventDefault();
+    onSwap();
+  };
 
   useEffect(() => {
     renderedDirectFrameRef.current = hasRenderedDirectFrame;
@@ -381,14 +388,16 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
   const streamUrl = useMemo(() => displayUrl, [displayUrl]);
 
   return (
-    <WrapperTag
-      {...(!dominant ? { type: 'button' as const } : {})}
+    <div
       className={`live-video-pane ${dominant ? 'live-video-pane--dominant' : 'live-video-pane--corner'} ${
         waitingForFeed ? 'live-video-pane--waiting' : ''
       }`}
       {...(!dominant
         ? {
             onClick: onSwap,
+            onKeyDown: handleCornerKeyDown,
+            role: 'button' as const,
+            tabIndex: 0,
             'aria-label': 'Show video in main view'
           }
         : {})}
@@ -420,7 +429,7 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
           {overlayMessage}
         </span>
       </div>
-    </WrapperTag>
+    </div>
   );
 }
 

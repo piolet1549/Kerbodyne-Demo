@@ -231,6 +231,60 @@ impl Database {
             .map_err(|error| error.to_string())
     }
 
+    pub fn delete_non_flight_sessions(&self) -> Result<usize, String> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute_batch(
+                r#"
+                CREATE TEMP TABLE IF NOT EXISTS sessions_to_prune (id TEXT PRIMARY KEY);
+                DELETE FROM sessions_to_prune;
+                INSERT INTO sessions_to_prune (id)
+                SELECT sessions.id
+                FROM sessions
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM replay_events
+                    WHERE replay_events.session_id = sessions.id
+                      AND replay_events.envelope_json LIKE '%"type":"telemetry"%'
+                      AND replay_events.envelope_json LIKE '%"armed":true%'
+                    LIMIT 1
+                )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM track_points
+                    WHERE track_points.session_id = sessions.id
+                    LIMIT 1
+                );
+
+                DELETE FROM system_status_events WHERE session_id IN (SELECT id FROM sessions_to_prune);
+                DELETE FROM replay_events WHERE session_id IN (SELECT id FROM sessions_to_prune);
+                DELETE FROM session_video_clips WHERE session_id IN (SELECT id FROM sessions_to_prune);
+                DELETE FROM track_points WHERE session_id IN (SELECT id FROM sessions_to_prune);
+                DELETE FROM alerts WHERE session_id IN (SELECT id FROM sessions_to_prune);
+                "#,
+            )
+            .map_err(|error| error.to_string())?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM sessions WHERE id IN (SELECT id FROM sessions_to_prune)",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM sessions_to_prune", [])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| error.to_string())?;
+        Ok(deleted)
+    }
+
     pub fn load_alerts_for_session(&self, session_id: &str) -> Result<Vec<AlertRecord>, String> {
         let connection = self
             .connection

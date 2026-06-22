@@ -438,6 +438,7 @@ impl AppRuntime {
         database.save_config(&config)?;
         database.close_active_sessions(&Utc::now().to_rfc3339())?;
         database.delete_empty_sessions()?;
+        database.delete_non_flight_sessions()?;
         let sessions = database.load_sessions(MAX_SESSION_HISTORY)?;
         let focused_session_id = None;
         let alerts = Vec::new();
@@ -1138,6 +1139,7 @@ impl AppRuntime {
 
         self.end_current_session().await?;
         self.db.delete_empty_sessions()?;
+        self.db.delete_non_flight_sessions()?;
         *self.live_state.write().await = None;
         *self.focused_session_id.write().await = None;
         self.track.write().await.clear();
@@ -1746,6 +1748,7 @@ impl AppRuntime {
         let _ = self.stop_video_subsystem(app).await;
         let _ = self.end_current_session().await;
         let _ = self.db.delete_empty_sessions();
+        let _ = self.db.delete_non_flight_sessions();
     }
 
     async fn stop_video_subsystem(&self, app: &AppHandle) -> Result<(), String> {
@@ -2304,14 +2307,12 @@ impl AppRuntime {
         canonical_raw_json: &str,
         source: IngestSource,
     ) -> Result<(), String> {
-        let session_id = self
-            .ensure_session(&envelope.aircraft_id, &source.source_label())
-            .await?;
         let sent_at = normalize_timestamp(&envelope.sent_at);
+        let session_id = self.current_session_id.read().await.clone();
 
         let record = SystemStatusRecord {
             id: envelope.message_id.clone(),
-            session_id: session_id.clone(),
+            session_id: session_id.clone().unwrap_or_default(),
             aircraft_id: envelope.aircraft_id.clone(),
             status: envelope.payload.status.clone(),
             message: envelope.payload.message.clone(),
@@ -2322,12 +2323,21 @@ impl AppRuntime {
             heading_deg: envelope.payload.heading_deg,
             extras: envelope.payload.extras.clone(),
         };
+        let status_is_error = is_error_status(&record.status);
 
-        self.db.insert_system_status(&record, canonical_raw_json)?;
-        {
-            let mut system_statuses = self.system_statuses.write().await;
-            system_statuses.insert(0, record.clone());
-            system_statuses.truncate(40);
+        if let Some(session_id) = session_id {
+            let record = SystemStatusRecord {
+                session_id: session_id.clone(),
+                ..record
+            };
+            self.db.insert_system_status(&record, canonical_raw_json)?;
+            {
+                let mut system_statuses = self.system_statuses.write().await;
+                system_statuses.insert(0, record.clone());
+                system_statuses.truncate(40);
+            }
+            self.record_event(&session_id, canonical_raw_json, &sent_at, false)
+                .await?;
         }
 
         if matches!(source, IngestSource::CompatibilityAlert)
@@ -2341,10 +2351,8 @@ impl AppRuntime {
         } else {
             self.update_runtime_status(source, &sent_at).await;
         }
-        self.record_event(&session_id, canonical_raw_json, &sent_at, false)
-            .await?;
 
-        if is_error_status(&record.status) {
+        if status_is_error {
             self.emit_snapshot(app).await?;
             return Ok(());
         }
