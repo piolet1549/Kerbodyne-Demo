@@ -922,6 +922,100 @@ impl AppRuntime {
         Ok(path.to_string_lossy().to_string())
     }
 
+    pub async fn export_session_detections(
+        &self,
+        app: &AppHandle,
+        session_id: String,
+    ) -> Result<String, String> {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .iter()
+            .find(|entry| entry.id == session_id)
+            .cloned()
+            .ok_or_else(|| "Flight not found.".to_string())?;
+        let alerts = self.db.load_alerts_for_session(&session_id)?;
+        if alerts.is_empty() {
+            return Err("This flight does not contain any detections.".into());
+        }
+
+        let downloads_dir = app
+            .path()
+            .download_dir()
+            .map_err(|error| error.to_string())?;
+        fs::create_dir_all(&downloads_dir).map_err(|error| error.to_string())?;
+        let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+        let folder_name = format!(
+            "{}-detections-{}",
+            sanitize_file_component(&session.name),
+            timestamp
+        );
+        let export_dir = downloads_dir.join(folder_name);
+        fs::create_dir_all(&export_dir).map_err(|error| error.to_string())?;
+
+        let manifest_path = export_dir.join("detections.csv");
+        let mut rows = String::new();
+        write_csv_row(
+            &mut rows,
+            &[
+                "detection_index".to_string(),
+                "image_file".to_string(),
+                "class_label".to_string(),
+                "confidence".to_string(),
+                "detected_at".to_string(),
+                "alt_msl_m".to_string(),
+                "center_lat".to_string(),
+                "center_lon".to_string(),
+                "heading_deg".to_string(),
+            ],
+        );
+
+        for (index, alert) in alerts.iter().enumerate() {
+            let detection_index = index + 1;
+            let mut image_file = String::new();
+            if let Some(image_path) = alert.image_path.as_deref() {
+                let source_path = Path::new(image_path);
+                if source_path.exists() {
+                    let extension = source_path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_else(|| alert.image_format.as_deref().unwrap_or("bin"));
+                    let normalized_extension = extension.to_ascii_lowercase();
+                    let file_name = format!(
+                        "detection-{detection_index:03}-{}-{}.{}",
+                        sanitize_file_component(&alert.class_label),
+                        sanitize_file_component(&alert.id),
+                        sanitize_extension(&normalized_extension)
+                    );
+                    let destination = export_dir.join(&file_name);
+                    fs::copy(source_path, &destination).map_err(|error| {
+                        format!("Unable to copy detection image {}: {error}", source_path.display())
+                    })?;
+                    image_file = file_name;
+                }
+            }
+
+            write_csv_row(
+                &mut rows,
+                &[
+                    detection_index.to_string(),
+                    image_file,
+                    alert.class_label.clone(),
+                    alert.confidence.to_string(),
+                    normalize_timestamp(&alert.detected_at),
+                    csv_option_f64(alert.alt_msl_m),
+                    alert.sector.center_lat.to_string(),
+                    alert.sector.center_lon.to_string(),
+                    alert.sector.bearing_deg.to_string(),
+                ],
+            );
+        }
+
+        fs::write(&manifest_path, rows).map_err(|error| error.to_string())?;
+        Ok(export_dir.to_string_lossy().to_string())
+    }
+
     pub async fn set_vision_pipeline_enabled(&self, enabled: bool) -> Result<String, String> {
         let command = if enabled {
             "start_vision"

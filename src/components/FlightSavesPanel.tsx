@@ -187,8 +187,8 @@ export function FlightSavesPanel({
                           className="secondary-button secondary-button--muted save-row__icon-button save-row__icon-button--bottom"
                           onClick={() => onExportSession(session.id)}
                           disabled={isLive}
-                          title="Export telemetry"
-                          aria-label={`Export telemetry for ${session.name}`}
+                          title="Export flight data"
+                          aria-label={`Export flight data for ${session.name}`}
                         >
                           <ExportIcon />
                         </button>

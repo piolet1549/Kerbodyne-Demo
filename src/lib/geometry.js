@@ -509,6 +509,103 @@ export function buildAlertsGeoJson(alerts, selectedAlertId, highlightedAlertIds)
   };
 }
 
+export function buildConvergencesGeoJson(convergences, selectedConvergenceId) {
+  return {
+    type: 'FeatureCollection',
+    features: Array.isArray(convergences)
+      ? convergences.flatMap((convergence) => {
+          const coordinate = normalizeCoordinate(convergence?.lat, convergence?.lon);
+          if (!coordinate) {
+            return [];
+          }
+          const selected = convergence.id === selectedConvergenceId;
+          const sizeM = selected ? 34 : 28;
+          const diagOneStart = projectCoordinate(coordinate.lat, coordinate.lon, 45, sizeM);
+          const diagOneEnd = projectCoordinate(coordinate.lat, coordinate.lon, 225, sizeM);
+          const diagTwoStart = projectCoordinate(coordinate.lat, coordinate.lon, 135, sizeM);
+          const diagTwoEnd = projectCoordinate(coordinate.lat, coordinate.lon, 315, sizeM);
+          return [
+            {
+              type: 'Feature',
+              properties: {
+                id: convergence.id,
+                kind: 'x',
+                selected,
+                opacity: selected ? 1 : 0.92
+              },
+              geometry: {
+                type: 'MultiLineString',
+                coordinates: [
+                  [diagOneStart, diagOneEnd],
+                  [diagTwoStart, diagTwoEnd]
+                ]
+              }
+            },
+            {
+              type: 'Feature',
+              properties: {
+                id: convergence.id,
+                kind: 'hit',
+                selected
+              },
+              geometry: {
+                type: 'Point',
+                coordinates: [coordinate.lon, coordinate.lat]
+              }
+            }
+          ];
+        })
+      : []
+  };
+}
+
+export function buildConvergenceLinesGeoJson(convergence, alerts) {
+  if (!convergence || !Array.isArray(alerts)) {
+    return {
+      type: 'FeatureCollection',
+      features: []
+    };
+  }
+
+  const target = normalizeCoordinate(convergence.lat, convergence.lon);
+  if (!target) {
+    return {
+      type: 'FeatureCollection',
+      features: []
+    };
+  }
+
+  const alertIds = normalizeIdSet(convergence.alertIds);
+  return {
+    type: 'FeatureCollection',
+    features: alerts.flatMap((alert) => {
+      if (!alertIds.has(alert.id)) {
+        return [];
+      }
+      const sector = normalizeAlertSector(alert);
+      if (!sector) {
+        return [];
+      }
+      return [
+        {
+          type: 'Feature',
+          properties: {
+            id: convergence.id,
+            alert_id: alert.id
+          },
+          geometry: {
+            type: 'LineString',
+            coordinates: [
+              [sector.center_lon, sector.center_lat],
+              [target.lon, target.lat]
+            ]
+          }
+        }
+      ];
+    })
+  };
+}
+
 function normalizeIdSet(value) {
   if (!value) {
     return new Set();

@@ -131,6 +131,13 @@ export interface AlertRecord {
   extras: Record<string, unknown>;
 }
 
+export interface DetectionConvergence {
+  id: string;
+  lat: number;
+  lon: number;
+  alertIds: string[];
+}
+
 export interface SystemStatusRecord {
   id: string;
   session_id: string;

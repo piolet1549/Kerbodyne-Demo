@@ -12,6 +12,7 @@ import {
   clearFocusedSession,
   completeActiveStream,
   deleteSession,
+  exportSessionDetections,
   exportSessionTelemetry,
   focusSession,
   listOfflineRegions,
@@ -25,6 +26,7 @@ import {
 import type {
   AlertRecord,
   AppSnapshot,
+  DetectionConvergence,
   HudMetricState,
   OfflineRegionCatalog,
   RuntimeEvent,
@@ -35,6 +37,7 @@ import type {
 type OverlayPanel = 'flights' | 'settings' | null;
 type FlightNotificationSeverity = 'info' | 'caution' | 'warning';
 type VisionCommandState = 'idle' | 'starting' | 'stopping';
+type ExportChoice = 'telemetry' | 'detections' | 'both';
 
 interface FlightNotificationRecord {
   id: string;
@@ -128,6 +131,129 @@ const emptySnapshot: AppSnapshot = {
   raw_telemetry_packets: [],
   warnings: []
 };
+
+const CONVERGENCE_CLUSTER_DISTANCE_M = 75;
+
+interface RayIntersectionCandidate {
+  lat: number;
+  lon: number;
+  alertIds: string[];
+}
+
+function toRadians(value: number) {
+  return (value * Math.PI) / 180;
+}
+
+function normalizeBearing(value: number) {
+  const normalized = value % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+}
+
+function haversineDistanceM(startLat: number, startLon: number, endLat: number, endLon: number) {
+  const earthRadiusM = 6378137;
+  const lat1 = toRadians(startLat);
+  const lat2 = toRadians(endLat);
+  const latDiff = toRadians(endLat - startLat);
+  const lonDiff = toRadians(endLon - startLon);
+  const a =
+    Math.sin(latDiff / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(lonDiff / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusM * c;
+}
+
+function buildDetectionConvergences(alerts: AlertRecord[]): DetectionConvergence[] {
+  const candidates: RayIntersectionCandidate[] = [];
+  for (let firstIndex = 0; firstIndex < alerts.length; firstIndex += 1) {
+    for (let secondIndex = firstIndex + 1; secondIndex < alerts.length; secondIndex += 1) {
+      const intersection = intersectDetectionRays(alerts[firstIndex], alerts[secondIndex]);
+      if (intersection) {
+        candidates.push(intersection);
+      }
+    }
+  }
+
+  const clusters: Array<RayIntersectionCandidate & { count: number }> = [];
+  candidates.forEach((candidate) => {
+    const existing = clusters.find(
+      (cluster) =>
+        haversineDistanceM(cluster.lat, cluster.lon, candidate.lat, candidate.lon) <=
+        CONVERGENCE_CLUSTER_DISTANCE_M
+    );
+    if (!existing) {
+      clusters.push({ ...candidate, count: 1 });
+      return;
+    }
+    const nextCount = existing.count + 1;
+    existing.lat = (existing.lat * existing.count + candidate.lat) / nextCount;
+    existing.lon = (existing.lon * existing.count + candidate.lon) / nextCount;
+    existing.count = nextCount;
+    candidate.alertIds.forEach((alertId) => {
+      if (!existing.alertIds.includes(alertId)) {
+        existing.alertIds.push(alertId);
+      }
+    });
+  });
+
+  return clusters
+    .filter((cluster) => cluster.alertIds.length >= 2)
+    .map((cluster) => {
+      const alertIds = [...cluster.alertIds].sort();
+      return {
+        id: `convergence:${alertIds.join('+')}:${cluster.lat.toFixed(5)}:${cluster.lon.toFixed(5)}`,
+        lat: cluster.lat,
+        lon: cluster.lon,
+        alertIds
+      };
+    });
+}
+
+function intersectDetectionRays(
+  first: AlertRecord,
+  second: AlertRecord
+): RayIntersectionCandidate | null {
+  const firstLat = first.sector.center_lat;
+  const firstLon = first.sector.center_lon;
+  const secondLat = second.sector.center_lat;
+  const secondLon = second.sector.center_lon;
+  if (!hasValidPosition(firstLat, firstLon) || !hasValidPosition(secondLat, secondLon)) {
+    return null;
+  }
+
+  const originLat = (firstLat + secondLat) / 2;
+  const metersPerLat = 111_320;
+  const metersPerLon = Math.max(1, Math.cos(toRadians(originLat)) * metersPerLat);
+  const p2 = {
+    x: (secondLon - firstLon) * metersPerLon,
+    y: (secondLat - firstLat) * metersPerLat
+  };
+  const firstBearing = normalizeBearing(first.sector.bearing_deg);
+  const secondBearing = normalizeBearing(second.sector.bearing_deg);
+  const d1 = {
+    x: Math.sin(toRadians(firstBearing)),
+    y: Math.cos(toRadians(firstBearing))
+  };
+  const d2 = {
+    x: Math.sin(toRadians(secondBearing)),
+    y: Math.cos(toRadians(secondBearing))
+  };
+  const determinant = d1.x * d2.y - d1.y * d2.x;
+  if (Math.abs(determinant) < 0.00001) {
+    return null;
+  }
+
+  const t = (p2.x * d2.y - p2.y * d2.x) / determinant;
+  const u = (p2.x * d1.y - p2.y * d1.x) / determinant;
+  if (t < 0 || u < 0) {
+    return null;
+  }
+
+  return {
+    lat: firstLat + (t * d1.y) / metersPerLat,
+    lon: firstLon + (t * d1.x) / metersPerLon,
+    alertIds: [first.id, second.id]
+  };
+}
 
 function findMostRecentAlert(alerts: AlertRecord[]): AlertRecord | null {
   if (alerts.length === 0) {
@@ -371,6 +497,7 @@ export function App() {
   });
   const [offlineRegionsError, setOfflineRegionsError] = useState<string | null>(null);
   const [selectedAlertId, setSelectedAlertId] = useState<string | null>(null);
+  const [selectedConvergenceId, setSelectedConvergenceId] = useState<string | null>(null);
   const [activePanel, setActivePanel] = useState<OverlayPanel>(null);
   const [alertDetailVisible, setAlertDetailVisible] = useState(false);
   const [activeFlightLayout, setActiveFlightLayout] = useState<'video-dominant' | 'map-dominant'>(
@@ -386,10 +513,16 @@ export function App() {
   const [stopFlightOpen, setStopFlightOpen] = useState(false);
   const [rawTelemetryOpen, setRawTelemetryOpen] = useState(false);
   const [expandedHudOpen, setExpandedHudOpen] = useState(false);
+  const [measureToolActive, setMeasureToolActive] = useState(false);
   const [reviewVideoOpen, setReviewVideoOpen] = useState(false);
   const [deleteFlightTarget, setDeleteFlightTarget] = useState<{
     id: string;
     name: string;
+  } | null>(null);
+  const [exportFlightTarget, setExportFlightTarget] = useState<{
+    id: string;
+    name: string;
+    alertCount: number;
   } | null>(null);
   const [regionMenuOpen, setRegionMenuOpen] = useState(false);
   const [stopFlightName, setStopFlightName] = useState('');
@@ -585,13 +718,36 @@ export function App() {
     }
     return fallbackTrack;
   }, [effectiveReviewFrameIndex, fallbackTrack, reviewFrames, reviewMode, snapshot.track]);
+  const detectionConvergences = useMemo(
+    () => buildDetectionConvergences(deferredAlerts),
+    [deferredAlerts]
+  );
+  const selectedConvergence = useMemo(
+    () =>
+      selectedConvergenceId
+        ? detectionConvergences.find((convergence) => convergence.id === selectedConvergenceId) ??
+          null
+        : null,
+    [detectionConvergences, selectedConvergenceId]
+  );
+  const selectedConvergenceAlertIds = useMemo(
+    () => new Set(selectedConvergence?.alertIds ?? []),
+    [selectedConvergence]
+  );
+  const detectionNavigationAlerts = useMemo(
+    () =>
+      selectedConvergence
+        ? deferredAlerts.filter((alert) => selectedConvergenceAlertIds.has(alert.id))
+        : deferredAlerts,
+    [deferredAlerts, selectedConvergence, selectedConvergenceAlertIds]
+  );
   const selectedAlert = useMemo<AlertRecord | null>(
-    () => deferredAlerts.find((alert) => alert.id === selectedAlertId) ?? null,
-    [deferredAlerts, selectedAlertId]
+    () => detectionNavigationAlerts.find((alert) => alert.id === selectedAlertId) ?? null,
+    [detectionNavigationAlerts, selectedAlertId]
   );
   const selectedAlertIndex = useMemo(
-    () => deferredAlerts.findIndex((alert) => alert.id === selectedAlertId),
-    [deferredAlerts, selectedAlertId]
+    () => detectionNavigationAlerts.findIndex((alert) => alert.id === selectedAlertId),
+    [detectionNavigationAlerts, selectedAlertId]
   );
   const reviewInitialMapFocusTarget = useMemo<[number, number] | null>(() => {
     if (!reviewMode) {
@@ -754,6 +910,7 @@ export function App() {
         setSnapshot(normalizedSnapshot);
         previousAlertCountRef.current = nextSnapshot.alerts.length;
         setSelectedAlertId(null);
+        setSelectedConvergenceId(null);
         setAlertDetailVisible(false);
         void refreshOfflineRegions();
         if (nextSnapshot.config.default_map_mode !== 'satellite') {
@@ -808,6 +965,7 @@ export function App() {
 
           if (event.snapshot.alerts.length === 0) {
             setAlertDetailVisible(false);
+            setSelectedConvergenceId(null);
             setUnacknowledgedDetectionIds([]);
           }
         }
@@ -857,6 +1015,7 @@ export function App() {
     const currentActiveSessionId = snapshot.active_session_id ?? null;
     if (previousActiveSessionId && !currentActiveSessionId && reviewMode) {
       setSelectedAlertId(null);
+      setSelectedConvergenceId(null);
       setAlertDetailVisible(false);
     }
     previousActiveSessionIdRef.current = currentActiveSessionId;
@@ -899,8 +1058,12 @@ export function App() {
   const reviewDetectionDetailOpen = reviewMode && alertDetailVisible && Boolean(selectedAlert);
   const reviewExpandedHudOccluded =
     reviewDetectionDetailOpen && (viewportWidth < 1180 || viewportHeight < 900);
-  const suppressExpandedHud = activeDetectionDetailOpen || reviewExpandedHudOccluded;
+  const suppressExpandedHud =
+    activeDetectionDetailOpen || reviewExpandedHudOccluded || measureToolActive;
   const visibleMapAlerts = useMemo(() => {
+    if (selectedConvergence) {
+      return deferredAlerts.filter((alert) => selectedConvergenceAlertIds.has(alert.id));
+    }
     if (reviewMode) {
       return reviewDetectionDetailOpen ? deferredAlerts : [];
     }
@@ -918,12 +1081,17 @@ export function App() {
     deferredAlerts,
     reviewDetectionDetailOpen,
     reviewMode,
+    selectedConvergence,
+    selectedConvergenceAlertIds,
     unacknowledgedDetectionIds
   ]);
   const visibleMapAlertIds = useMemo(
     () => visibleMapAlerts.map((alert) => alert.id),
     [visibleMapAlerts]
   );
+  const detectionViewingModeActive =
+    hasFlightContext && alertDetailVisible && Boolean(selectedAlert);
+  const visibleMapConvergences = detectionViewingModeActive ? detectionConvergences : [];
   const reviewHasVideoClips = reviewMode && snapshot.review_video_clips.length > 0;
   const flightHasReceivedConnection = Boolean(snapshot.connection.last_packet_at);
   const flightHasArmedTelemetry = snapshot.active_session_has_armed_telemetry;
@@ -949,10 +1117,12 @@ export function App() {
       setReviewVideoOpen(false);
       setAlertDetailVisible(false);
       setSelectedAlertId(null);
+      setSelectedConvergenceId(null);
       setUnacknowledgedDetectionIds([]);
     }
     if (!activeFlight && previousActiveFlightRef.current) {
       setActiveFlightLayout('video-dominant');
+      setSelectedConvergenceId(null);
       setUnacknowledgedDetectionIds([]);
       dismissFlightNotification('active-flight-detection');
     }
@@ -963,6 +1133,15 @@ export function App() {
       setActivePanel(null);
     }
   }, [activeFlight, activePanel]);
+
+  useEffect(() => {
+    if (!selectedConvergenceId) {
+      return;
+    }
+    if (!selectedConvergence) {
+      setSelectedConvergenceId(null);
+    }
+  }, [selectedConvergence, selectedConvergenceId]);
 
   useEffect(() => {
     if (!activeFlight) {
@@ -1660,6 +1839,7 @@ export function App() {
       closeDetectionPanel();
       return;
     }
+    setSelectedConvergenceId(null);
     setSelectedAlertId(alertId);
     setAlertDetailVisible(true);
     setActivePanel(null);
@@ -1674,12 +1854,35 @@ export function App() {
     }
     setUnacknowledgedDetectionIds([]);
     dismissFlightNotification('active-flight-detection');
+    setSelectedConvergenceId(null);
     handleSelectAlert(targetAlert.id);
   }
 
   function closeDetectionPanel() {
     setAlertDetailVisible(false);
     setSelectedAlertId(null);
+    setSelectedConvergenceId(null);
+  }
+
+  function handleSelectConvergence(convergenceId: string) {
+    if (selectedConvergenceId === convergenceId) {
+      setSelectedConvergenceId(null);
+      return;
+    }
+    const convergence = detectionConvergences.find((entry) => entry.id === convergenceId);
+    if (!convergence) {
+      return;
+    }
+    const firstAssociatedAlert = deferredAlerts.find((alert) =>
+      convergence.alertIds.includes(alert.id)
+    );
+    if (!firstAssociatedAlert) {
+      return;
+    }
+    setSelectedConvergenceId(convergence.id);
+    setSelectedAlertId(firstAssociatedAlert.id);
+    setAlertDetailVisible(true);
+    setActivePanel(null);
   }
 
   function handleFollowModeChange(enabled: boolean) {
@@ -1693,20 +1896,26 @@ export function App() {
   }
 
   function stepDetection(direction: -1 | 1) {
-    if (deferredAlerts.length === 0) {
+    if (detectionNavigationAlerts.length === 0) {
       return;
     }
     const currentIndex = selectedAlertIndex >= 0 ? selectedAlertIndex : 0;
-    const nextIndex = Math.max(0, Math.min(currentIndex + direction, deferredAlerts.length - 1));
-    const nextAlert = deferredAlerts[nextIndex];
+    const nextIndex = Math.max(
+      0,
+      Math.min(currentIndex + direction, detectionNavigationAlerts.length - 1)
+    );
+    const nextAlert = detectionNavigationAlerts[nextIndex];
     if (!nextAlert) {
       return;
     }
-    handleSelectAlert(nextAlert.id);
+    setSelectedAlertId(nextAlert.id);
+    setAlertDetailVisible(true);
+    setActivePanel(null);
   }
 
   function handleFocusSession(sessionId: string) {
     setSelectedAlertId(null);
+    setSelectedConvergenceId(null);
     setAlertDetailVisible(false);
     setReviewFrameIndex(null);
     setReviewPlaybackActive(false);
@@ -1719,6 +1928,7 @@ export function App() {
 
   function handleClearReview() {
     setSelectedAlertId(null);
+    setSelectedConvergenceId(null);
     setAlertDetailVisible(false);
     setReviewPlaybackActive(false);
     setReviewVideoOpen(false);
@@ -1771,17 +1981,37 @@ export function App() {
     );
   }
 
-  async function handleExportSession(sessionId: string) {
-    const exportPath = await exportSessionTelemetry(sessionId);
-    const exportFileName =
-      exportPath.split(/[\\/]/).filter(Boolean).pop() ?? 'Telemetry export.csv';
+  function openExportPrompt(sessionId: string) {
+    const session = snapshot.sessions.find((entry) => entry.id === sessionId);
+    setExportFlightTarget({
+      id: sessionId,
+      name: session?.name ?? 'Saved flight',
+      alertCount: session?.alert_count ?? 0
+    });
+  }
+
+  async function handleExportSession(sessionId: string, choice: ExportChoice) {
+    const savedPaths: string[] = [];
+    if (choice === 'telemetry' || choice === 'both') {
+      savedPaths.push(await exportSessionTelemetry(sessionId));
+    }
+    if (choice === 'detections' || choice === 'both') {
+      savedPaths.push(await exportSessionDetections(sessionId));
+    }
+    const exportName =
+      choice === 'telemetry'
+        ? savedPaths[0]?.split(/[\\/]/).filter(Boolean).pop() ?? 'Telemetry export.csv'
+        : choice === 'detections'
+          ? savedPaths[0]?.split(/[\\/]/).filter(Boolean).pop() ?? 'Detection export'
+          : 'Telemetry and detections';
     upsertFlightNotification({
       id: `export:${sessionId}:${Date.now()}`,
-      message: `${exportFileName} saved to Downloads`,
+      message: `${exportName} saved to Downloads`,
       severity: 'info',
       persistent: false,
       placement: reviewMode ? 'review-above-replay' : 'default'
     });
+    setExportFlightTarget(null);
   }
 
   const elevatedNotifications = reviewMode
@@ -1798,6 +2028,9 @@ export function App() {
       alerts={visibleMapAlerts}
       selectedAlertId={selectedAlertId}
       highlightedAlertIds={visibleMapAlertIds}
+      convergences={visibleMapConvergences}
+      selectedConvergenceId={selectedConvergenceId}
+      convergenceAlerts={visibleMapAlerts}
       enabledRegions={mapRegionReady ? enabledRegions : []}
       selectedRegion={mapRegionReady ? selectedRegion : null}
       assetOrigin={mapRegionReady ? offlineCatalog.asset_origin : null}
@@ -1817,9 +2050,17 @@ export function App() {
         }
       }}
       onFollowModeChange={handleFollowModeChange}
+      onMeasureModeChange={setMeasureToolActive}
       onSelectAlert={handleSelectAlert}
+      onSelectConvergence={handleSelectConvergence}
     />
   );
+  const exportTargetDetectionsKnown =
+    exportFlightTarget?.id != null && exportFlightTarget.id === snapshot.focused_session_id;
+  const exportTargetHasDetections =
+    (exportFlightTarget?.alertCount ?? 0) > 0 ||
+    (exportTargetDetectionsKnown &&
+      deferredAlerts.some((alert) => alert.session_id === exportFlightTarget?.id));
 
   return (
     <div className="console-shell">
@@ -1977,11 +2218,9 @@ export function App() {
                 {focusedSession?.id ? (
                   <button
                     className="secondary-button secondary-button--muted save-row__icon-button"
-                    onClick={() =>
-                      void runCommand(() => handleExportSession(focusedSession.id))
-                    }
-                    title="Export telemetry"
-                    aria-label="Export telemetry"
+                    onClick={() => openExportPrompt(focusedSession.id)}
+                    title="Export flight data"
+                    aria-label="Export flight data"
                   >
                     <ExportIcon />
                   </button>
@@ -2134,14 +2373,27 @@ export function App() {
                 alert={selectedAlert}
                 config={snapshot.config}
                 alertIndex={Math.max(selectedAlertIndex, 0)}
-                alertCount={deferredAlerts.length}
+                alertCount={detectionNavigationAlerts.length}
                 onPrevious={() => stepDetection(-1)}
                 onNext={() => stepDetection(1)}
                 canPrevious={selectedAlertIndex > 0}
-                canNext={selectedAlertIndex >= 0 && selectedAlertIndex < deferredAlerts.length - 1}
+                canNext={
+                  selectedAlertIndex >= 0 &&
+                  selectedAlertIndex < detectionNavigationAlerts.length - 1
+                }
                 onClose={closeDetectionPanel}
               />
             </div>
+          </div>
+        ) : null}
+
+        {detectionViewingModeActive && selectedConvergence ? (
+          <div
+            className={`convergence-location-chip ${
+              reviewMode ? 'convergence-location-chip--review' : ''
+            }`}
+          >
+            Convergence at {selectedConvergence.lat.toFixed(5)}, {selectedConvergence.lon.toFixed(5)}
           </div>
         ) : null}
 
@@ -2176,11 +2428,14 @@ export function App() {
               alert={selectedAlert}
               config={snapshot.config}
               alertIndex={Math.max(selectedAlertIndex, 0)}
-              alertCount={deferredAlerts.length}
+              alertCount={detectionNavigationAlerts.length}
               onPrevious={() => stepDetection(-1)}
               onNext={() => stepDetection(1)}
               canPrevious={selectedAlertIndex > 0}
-              canNext={selectedAlertIndex >= 0 && selectedAlertIndex < deferredAlerts.length - 1}
+              canNext={
+                selectedAlertIndex >= 0 &&
+                selectedAlertIndex < detectionNavigationAlerts.length - 1
+              }
               onClose={closeDetectionPanel}
             />
         ) : null}
@@ -2212,9 +2467,7 @@ export function App() {
                   onRequestDeleteSession={(sessionId, name) =>
                     setDeleteFlightTarget({ id: sessionId, name })
                   }
-                  onExportSession={(sessionId) =>
-                    void runCommand(() => handleExportSession(sessionId))
-                  }
+                  onExportSession={openExportPrompt}
                 />
               ) : null}
             </aside>
@@ -2348,6 +2601,59 @@ export function App() {
                 }
               >
                 Delete
+              </button>
+            </div>
+          </section>
+        </>
+      ) : null}
+
+      {exportFlightTarget ? (
+        <>
+          <button
+            className="modal-backdrop"
+            onClick={() => setExportFlightTarget(null)}
+            aria-label="Close export options"
+          />
+          <section className="modal-card export-choice-modal">
+            <div className="modal-card__header">
+              <div>
+                <span className="section-title">Export flight</span>
+                <strong>{exportFlightTarget.name}</strong>
+              </div>
+            </div>
+
+            <div className="modal-card__actions modal-card__actions--stacked">
+              <button
+                className="primary-toggle"
+                onClick={() =>
+                  void runCommand(() => handleExportSession(exportFlightTarget.id, 'telemetry'))
+                }
+              >
+                Flight log
+              </button>
+              <button
+                className="secondary-button"
+                disabled={!exportTargetHasDetections}
+                onClick={() =>
+                  void runCommand(() => handleExportSession(exportFlightTarget.id, 'detections'))
+                }
+              >
+                Detections
+              </button>
+              <button
+                className="secondary-button"
+                disabled={!exportTargetHasDetections}
+                onClick={() =>
+                  void runCommand(() => handleExportSession(exportFlightTarget.id, 'both'))
+                }
+              >
+                Both
+              </button>
+              <button
+                className="secondary-button secondary-button--muted"
+                onClick={() => setExportFlightTarget(null)}
+              >
+                Cancel
               </button>
             </div>
           </section>

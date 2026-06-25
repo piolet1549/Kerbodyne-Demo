@@ -70,6 +70,12 @@ export async function exportSessionTelemetry(sessionId: string): Promise<string>
   });
 }
 
+export async function exportSessionDetections(sessionId: string): Promise<string> {
+  return invoke<string>('export_session_detections', {
+    sessionId
+  });
+}
+
 export async function setVisionPipelineEnabled(enabled: boolean): Promise<string> {
   return invoke<string>('set_vision_pipeline_enabled', { enabled });
 }

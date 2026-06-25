@@ -127,6 +127,15 @@ async fn export_session_telemetry(
 }
 
 #[tauri::command]
+async fn export_session_detections(
+    app: AppHandle,
+    state: State<'_, Arc<AppRuntime>>,
+    session_id: String,
+) -> Result<String, String> {
+    state.export_session_detections(&app, session_id).await
+}
+
+#[tauri::command]
 async fn set_vision_pipeline_enabled(
     state: State<'_, Arc<AppRuntime>>,
     enabled: bool,
@@ -235,6 +244,7 @@ pub fn run() {
             update_session_details,
             delete_session,
             export_session_telemetry,
+            export_session_detections,
             set_vision_pipeline_enabled
         ])
         .build(tauri::generate_context!())

@@ -1,4 +1,4 @@
-import type { AircraftLiveState, AlertRecord, TrackPointRecord } from './types';
+import type { AircraftLiveState, AlertRecord, DetectionConvergence, TrackPointRecord } from './types';
 
 export function buildAlertSectorsGeoJson(
   alerts: AlertRecord[],
@@ -15,6 +15,16 @@ export function buildAlertsGeoJson(
   alerts: AlertRecord[],
   selectedAlertId?: string | null,
   highlightedAlertIds?: string[] | Set<string> | null
+): any;
+
+export function buildConvergencesGeoJson(
+  convergences: DetectionConvergence[],
+  selectedConvergenceId?: string | null
+): any;
+
+export function buildConvergenceLinesGeoJson(
+  convergence: DetectionConvergence | null,
+  alerts: AlertRecord[]
 ): any;
 
 export function buildCoverageMaskGeoJson(enabledRegions?: Array<{

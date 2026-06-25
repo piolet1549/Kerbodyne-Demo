@@ -4,6 +4,8 @@ import maplibregl, { type GeoJSONSource, type LayerSpecification, type Map } fro
 import {
   buildAlertSectorsGeoJson,
   buildAlertsGeoJson,
+  buildConvergenceLinesGeoJson,
+  buildConvergencesGeoJson,
   buildCoverageBoundsGeoJson,
   buildCoverageMaskGeoJson,
   buildTrackGeoJson
@@ -13,6 +15,7 @@ import type {
   AircraftLiveState,
   AlertRecord,
   AppConfig,
+  DetectionConvergence,
   MapMode,
   OfflineRegionManifest,
   TrackPointRecord
@@ -25,6 +28,9 @@ interface LiveMapProps {
   alerts: AlertRecord[];
   selectedAlertId?: string | null;
   highlightedAlertIds?: string[];
+  convergences?: DetectionConvergence[];
+  selectedConvergenceId?: string | null;
+  convergenceAlerts?: AlertRecord[];
   enabledRegions: OfflineRegionManifest[];
   selectedRegion?: OfflineRegionManifest | null;
   assetOrigin?: string | null;
@@ -40,16 +46,27 @@ interface LiveMapProps {
   focusKey?: string | null;
   onViewStateChange?: (view: { center: [number, number]; zoom: number; bearing: number }) => void;
   onFollowModeChange?: (enabled: boolean) => void;
+  onMeasureModeChange?: (enabled: boolean) => void;
   onSelectAlert: (alertId: string) => void;
+  onSelectConvergence?: (convergenceId: string) => void;
 }
 
 const SOURCE_TRACK = 'track-source';
 const SOURCE_ALERTS = 'alerts-source';
 const SOURCE_SECTOR = 'sector-source';
+const SOURCE_CONVERGENCES = 'convergences-source';
+const SOURCE_CONVERGENCE_LINES = 'convergence-lines-source';
 const SOURCE_COVERAGE_MASK = 'coverage-mask-source';
 const SOURCE_COVERAGE_BOUNDS = 'coverage-bounds-source';
 const SOURCE_MEASURE = 'measure-source';
-const INTERACTIVE_LAYERS = ['alerts-layer', 'alerts-halo-layer', 'sector-mask', 'sector-fill', 'sector-border'];
+const INTERACTIVE_LAYERS = [
+  'convergence-hit-layer',
+  'alerts-layer',
+  'alerts-halo-layer',
+  'sector-mask',
+  'sector-fill',
+  'sector-border'
+];
 type MeasureUnit = 'nm' | 'mi' | 'm' | 'km';
 const MEASURE_UNIT_LABELS: Record<MeasureUnit, string> = {
   nm: 'Nautical Miles',
@@ -83,6 +100,9 @@ export function LiveMap({
   alerts,
   selectedAlertId,
   highlightedAlertIds = [],
+  convergences = [],
+  selectedConvergenceId = null,
+  convergenceAlerts = [],
   enabledRegions,
   selectedRegion,
   assetOrigin,
@@ -98,7 +118,9 @@ export function LiveMap({
   focusKey,
   onViewStateChange,
   onFollowModeChange,
-  onSelectAlert
+  onMeasureModeChange,
+  onSelectAlert,
+  onSelectConvergence
 }: LiveMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
@@ -108,9 +130,13 @@ export function LiveMap({
   const lastRightClickRef = useRef<{ at: number; x: number; y: number } | null>(null);
   const fittedRegionIdRef = useRef<string | null>(null);
   const onSelectAlertRef = useRef(onSelectAlert);
+  const onSelectConvergenceRef = useRef(onSelectConvergence);
   const liveStateRef = useRef(liveState);
   const trackRef = useRef(track);
   const alertsRef = useRef(alerts);
+  const convergencesRef = useRef(convergences);
+  const selectedConvergenceIdRef = useRef(selectedConvergenceId);
+  const convergenceAlertsRef = useRef(convergenceAlerts);
   const selectedAlertIdRef = useRef(selectedAlertId);
   const highlightedAlertIdsRef = useRef(highlightedAlertIds);
   const mapModeRef = useRef(mapMode);
@@ -122,6 +148,7 @@ export function LiveMap({
   const selectedRegionRef = useRef(selectedRegion);
   const onViewStateChangeRef = useRef(onViewStateChange);
   const onFollowModeChangeRef = useRef(onFollowModeChange);
+  const onMeasureModeChangeRef = useRef(onMeasureModeChange);
   const previousFollowAvailabilityRef = useRef(false);
   const measureEnabledRef = useRef(false);
   const measurePointsRef = useRef<Array<[number, number]>>([]);
@@ -294,9 +321,24 @@ export function LiveMap({
   }, [onSelectAlert]);
 
   useEffect(() => {
+    onSelectConvergenceRef.current = onSelectConvergence;
+  }, [onSelectConvergence]);
+
+  useEffect(() => {
+    onMeasureModeChangeRef.current = onMeasureModeChange;
+  }, [onMeasureModeChange]);
+
+  useEffect(() => {
+    onMeasureModeChangeRef.current?.(measureOpen);
+  }, [measureOpen]);
+
+  useEffect(() => {
     liveStateRef.current = filteredLiveState;
     trackRef.current = filteredTrack;
     alertsRef.current = filteredAlerts;
+    convergencesRef.current = convergences;
+    selectedConvergenceIdRef.current = selectedConvergenceId;
+    convergenceAlertsRef.current = convergenceAlerts;
     selectedAlertIdRef.current = selectedAlertId;
     highlightedAlertIdsRef.current = highlightedAlertIds;
     mapModeRef.current = mapMode;
@@ -308,12 +350,15 @@ export function LiveMap({
     selectedRegionRef.current = selectedRegion;
     onViewStateChangeRef.current = onViewStateChange;
     onFollowModeChangeRef.current = onFollowModeChange;
+    onMeasureModeChangeRef.current = onMeasureModeChange;
     measureEnabledRef.current = measureOpen;
     measurePointsRef.current = measurePoints;
     measureUnitRef.current = measureUnit;
   }, [
     activeFlight,
     config,
+    convergenceAlerts,
+    convergences,
     enabledRegions,
     filteredAlerts,
     filteredLiveState,
@@ -325,10 +370,12 @@ export function LiveMap({
     measureUnit,
     reviewMode,
     selectedAlertId,
+    selectedConvergenceId,
     highlightedAlertIds,
     selectedRegion,
     onViewStateChange,
-    onFollowModeChange
+    onFollowModeChange,
+    onMeasureModeChange
   ]);
 
   useEffect(() => {
@@ -414,6 +461,54 @@ export function LiveMap({
           activeFlightRef.current,
           linkPulseActiveRef.current
         );
+        let disposed = false;
+        const syncCurrentMapOverlays = () => {
+          if (disposed || !map.isStyleLoaded()) {
+            return false;
+          }
+          try {
+            ensureSources(map);
+            applyOverlayAppearance(map, mapModeRef.current, configRef.current.track_display);
+            syncMapData(
+              map,
+              trackRef.current,
+              alertsRef.current,
+              selectedAlertIdRef.current,
+              highlightedAlertIdsRef.current,
+              convergencesRef.current,
+              selectedConvergenceIdRef.current,
+              convergenceAlertsRef.current,
+              enabledRegionsRef.current,
+              configRef.current.stale_after_seconds
+            );
+            syncAircraftMarker(
+              aircraftMarkerRef.current,
+              aircraftMarkerGlyphRef.current,
+              liveStateRef.current,
+              configRef.current,
+              activeFlightRef.current,
+              linkPulseActiveRef.current
+            );
+            syncMeasureData(map, measurePointsRef.current);
+            syncMeasureOverlay(
+              map,
+              measurePointsRef.current,
+              measureUnitRef.current,
+              setMeasureLabelScreen
+            );
+            const currentCenter = map.getCenter();
+            setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
+            syncScaleIndicator(map, setScaleIndicator);
+            setMapLoadingLabel(null);
+            return true;
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : 'Map overlay synchronization failed';
+            console.error('Kerbodyne map overlay synchronization failed:', error);
+            setMapError(message);
+            return false;
+          }
+        };
 
         map.on('error', (event) => {
         const message =
@@ -422,37 +517,8 @@ export function LiveMap({
         setMapError(message);
       });
 
-        map.on('style.load', () => {
-          ensureSources(map);
-          applyOverlayAppearance(map, mapModeRef.current, configRef.current.track_display);
-        syncMapData(
-          map,
-          trackRef.current,
-          alertsRef.current,
-          selectedAlertIdRef.current,
-          highlightedAlertIdsRef.current,
-          enabledRegionsRef.current,
-          configRef.current.stale_after_seconds
-        );
-        syncAircraftMarker(
-          aircraftMarkerRef.current,
-          aircraftMarkerGlyphRef.current,
-          liveStateRef.current,
-          configRef.current,
-          activeFlightRef.current,
-          linkPulseActiveRef.current
-        );
-        syncMeasureData(map, measurePointsRef.current);
-          syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
-          const currentCenter = map.getCenter();
-          setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
-          syncScaleIndicator(map, setScaleIndicator);
-          setMapLoadingLabel(null);
-        });
-
-        map.on('load', () => {
-          setMapLoadingLabel(null);
-        });
+        map.on('style.load', syncCurrentMapOverlays);
+        map.on('load', syncCurrentMapOverlays);
 
       map.on('click', (event) => {
         if (measureEnabledRef.current) {
@@ -471,7 +537,15 @@ export function LiveMap({
             layers: interactiveLayers
           })
           .find((entry) => typeof entry.properties?.id === 'string');
-        const alertId = feature?.properties?.id;
+        const featureId = feature?.properties?.id;
+        if (typeof featureId !== 'string') {
+          return;
+        }
+        if (feature?.layer.id === 'convergence-hit-layer') {
+          onSelectConvergenceRef.current?.(featureId);
+          return;
+        }
+        const alertId = featureId;
         if (typeof alertId === 'string') {
           onSelectAlertRef.current(alertId);
         }
@@ -548,7 +622,17 @@ export function LiveMap({
       canvas.addEventListener('mouseup', handleMouseUp);
 
       mapRef.current = map;
+      const initialOverlaySyncFrame = window.requestAnimationFrame(() => {
+        if (!syncCurrentMapOverlays()) {
+          map.once('idle', syncCurrentMapOverlays);
+        }
+      });
         return () => {
+          disposed = true;
+          window.cancelAnimationFrame(initialOverlaySyncFrame);
+          map.off('style.load', syncCurrentMapOverlays);
+          map.off('load', syncCurrentMapOverlays);
+          map.off('idle', syncCurrentMapOverlays);
           canvas.removeEventListener('contextmenu', handleContextMenu);
           canvas.removeEventListener('mouseup', handleMouseUp);
           aircraftMarker.remove();
@@ -614,6 +698,9 @@ export function LiveMap({
       filteredAlerts,
       selectedAlertId,
       highlightedAlertIds,
+      convergences,
+      selectedConvergenceId,
+      convergenceAlerts,
       enabledRegions,
       config.stale_after_seconds
     );
@@ -621,6 +708,8 @@ export function LiveMap({
     syncMeasureOverlay(map, measurePoints, measureUnit, setMeasureLabelScreen);
   }, [
     config,
+    convergenceAlerts,
+    convergences,
     enabledRegions,
     filteredAlerts,
     filteredTrack,
@@ -628,6 +717,7 @@ export function LiveMap({
     measurePoints,
     measureUnit,
     selectedAlertId,
+    selectedConvergenceId,
     highlightedAlertIds
   ]);
 
@@ -1041,6 +1131,40 @@ function ensureSources(map: Map) {
     }
   );
 
+  ensureGeoJsonSource(map, SOURCE_CONVERGENCE_LINES, buildConvergenceLinesGeoJson(null, []));
+  ensureLayer(
+    map,
+    {
+      id: 'convergence-line-casing-layer',
+      type: 'line',
+      source: SOURCE_CONVERGENCE_LINES,
+      paint: {
+        'line-color': '#050505',
+        'line-width': 0,
+        'line-opacity': 0,
+        'line-dasharray': [2.8, 1.6]
+      }
+    }
+  );
+  ensureLayer(
+    map,
+    {
+      id: 'convergence-line-layer',
+      type: 'line',
+      source: SOURCE_CONVERGENCE_LINES,
+      layout: {
+        'line-cap': 'round',
+        'line-join': 'round'
+      },
+      paint: {
+        'line-color': '#ff8a24',
+        'line-width': 3.1,
+        'line-opacity': 0.96,
+        'line-dasharray': [2.8, 1.6]
+      }
+    }
+  );
+
   ensureGeoJsonSource(map, SOURCE_COVERAGE_MASK, buildCoverageMaskGeoJson(null));
   ensureLayer(
     map,
@@ -1204,6 +1328,58 @@ function ensureSources(map: Map) {
       }
     }
   );
+
+  ensureGeoJsonSource(map, SOURCE_CONVERGENCES, buildConvergencesGeoJson([], null));
+  ensureLayer(
+    map,
+    {
+      id: 'convergence-x-border-layer',
+      type: 'line',
+      source: SOURCE_CONVERGENCES,
+      filter: ['==', ['get', 'kind'], 'x'],
+      layout: {
+        'line-cap': 'round',
+        'line-join': 'round'
+      },
+      paint: {
+        'line-color': '#ffffff',
+        'line-width': ['case', ['boolean', ['get', 'selected'], false], 8.4, 0],
+        'line-opacity': ['case', ['boolean', ['get', 'selected'], false], 0.94, 0]
+      }
+    }
+  );
+  ensureLayer(
+    map,
+    {
+      id: 'convergence-x-layer',
+      type: 'line',
+      source: SOURCE_CONVERGENCES,
+      filter: ['==', ['get', 'kind'], 'x'],
+      layout: {
+        'line-cap': 'round',
+        'line-join': 'round'
+      },
+      paint: {
+        'line-color': '#ff8a24',
+        'line-width': ['case', ['boolean', ['get', 'selected'], false], 5.2, 4.1],
+        'line-opacity': ['coalesce', ['get', 'opacity'], 0.92]
+      }
+    }
+  );
+  ensureLayer(
+    map,
+    {
+      id: 'convergence-hit-layer',
+      type: 'circle',
+      source: SOURCE_CONVERGENCES,
+      filter: ['==', ['get', 'kind'], 'hit'],
+      paint: {
+        'circle-radius': ['case', ['boolean', ['get', 'selected'], false], 22, 18],
+        'circle-color': '#ff8a24',
+        'circle-opacity': 0.001
+      }
+    }
+  );
 }
 
 function safeSetPaintProperty(map: Map, layerId: string, property: string, value: unknown) {
@@ -1278,6 +1454,9 @@ function syncMapData(
   alerts: AlertRecord[],
   selectedAlertId?: string | null,
   highlightedAlertIds: string[] = [],
+  convergences: DetectionConvergence[] = [],
+  selectedConvergenceId: string | null = null,
+  convergenceAlerts: AlertRecord[] = [],
   enabledRegions: OfflineRegionManifest[] = [],
   staleAfterSeconds = 10
 ) {
@@ -1286,7 +1465,21 @@ function syncMapData(
     buildAlertsGeoJson(alerts, selectedAlertId, highlightedAlertIds)
   );
   (map.getSource(SOURCE_SECTOR) as GeoJSONSource).setData(
-    buildAlertSectorsGeoJson(alerts, selectedAlertId, highlightedAlertIds)
+    buildAlertSectorsGeoJson(
+      selectedConvergenceId ? [] : alerts,
+      selectedAlertId,
+      highlightedAlertIds
+    )
+  );
+  (map.getSource(SOURCE_CONVERGENCES) as GeoJSONSource).setData(
+    buildConvergencesGeoJson(convergences, selectedConvergenceId)
+  );
+  const selectedConvergence =
+    selectedConvergenceId != null
+      ? convergences.find((convergence) => convergence.id === selectedConvergenceId) ?? null
+      : null;
+  (map.getSource(SOURCE_CONVERGENCE_LINES) as GeoJSONSource).setData(
+    buildConvergenceLinesGeoJson(selectedConvergence, convergenceAlerts)
   );
   (map.getSource(SOURCE_COVERAGE_MASK) as GeoJSONSource).setData(
     buildCoverageMaskGeoJson(enabledRegions)

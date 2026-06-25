@@ -1590,6 +1590,28 @@ button {
   font-weight: 700;
 }
 
+.convergence-location-chip {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  z-index: 8;
+  padding: 10px 16px;
+  border: 1px solid rgba(255, 138, 36, 0.92);
+  border-radius: 999px;
+  background: rgba(8, 8, 8, 0.92);
+  color: #ffffff;
+  font-size: 0.86rem;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  box-shadow: 0 0 24px rgba(255, 122, 34, 0.18);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.convergence-location-chip--review {
+  bottom: 190px;
+}
+
 .alert-image-shell {
   display: grid;
   place-items: center;
@@ -1915,6 +1937,30 @@ button {
 .modal-card__actions {
   justify-content: flex-end;
   margin-top: 20px;
+}
+
+.export-choice-modal {
+  width: min(280px, calc(100vw - 32px));
+}
+
+.export-choice-modal .modal-card__header {
+  justify-content: center;
+  text-align: center;
+}
+
+.modal-card__actions.modal-card__actions--stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.modal-card__actions--stacked .primary-toggle,
+.modal-card__actions--stacked .secondary-button {
+  width: 100%;
+  min-height: 36px;
+  flex: 0 0 auto;
+  justify-content: center;
+  padding: 8px 12px;
 }
 
 .modal-copy {
