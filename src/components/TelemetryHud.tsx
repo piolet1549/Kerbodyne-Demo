@@ -57,6 +57,7 @@ interface TelemetryHudProps {
     battery?: HudMetricState;
   };
   expandedHud?: ExpandedHudData | null;
+  mainDock?: 'left' | 'right';
   onOpenRawData?: (() => void) | undefined;
   onToggleExpandedHud?: (() => void) | undefined;
 }
@@ -377,6 +378,7 @@ export function TelemetryHud({
   attitude,
   metricStates,
   expandedHud,
+  mainDock = 'left',
   onOpenRawData,
   onToggleExpandedHud
 }: TelemetryHudProps) {
@@ -391,7 +393,11 @@ export function TelemetryHud({
 
   return (
     <div className="telemetry-hud-layer">
-      <div className="telemetry-hud-stack telemetry-hud-stack--main">
+      <div
+        className={`telemetry-hud-stack telemetry-hud-stack--main ${
+          mainDock === 'right' ? 'telemetry-hud-stack--main-right' : ''
+        }`}
+      >
         <div
           className={liveHudClassName}
           title={mode === 'live' && liveConnectionState ? liveConnectionState.label : undefined}

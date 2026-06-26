@@ -84,6 +84,25 @@ button {
   display: block;
 }
 
+.map-svg-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.map-svg-overlay * {
+  vector-effect: non-scaling-stroke;
+}
+
+.map-svg-overlay__click-target {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
 .aircraft-marker {
   width: 38px;
   height: 50px;
@@ -435,6 +454,11 @@ button {
 
 .telemetry-hud-stack--main {
   left: 18px;
+}
+
+.telemetry-hud-stack--main-right {
+  left: auto;
+  right: 18px;
 }
 
 .telemetry-hud-stack--expanded {

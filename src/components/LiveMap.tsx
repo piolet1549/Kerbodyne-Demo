@@ -171,6 +171,7 @@ export function LiveMap({
   const [scaleIndicator, setScaleIndicator] = useState<{ widthPx: number; label: string } | null>(
     null
   );
+  const [mapOverlayRevision, setMapOverlayRevision] = useState(0);
   const [followEnabled, setFollowEnabled] = useState(true);
   const [centerCoordinates, setCenterCoordinates] = useState<[number, number]>(
     selectedRegion
@@ -236,6 +237,42 @@ export function LiveMap({
   }, [measurementDistanceM, measureUnit]);
   const followAvailable = activeFlight && Boolean(filteredLiveState?.armed);
   const effectiveFollowEnabled = forceFollow || followEnabled;
+  const svgMapOverlay = useMemo(() => {
+    const map = mapRef.current;
+    if (!map || mapError) {
+      return null;
+    }
+    return buildSvgMapOverlay({
+      map,
+      track: filteredTrack,
+      alerts: filteredAlerts,
+      selectedAlertId,
+      highlightedAlertIds,
+      convergences,
+      selectedConvergenceId,
+      convergenceAlerts,
+      trackDisplay: config.track_display,
+      staleAfterSeconds: config.stale_after_seconds,
+      mapMode,
+      interactive: !measureOpen,
+      onSelectAlert: (alertId) => onSelectAlertRef.current(alertId),
+      onSelectConvergence: (convergenceId) => onSelectConvergenceRef.current?.(convergenceId)
+    });
+  }, [
+    config.stale_after_seconds,
+    config.track_display,
+    convergenceAlerts,
+    convergences,
+    filteredAlerts,
+    filteredTrack,
+    highlightedAlertIds,
+    mapError,
+    mapMode,
+    mapOverlayRevision,
+    measureOpen,
+    selectedAlertId,
+    selectedConvergenceId
+  ]);
   const measureControl = (
     <div ref={measureShellRef} className="measure-shell">
       <button
@@ -499,6 +536,7 @@ export function LiveMap({
             const currentCenter = map.getCenter();
             setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
             syncScaleIndicator(map, setScaleIndicator);
+            setMapOverlayRevision((revision) => (revision + 1) % 1_000_000);
             setMapLoadingLabel(null);
             return true;
           } catch (error) {
@@ -576,6 +614,7 @@ export function LiveMap({
         setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
         syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
         syncScaleIndicator(map, setScaleIndicator);
+        setMapOverlayRevision((revision) => (revision + 1) % 1_000_000);
       });
 
       map.on('moveend', () => {
@@ -926,6 +965,7 @@ export function LiveMap({
       setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
       syncScaleIndicator(map, setScaleIndicator);
       syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
+      setMapOverlayRevision((revision) => (revision + 1) % 1_000_000);
     });
 
     return () => window.cancelAnimationFrame(handle);
@@ -982,6 +1022,7 @@ export function LiveMap({
   return (
     <div className={`map-stage ${compactFlightView ? 'map-stage--compact' : ''}`}>
       <div ref={containerRef} className="map-canvas" />
+      {svgMapOverlay}
       {mapError ? (
         <div className="map-fallback">
           <span className="section-title">Map unavailable</span>
@@ -1028,6 +1069,396 @@ export function LiveMap({
       ) : null}
     </div>
   );
+}
+
+type CoordinatePair = [number, number];
+type ProjectedPoint = { x: number; y: number };
+
+interface GeoJsonFeature {
+  type: 'Feature';
+  properties?: Record<string, unknown> | null;
+  geometry?: {
+    type: string;
+    coordinates: unknown;
+  } | null;
+}
+
+interface GeoJsonFeatureCollection {
+  type: 'FeatureCollection';
+  features: GeoJsonFeature[];
+}
+
+interface SvgMapOverlayOptions {
+  map: Map;
+  track: TrackPointRecord[];
+  alerts: AlertRecord[];
+  selectedAlertId?: string | null;
+  highlightedAlertIds: string[];
+  convergences: DetectionConvergence[];
+  selectedConvergenceId?: string | null;
+  convergenceAlerts: AlertRecord[];
+  trackDisplay: AppConfig['track_display'];
+  staleAfterSeconds: number;
+  mapMode: MapMode;
+  interactive: boolean;
+  onSelectAlert: (alertId: string) => void;
+  onSelectConvergence: (convergenceId: string) => void;
+}
+
+function buildSvgMapOverlay({
+  map,
+  track,
+  alerts,
+  selectedAlertId,
+  highlightedAlertIds,
+  convergences,
+  selectedConvergenceId,
+  convergenceAlerts,
+  trackDisplay,
+  staleAfterSeconds,
+  mapMode,
+  interactive,
+  onSelectAlert,
+  onSelectConvergence
+}: SvgMapOverlayOptions) {
+  const size = map.getContainer().getBoundingClientRect();
+  if (size.width <= 0 || size.height <= 0) {
+    return null;
+  }
+
+  const satellite = mapMode === 'satellite';
+  const selectedConvergence =
+    selectedConvergenceId != null
+      ? convergences.find((convergence) => convergence.id === selectedConvergenceId) ?? null
+      : null;
+  const trackGeoJson = buildTrackGeoJson(track, staleAfterSeconds) as GeoJsonFeatureCollection;
+  const sectorGeoJson = buildAlertSectorsGeoJson(
+    selectedConvergenceId ? [] : alerts,
+    selectedAlertId,
+    highlightedAlertIds
+  ) as GeoJsonFeatureCollection;
+  const alertsGeoJson = buildAlertsGeoJson(
+    alerts,
+    selectedAlertId,
+    highlightedAlertIds
+  ) as GeoJsonFeatureCollection;
+  const convergenceGeoJson = buildConvergencesGeoJson(
+    convergences,
+    selectedConvergenceId
+  ) as GeoJsonFeatureCollection;
+  const convergenceLinesGeoJson = buildConvergenceLinesGeoJson(
+    selectedConvergence,
+    convergenceAlerts
+  ) as GeoJsonFeatureCollection;
+  const lineColor = trackDisplay.color_hex || (satellite ? '#ffffff' : '#ededed');
+  const trackWidth = Math.max(trackDisplay.width_px, 1.2);
+  const showDashedTrack = trackDisplay.style === 'dashed';
+
+  return (
+    <svg
+      className="map-svg-overlay"
+      width={size.width}
+      height={size.height}
+      viewBox={`0 0 ${size.width} ${size.height}`}
+      aria-hidden="true"
+    >
+      <g className="map-svg-overlay__cones">
+        {sectorGeoJson.features.map((feature, index) => {
+          const path = svgPathForPolygon(map, feature.geometry?.coordinates);
+          if (!path) return null;
+          const fillColor = readFeatureString(feature, 'fill_color') ?? '#ff8a24';
+          const opacity = readFeatureNumber(feature, 'tint_opacity') ?? 0.42;
+          const borderWidth = readFeatureNumber(feature, 'border_width') ?? 0;
+          const borderOpacity = readFeatureNumber(feature, 'border_opacity') ?? 0;
+          return (
+            <path
+              key={`sector-${readFeatureString(feature, 'id') ?? index}-${index}`}
+              d={path}
+              fill={fillColor}
+              fillOpacity={opacity}
+              stroke={readFeatureString(feature, 'border_color') ?? '#ff9a45'}
+              strokeWidth={borderWidth}
+              strokeOpacity={borderOpacity}
+              strokeLinejoin="round"
+            />
+          );
+        })}
+      </g>
+
+      <g className="map-svg-overlay__convergence-lines">
+        {convergenceLinesGeoJson.features.map((feature, index) => {
+          const path = svgPathForLineString(map, feature.geometry?.coordinates);
+          if (!path) return null;
+          return (
+            <path
+              key={`convergence-line-${readFeatureString(feature, 'alert_id') ?? index}`}
+              d={path}
+              fill="none"
+              stroke="#ff9a2f"
+              strokeWidth={3.4}
+              strokeOpacity={0.96}
+              strokeDasharray="9 8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          );
+        })}
+      </g>
+
+      {trackDisplay.enabled ? (
+        <g className="map-svg-overlay__track">
+          {trackGeoJson.features.map((feature, index) => {
+            const kind = readFeatureString(feature, 'kind');
+            if (kind === 'gap') {
+              return renderSvgMultiLineFeature(map, feature, {
+                keyPrefix: `track-gap-${index}`,
+                casingColor: '#050505',
+                casingWidth: trackWidth + 2.8,
+                casingOpacity: 0.72,
+                color: '#ff6b63',
+                width: trackWidth + 0.4,
+                opacity: 0.96
+              });
+            }
+            const path = svgPathForLineString(map, feature.geometry?.coordinates);
+            if (!path) return null;
+            return (
+              <g key={`track-${index}`}>
+                <path
+                  d={path}
+                  fill="none"
+                  stroke="#050505"
+                  strokeWidth={trackWidth + 2.4}
+                  strokeOpacity={satellite ? 0.62 : 0.42}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d={path}
+                  fill="none"
+                  stroke={lineColor}
+                  strokeWidth={trackWidth}
+                  strokeOpacity={0.96}
+                  strokeDasharray={showDashedTrack ? '12 8' : undefined}
+                  strokeLinecap={showDashedTrack ? 'butt' : 'round'}
+                  strokeLinejoin={showDashedTrack ? 'miter' : 'round'}
+                />
+              </g>
+            );
+          })}
+        </g>
+      ) : null}
+
+      <g className="map-svg-overlay__alerts">
+        {alertsGeoJson.features.map((feature, index) => {
+          const point = projectFeaturePoint(map, feature);
+          if (!point) return null;
+          const id = readFeatureString(feature, 'id');
+          const radius = readFeatureNumber(feature, 'radius') ?? 7.4;
+          const haloRadius = readFeatureNumber(feature, 'halo_radius') ?? radius + 3.4;
+          return (
+            <g key={`alert-${id ?? index}`}>
+              <circle
+                cx={point.x}
+                cy={point.y}
+                r={haloRadius}
+                fill={readFeatureString(feature, 'halo_color') ?? 'rgba(255, 122, 34, 0.38)'}
+                opacity={readFeatureNumber(feature, 'halo_opacity') ?? 0.48}
+              />
+              <circle
+                cx={point.x}
+                cy={point.y}
+                r={radius}
+                fill={readFeatureString(feature, 'fill_color') ?? '#ff7b22'}
+                fillOpacity={readFeatureNumber(feature, 'opacity') ?? 1}
+                stroke={readFeatureString(feature, 'stroke_color') ?? '#ffb06a'}
+                strokeWidth={readFeatureNumber(feature, 'stroke_width') ?? 1.6}
+                className={interactive && id ? 'map-svg-overlay__click-target' : undefined}
+                onClick={
+                  interactive && id
+                    ? (event) => {
+                        event.stopPropagation();
+                        onSelectAlert(id);
+                      }
+                    : undefined
+                }
+              />
+            </g>
+          );
+        })}
+      </g>
+
+      <g className="map-svg-overlay__convergences">
+        {convergenceGeoJson.features.map((feature, index) => {
+          const kind = readFeatureString(feature, 'kind');
+          const id = readFeatureString(feature, 'id');
+          const selected = readFeatureBoolean(feature, 'selected');
+          if (kind === 'hit') {
+            const point = projectFeaturePoint(map, feature);
+            if (!point) return null;
+            return (
+              <circle
+                key={`convergence-hit-${id ?? index}`}
+                cx={point.x}
+                cy={point.y}
+                r={selected ? 22 : 18}
+                fill="transparent"
+                className={interactive && id ? 'map-svg-overlay__click-target' : undefined}
+                onClick={
+                  interactive && id
+                    ? (event) => {
+                        event.stopPropagation();
+                        onSelectConvergence(id);
+                      }
+                    : undefined
+                }
+              />
+            );
+          }
+          if (kind !== 'x') {
+            return null;
+          }
+          return renderSvgMultiLineFeature(map, feature, {
+            keyPrefix: `convergence-x-${id ?? index}`,
+            casingColor: '#ffffff',
+            casingWidth: selected ? 8.4 : 0,
+            casingOpacity: selected ? 0.94 : 0,
+            color: '#ff8a24',
+            width: selected ? 5.2 : 4.1,
+            opacity: readFeatureNumber(feature, 'opacity') ?? 0.92
+          });
+        })}
+      </g>
+    </svg>
+  );
+}
+
+function renderSvgMultiLineFeature(
+  map: Map,
+  feature: GeoJsonFeature,
+  options: {
+    keyPrefix: string;
+    casingColor: string;
+    casingWidth: number;
+    casingOpacity: number;
+    color: string;
+    width: number;
+    opacity: number;
+  }
+) {
+  const lines = Array.isArray(feature.geometry?.coordinates)
+    ? (feature.geometry.coordinates as unknown[])
+    : [];
+  return (
+    <g key={options.keyPrefix}>
+      {lines.map((coordinates, index) => {
+        const path = svgPathForLineString(map, coordinates);
+        if (!path) return null;
+        return (
+          <g key={`${options.keyPrefix}-${index}`}>
+            {options.casingWidth > 0 ? (
+              <path
+                d={path}
+                fill="none"
+                stroke={options.casingColor}
+                strokeWidth={options.casingWidth}
+                strokeOpacity={options.casingOpacity}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            ) : null}
+            <path
+              d={path}
+              fill="none"
+              stroke={options.color}
+              strokeWidth={options.width}
+              strokeOpacity={options.opacity}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </g>
+        );
+      })}
+    </g>
+  );
+}
+
+function svgPathForLineString(map: Map, coordinates: unknown) {
+  if (!Array.isArray(coordinates) || coordinates.length < 2) {
+    return null;
+  }
+  const points = coordinates
+    .map((coordinate) => projectCoordinatePair(map, coordinate))
+    .filter(isProjectedPoint);
+  if (points.length < 2) {
+    return null;
+  }
+  return points
+    .map((point, index) => `${index === 0 ? 'M' : 'L'} ${formatSvgNumber(point.x)} ${formatSvgNumber(point.y)}`)
+    .join(' ');
+}
+
+function svgPathForPolygon(map: Map, coordinates: unknown) {
+  if (!Array.isArray(coordinates)) {
+    return null;
+  }
+  const paths = coordinates.flatMap((ring) => {
+    if (!Array.isArray(ring) || ring.length < 3) {
+      return [];
+    }
+    const points = ring
+      .map((coordinate) => projectCoordinatePair(map, coordinate))
+      .filter(isProjectedPoint);
+    if (points.length < 3) {
+      return [];
+    }
+    return [
+      `${points
+        .map((point, index) => `${index === 0 ? 'M' : 'L'} ${formatSvgNumber(point.x)} ${formatSvgNumber(point.y)}`)
+        .join(' ')} Z`
+    ];
+  });
+  return paths.length > 0 ? paths.join(' ') : null;
+}
+
+function projectFeaturePoint(map: Map, feature: GeoJsonFeature) {
+  return projectCoordinatePair(map, feature.geometry?.coordinates);
+}
+
+function projectCoordinatePair(map: Map, coordinate: unknown) {
+  if (!Array.isArray(coordinate) || coordinate.length < 2) {
+    return null;
+  }
+  const [lon, lat] = coordinate as CoordinatePair;
+  if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+    return null;
+  }
+  const point = map.project([lon, lat]);
+  return Number.isFinite(point.x) && Number.isFinite(point.y)
+    ? { x: point.x, y: point.y }
+    : null;
+}
+
+function isProjectedPoint(point: ProjectedPoint | null): point is ProjectedPoint {
+  return point != null;
+}
+
+function readFeatureString(feature: GeoJsonFeature, key: string) {
+  const value = feature.properties?.[key];
+  return typeof value === 'string' ? value : null;
+}
+
+function readFeatureNumber(feature: GeoJsonFeature, key: string) {
+  const value = feature.properties?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function readFeatureBoolean(feature: GeoJsonFeature, key: string) {
+  return feature.properties?.[key] === true;
+}
+
+function formatSvgNumber(value: number) {
+  return Number.isFinite(value) ? value.toFixed(2) : '0';
 }
 
 function getInteractiveLayers(map: Map) {
@@ -1460,33 +1891,33 @@ function syncMapData(
   enabledRegions: OfflineRegionManifest[] = [],
   staleAfterSeconds = 10
 ) {
-  (map.getSource(SOURCE_TRACK) as GeoJSONSource).setData(buildTrackGeoJson(track, staleAfterSeconds));
-  (map.getSource(SOURCE_ALERTS) as GeoJSONSource).setData(
-    buildAlertsGeoJson(alerts, selectedAlertId, highlightedAlertIds)
-  );
-  (map.getSource(SOURCE_SECTOR) as GeoJSONSource).setData(
-    buildAlertSectorsGeoJson(
-      selectedConvergenceId ? [] : alerts,
-      selectedAlertId,
-      highlightedAlertIds
-    )
-  );
-  (map.getSource(SOURCE_CONVERGENCES) as GeoJSONSource).setData(
-    buildConvergencesGeoJson(convergences, selectedConvergenceId)
-  );
-  const selectedConvergence =
-    selectedConvergenceId != null
-      ? convergences.find((convergence) => convergence.id === selectedConvergenceId) ?? null
-      : null;
-  (map.getSource(SOURCE_CONVERGENCE_LINES) as GeoJSONSource).setData(
-    buildConvergenceLinesGeoJson(selectedConvergence, convergenceAlerts)
-  );
+  const emptyOverlayData = emptyFeatureCollection();
+  void track;
+  void alerts;
+  void selectedAlertId;
+  void highlightedAlertIds;
+  void convergences;
+  void selectedConvergenceId;
+  void convergenceAlerts;
+  void staleAfterSeconds;
+  (map.getSource(SOURCE_TRACK) as GeoJSONSource).setData(emptyOverlayData);
+  (map.getSource(SOURCE_ALERTS) as GeoJSONSource).setData(emptyOverlayData);
+  (map.getSource(SOURCE_SECTOR) as GeoJSONSource).setData(emptyOverlayData);
+  (map.getSource(SOURCE_CONVERGENCES) as GeoJSONSource).setData(emptyOverlayData);
+  (map.getSource(SOURCE_CONVERGENCE_LINES) as GeoJSONSource).setData(emptyOverlayData);
   (map.getSource(SOURCE_COVERAGE_MASK) as GeoJSONSource).setData(
     buildCoverageMaskGeoJson(enabledRegions)
   );
   (map.getSource(SOURCE_COVERAGE_BOUNDS) as GeoJSONSource).setData(
     buildCoverageBoundsGeoJson(enabledRegions)
   );
+}
+
+function emptyFeatureCollection() {
+  return {
+    type: 'FeatureCollection' as const,
+    features: []
+  };
 }
 
 function syncAircraftMarker(

@@ -24,11 +24,13 @@ import {
   updateConfig
 } from './lib/runtime';
 import type {
+  AircraftLiveState,
   AlertRecord,
   AppSnapshot,
   DetectionConvergence,
   HudMetricState,
   OfflineRegionCatalog,
+  ReviewTelemetryFrame,
   RuntimeEvent,
   TelemetryEnvelope,
   TrackPointRecord
@@ -138,6 +140,33 @@ interface RayIntersectionCandidate {
   lat: number;
   lon: number;
   alertIds: string[];
+}
+
+interface EfficiencyMetric {
+  liveWhPerKm: number | null;
+  averageWhPerKm: number | null;
+}
+
+interface EfficiencyAccumulator {
+  lastTimeMs: number | null;
+  lastBatteryWh: number | null;
+  fallbackEnergyWh: number;
+  averageEfficiencySum: number;
+  averageEfficiencyCount: number;
+  lastAverageSampleKey: string | null;
+  lastLiveWhPerKm: number | null;
+}
+
+function createEfficiencyAccumulator(): EfficiencyAccumulator {
+  return {
+    lastTimeMs: null,
+    lastBatteryWh: null,
+    fallbackEnergyWh: 0,
+    averageEfficiencySum: 0,
+    averageEfficiencyCount: 0,
+    lastAverageSampleKey: null,
+    lastLiveWhPerKm: null
+  };
 }
 
 function toRadians(value: number) {
@@ -351,6 +380,134 @@ function readStringExtra(extras: Record<string, unknown> | null | undefined, key
   return null;
 }
 
+function getEfficiencyPacketTimeMs(liveState: AircraftLiveState) {
+  const extras = liveState.extras as Record<string, unknown> | null;
+  const bootTimeMs = readNumberExtra(extras, 'time_boot_ms');
+  if (bootTimeMs != null && Number.isFinite(bootTimeMs)) {
+    return bootTimeMs;
+  }
+  const wallTimeMs = new Date(liveState.last_update_at).getTime();
+  return Number.isFinite(wallTimeMs) ? wallTimeMs : null;
+}
+
+function updateEfficiencyAccumulator(
+  liveState: AircraftLiveState | null | undefined,
+  accumulator: EfficiencyAccumulator
+): EfficiencyMetric {
+  if (!liveState?.armed) {
+    return {
+      liveWhPerKm: accumulator.lastLiveWhPerKm,
+      averageWhPerKm:
+        accumulator.averageEfficiencyCount > 0
+          ? accumulator.averageEfficiencySum / accumulator.averageEfficiencyCount
+          : null
+    };
+  }
+
+  const packetTimeMs = getEfficiencyPacketTimeMs(liveState);
+  if (packetTimeMs == null) {
+    return {
+      liveWhPerKm: accumulator.lastLiveWhPerKm,
+      averageWhPerKm:
+        accumulator.averageEfficiencyCount > 0
+          ? accumulator.averageEfficiencySum / accumulator.averageEfficiencyCount
+          : null
+    };
+  }
+
+  const extras = liveState.extras as Record<string, unknown> | null;
+  const speedMps = liveState.groundspeed_mps;
+  const voltage = liveState.battery?.voltage_v;
+  const currentA = readNumberExtra(extras, 'battery_a');
+  const batteryWhConsumed = readNumberExtra(extras, 'battery_wh');
+  const lastTimeMs = accumulator.lastTimeMs;
+  const deltaHours =
+    lastTimeMs != null && packetTimeMs > lastTimeMs
+      ? (packetTimeMs - lastTimeMs) / 3_600_000
+      : 0;
+  const speedKmPerHour =
+    speedMps != null && Number.isFinite(speedMps) && speedMps > 0 ? speedMps * 3.6 : null;
+  const powerW =
+    voltage != null &&
+    currentA != null &&
+    Number.isFinite(voltage) &&
+    Number.isFinite(currentA)
+      ? Math.abs(voltage * currentA)
+      : null;
+
+  let deltaEnergyWh = 0;
+  if (
+    batteryWhConsumed != null &&
+    Number.isFinite(batteryWhConsumed) &&
+    batteryWhConsumed >= 0
+  ) {
+    if (accumulator.lastBatteryWh != null && batteryWhConsumed >= accumulator.lastBatteryWh) {
+      deltaEnergyWh = batteryWhConsumed - accumulator.lastBatteryWh;
+    }
+    accumulator.lastBatteryWh = batteryWhConsumed;
+    accumulator.fallbackEnergyWh = batteryWhConsumed;
+  } else if (deltaHours > 0 && powerW != null) {
+    deltaEnergyWh = powerW * deltaHours;
+    accumulator.fallbackEnergyWh += deltaEnergyWh;
+  }
+
+  const instantaneousWhPerKm =
+    powerW != null && speedKmPerHour != null && speedKmPerHour > 1.8
+      ? powerW / speedKmPerHour
+      : null;
+  const deltaDistanceKm =
+    deltaHours > 0 && speedMps != null && Number.isFinite(speedMps)
+      ? (speedMps * deltaHours * 3600) / 1000
+      : 0;
+  const segmentWhPerKm =
+    deltaDistanceKm > 0 && deltaEnergyWh > 0 ? deltaEnergyWh / deltaDistanceKm : null;
+  const computedWhPerKm = instantaneousWhPerKm ?? segmentWhPerKm;
+  const liveWhPerKm = computedWhPerKm ?? accumulator.lastLiveWhPerKm;
+
+  if (computedWhPerKm != null && Number.isFinite(computedWhPerKm)) {
+    accumulator.lastLiveWhPerKm = computedWhPerKm;
+  }
+
+  const airborne = speedMps != null && Number.isFinite(speedMps) && speedMps > 5;
+  const sampleKey = `${packetTimeMs}:${computedWhPerKm != null ? computedWhPerKm.toFixed(3) : 'na'}`;
+  if (
+    airborne &&
+    computedWhPerKm != null &&
+    Number.isFinite(computedWhPerKm) &&
+    sampleKey !== accumulator.lastAverageSampleKey
+  ) {
+    accumulator.averageEfficiencySum += computedWhPerKm;
+    accumulator.averageEfficiencyCount += 1;
+    accumulator.lastAverageSampleKey = sampleKey;
+  }
+
+  accumulator.lastTimeMs = packetTimeMs;
+  return {
+    liveWhPerKm: accumulator.lastLiveWhPerKm,
+    averageWhPerKm:
+      accumulator.averageEfficiencyCount > 0
+        ? accumulator.averageEfficiencySum / accumulator.averageEfficiencyCount
+        : null
+  };
+}
+
+function computeReviewEfficiencyMetric(
+  frames: ReviewTelemetryFrame[],
+  selectedIndex: number | null
+): EfficiencyMetric {
+  if (selectedIndex == null || selectedIndex < 0 || frames.length === 0) {
+    return { liveWhPerKm: null, averageWhPerKm: null };
+  }
+
+  const accumulator = createEfficiencyAccumulator();
+  const endIndex = Math.min(selectedIndex, frames.length - 1);
+  let metric: EfficiencyMetric = { liveWhPerKm: null, averageWhPerKm: null };
+  for (let index = 0; index <= endIndex; index += 1) {
+    metric = updateEfficiencyAccumulator(frames[index].live_state, accumulator);
+  }
+  return metric;
+}
+
 function isLegacyCompatibilityTelemetry(extras: Record<string, unknown> | null | undefined) {
   return Boolean(
     readStringExtra(extras, 'legacy_packet_type') ??
@@ -477,19 +634,7 @@ export function App() {
   const seenSystemStatusIdsRef = useRef<Set<string>>(new Set());
   const armedAltitudeBaselineRef = useRef<number | null>(null);
   const armedAtTimestampRef = useRef<string | null>(null);
-  const efficiencyAccumulatorRef = useRef<{
-    lastTimeMs: number | null;
-    lastBatteryWh: number | null;
-    fallbackEnergyWh: number;
-    averageEnergyWh: number;
-    averageDistanceKm: number;
-  }>({
-    lastTimeMs: null,
-    lastBatteryWh: null,
-    fallbackEnergyWh: 0,
-    averageEnergyWh: 0,
-    averageDistanceKm: 0
-  });
+  const efficiencyAccumulatorRef = useRef<EfficiencyAccumulator>(createEfficiencyAccumulator());
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [offlineCatalog, setOfflineCatalog] = useState<OfflineRegionCatalog>({
     asset_origin: '',
@@ -533,10 +678,10 @@ export function App() {
   const [visionCommandState, setVisionCommandState] = useState<VisionCommandState>('idle');
   const [visionStartupConfirmed, setVisionStartupConfirmed] = useState(false);
   const [visionStopAcknowledged, setVisionStopAcknowledged] = useState(false);
-  const [efficiencyMetric, setEfficiencyMetric] = useState<{
-    liveWhPerKm: number | null;
-    averageWhPerKm: number | null;
-  }>({ liveWhPerKm: null, averageWhPerKm: null });
+  const [efficiencyMetric, setEfficiencyMetric] = useState<EfficiencyMetric>({
+    liveWhPerKm: null,
+    averageWhPerKm: null
+  });
   const [lastIdleMapView, setLastIdleMapView] = useState<{
     center: [number, number];
     zoom: number;
@@ -660,8 +805,6 @@ export function App() {
   const cpuMhz = readNumberExtra(liveExtras, 'cpu_mhz');
   const npuTempC = readNumberExtra(liveExtras, 'npu_temp_c');
   const batteryMahConsumed = readNumberExtra(liveExtras, 'battery_mah');
-  const batteryWhConsumed = readNumberExtra(liveExtras, 'battery_wh');
-  const timeBootMs = readNumberExtra(liveExtras, 'time_boot_ms');
   const visionActive = readBooleanExtra(liveExtras, 'vision_active');
   const fallbackTrack = useMemo(
     () => deriveTrackFromRawPackets(snapshot.raw_telemetry_packets),
@@ -684,6 +827,11 @@ export function App() {
     snapshot.active_session_id,
     targetAltitudeMslM
   ]);
+  const reviewEfficiencyMetric = useMemo(
+    () => computeReviewEfficiencyMetric(reviewFrames, effectiveReviewFrameIndex),
+    [effectiveReviewFrameIndex, reviewFrames]
+  );
+  const displayEfficiencyMetric = reviewMode ? reviewEfficiencyMetric : efficiencyMetric;
   const displayTrack = useMemo(() => {
     if (!reviewMode) {
       return snapshot.track.length >= 2 ? snapshot.track : fallbackTrack;
@@ -1055,6 +1203,8 @@ export function App() {
   const activeFlightHasDetections = activeFlight && deferredAlerts.length > 0;
   const activeFlightDetectionFlash = activeFlight && unacknowledgedDetectionIds.length > 0;
   const activeDetectionDetailOpen = activeFlight && alertDetailVisible && Boolean(selectedAlert);
+  const dockMainHudRightForDetection =
+    activeDetectionDetailOpen && viewportWidth >= 760 && viewportHeight < 920;
   const reviewDetectionDetailOpen = reviewMode && alertDetailVisible && Boolean(selectedAlert);
   const reviewExpandedHudOccluded =
     reviewDetectionDetailOpen && (viewportWidth < 1180 || viewportHeight < 900);
@@ -1166,13 +1316,7 @@ export function App() {
       seenSystemStatusIdsRef.current = new Set();
       armedAltitudeBaselineRef.current = null;
       armedAtTimestampRef.current = null;
-      efficiencyAccumulatorRef.current = {
-        lastTimeMs: null,
-        lastBatteryWh: null,
-        fallbackEnergyWh: 0,
-        averageEnergyWh: 0,
-        averageDistanceKm: 0
-      };
+      efficiencyAccumulatorRef.current = createEfficiencyAccumulator();
       setEfficiencyMetric({ liveWhPerKm: null, averageWhPerKm: null });
       setLowSpeedMonitoringEnabled(false);
       if (lowSpeedLandingTimerRef.current) {
@@ -1204,83 +1348,20 @@ export function App() {
   }, [activeFlight, displayLiveState?.alt_msl_m, displayLiveState?.armed]);
 
   useEffect(() => {
-    if (!activeFlight || !displayLiveState?.armed) {
+    if (!activeFlight) {
       return;
     }
 
-    const speedMps = displayLiveState.groundspeed_mps;
-    const voltage = displayLiveState.battery?.voltage_v;
-    const currentA = readNumberExtra(liveExtras, 'battery_a');
-    const packetTimeMs =
-      timeBootMs != null && Number.isFinite(timeBootMs)
-        ? timeBootMs
-        : new Date(displayLiveState.last_update_at).getTime();
-    if (!Number.isFinite(packetTimeMs)) {
-      return;
-    }
-
-    const accumulator = efficiencyAccumulatorRef.current;
-    const lastTimeMs = accumulator.lastTimeMs;
-    const deltaHours =
-      lastTimeMs != null && packetTimeMs > lastTimeMs
-        ? (packetTimeMs - lastTimeMs) / 3_600_000
-        : 0;
-    let deltaEnergyWh = 0;
-
-    if (
-      batteryWhConsumed != null &&
-      Number.isFinite(batteryWhConsumed) &&
-      batteryWhConsumed >= 0
-    ) {
-      if (accumulator.lastBatteryWh != null && batteryWhConsumed >= accumulator.lastBatteryWh) {
-        deltaEnergyWh = batteryWhConsumed - accumulator.lastBatteryWh;
-      }
-      accumulator.lastBatteryWh = batteryWhConsumed;
-      accumulator.fallbackEnergyWh = batteryWhConsumed;
-    } else if (
-      deltaHours > 0 &&
-      voltage != null &&
-      currentA != null &&
-      Number.isFinite(voltage) &&
-      Number.isFinite(currentA)
-    ) {
-      deltaEnergyWh = Math.max(0, voltage * currentA * deltaHours);
-      accumulator.fallbackEnergyWh += deltaEnergyWh;
-    }
-
-    const liveWhPerKm =
-      speedMps != null &&
-      speedMps > 0.5 &&
-      voltage != null &&
-      currentA != null &&
-      Number.isFinite(voltage) &&
-      Number.isFinite(currentA)
-        ? (voltage * currentA) / (speedMps * 3.6)
-        : null;
-
-    if (deltaHours > 0 && speedMps != null && speedMps > 5) {
-      const deltaDistanceKm = (speedMps * deltaHours * 3600) / 1000;
-      if (deltaDistanceKm > 0 && deltaEnergyWh >= 0) {
-        accumulator.averageEnergyWh += deltaEnergyWh;
-        accumulator.averageDistanceKm += deltaDistanceKm;
-      }
-    }
-
-    accumulator.lastTimeMs = packetTimeMs;
-    const averageWhPerKm =
-      accumulator.averageDistanceKm > 0
-        ? accumulator.averageEnergyWh / accumulator.averageDistanceKm
-        : null;
-    setEfficiencyMetric({ liveWhPerKm, averageWhPerKm });
+    setEfficiencyMetric(
+      updateEfficiencyAccumulator(displayLiveState, efficiencyAccumulatorRef.current)
+    );
   }, [
     activeFlight,
-    batteryWhConsumed,
     displayLiveState?.armed,
     displayLiveState?.battery?.voltage_v,
     displayLiveState?.groundspeed_mps,
     displayLiveState?.last_update_at,
-    liveExtras,
-    timeBootMs
+    liveExtras
   ]);
 
   useEffect(() => {
@@ -2333,10 +2414,10 @@ export function App() {
             visionControl={visionControl}
             flightModeLabel={flightModeLabel}
             batteryPercent={displayLiveState?.battery?.percent ?? null}
-              attitude={{
-                pitchDeg,
-                rollDeg
-              }}
+            attitude={{
+              pitchDeg,
+              rollDeg
+            }}
             metricStates={activeFlight ? telemetryMetricStates : undefined}
             expandedHud={
               (activeFlight || reviewMode) && !suppressExpandedHud
@@ -2354,11 +2435,12 @@ export function App() {
                     altitudeMslM: displayAltitudeMsl,
                     targetAltitudeMslM,
                     batteryMahConsumed,
-                    liveEfficiencyWhPerKm: efficiencyMetric.liveWhPerKm,
-                    averageEfficiencyWhPerKm: efficiencyMetric.averageWhPerKm
+                    liveEfficiencyWhPerKm: displayEfficiencyMetric.liveWhPerKm,
+                    averageEfficiencyWhPerKm: displayEfficiencyMetric.averageWhPerKm
                   }
                 : null
             }
+            mainDock={dockMainHudRightForDetection ? 'right' : 'left'}
             onOpenRawData={activeFlight ? () => setRawTelemetryOpen(true) : undefined}
             onToggleExpandedHud={
               activeFlight ? () => setExpandedHudOpen((current) => !current) : undefined
