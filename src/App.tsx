@@ -689,6 +689,7 @@ export function App() {
   } | null>(null);
   const [flightNotifications, setFlightNotifications] = useState<FlightNotificationRecord[]>([]);
   const [unacknowledgedDetectionIds, setUnacknowledgedDetectionIds] = useState<string[]>([]);
+  const [activeMapHiddenDetectionIds, setActiveMapHiddenDetectionIds] = useState<string[]>([]);
   const [lowSpeedMonitoringEnabled, setLowSpeedMonitoringEnabled] = useState(false);
   const clearBannerRef = useRef<number | null>(null);
   const previousAlertCountRef = useRef(0);
@@ -831,7 +832,16 @@ export function App() {
     () => computeReviewEfficiencyMetric(reviewFrames, effectiveReviewFrameIndex),
     [effectiveReviewFrameIndex, reviewFrames]
   );
-  const displayEfficiencyMetric = reviewMode ? reviewEfficiencyMetric : efficiencyMetric;
+  const reviewFinalEfficiencyMetric = useMemo(
+    () => computeReviewEfficiencyMetric(reviewFrames, reviewFrames.length - 1),
+    [reviewFrames]
+  );
+  const displayEfficiencyMetric = reviewMode
+    ? {
+        liveWhPerKm: reviewEfficiencyMetric.liveWhPerKm,
+        averageWhPerKm: reviewFinalEfficiencyMetric.averageWhPerKm
+      }
+    : efficiencyMetric;
   const displayTrack = useMemo(() => {
     if (!reviewMode) {
       return snapshot.track.length >= 2 ? snapshot.track : fallbackTrack;
@@ -982,6 +992,11 @@ export function App() {
       return;
     }
     if (notification.actionType === 'open-detections' && action === 'dismiss') {
+      setActiveMapHiddenDetectionIds((current) => {
+        const next = new Set(current);
+        unacknowledgedDetectionIds.forEach((alertId) => next.add(alertId));
+        return [...next];
+      });
       dismissFlightNotification(notification.id);
       return;
     }
@@ -1084,6 +1099,9 @@ export function App() {
           const mostRecentNewAlert = newAlerts[0] ?? null;
 
           if (Boolean(event.snapshot.active_session_id) && mostRecentNewAlert) {
+            setActiveMapHiddenDetectionIds((current) =>
+              current.filter((alertId) => !newAlerts.some((alert) => alert.id === alertId))
+            );
             setUnacknowledgedDetectionIds((current) => {
               const next = new Set(current);
               newAlerts.forEach((alert) => next.add(alert.id));
@@ -1115,6 +1133,7 @@ export function App() {
             setAlertDetailVisible(false);
             setSelectedConvergenceId(null);
             setUnacknowledgedDetectionIds([]);
+            setActiveMapHiddenDetectionIds([]);
           }
         }
         if (event.type === 'warning') {
@@ -1222,12 +1241,16 @@ export function App() {
         return deferredAlerts;
       }
       const unacknowledgedIds = new Set(unacknowledgedDetectionIds);
-      return deferredAlerts.filter((alert) => unacknowledgedIds.has(alert.id));
+      const hiddenIds = new Set(activeMapHiddenDetectionIds);
+      return deferredAlerts.filter(
+        (alert) => unacknowledgedIds.has(alert.id) && !hiddenIds.has(alert.id)
+      );
     }
     return deferredAlerts;
   }, [
     activeDetectionDetailOpen,
     activeFlight,
+    activeMapHiddenDetectionIds,
     deferredAlerts,
     reviewDetectionDetailOpen,
     reviewMode,
@@ -1269,11 +1292,13 @@ export function App() {
       setSelectedAlertId(null);
       setSelectedConvergenceId(null);
       setUnacknowledgedDetectionIds([]);
+      setActiveMapHiddenDetectionIds([]);
     }
     if (!activeFlight && previousActiveFlightRef.current) {
       setActiveFlightLayout('video-dominant');
       setSelectedConvergenceId(null);
       setUnacknowledgedDetectionIds([]);
+      setActiveMapHiddenDetectionIds([]);
       dismissFlightNotification('active-flight-detection');
     }
     previousActiveFlightRef.current = activeFlight;
@@ -1934,6 +1959,7 @@ export function App() {
       return;
     }
     setUnacknowledgedDetectionIds([]);
+    setActiveMapHiddenDetectionIds([]);
     dismissFlightNotification('active-flight-detection');
     setSelectedConvergenceId(null);
     handleSelectAlert(targetAlert.id);
@@ -2706,7 +2732,7 @@ export function App() {
 
             <div className="modal-card__actions modal-card__actions--stacked">
               <button
-                className="primary-toggle"
+                className="secondary-button"
                 onClick={() =>
                   void runCommand(() => handleExportSession(exportFlightTarget.id, 'telemetry'))
                 }
@@ -2732,7 +2758,7 @@ export function App() {
                 Both
               </button>
               <button
-                className="secondary-button secondary-button--muted"
+                className="secondary-button"
                 onClick={() => setExportFlightTarget(null)}
               >
                 Cancel

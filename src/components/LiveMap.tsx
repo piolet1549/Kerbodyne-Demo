@@ -1210,29 +1210,38 @@ function buildSvgMapOverlay({
           {trackGeoJson.features.map((feature, index) => {
             const kind = readFeatureString(feature, 'kind');
             if (kind === 'gap') {
-              return renderSvgMultiLineFeature(map, feature, {
-                keyPrefix: `track-gap-${index}`,
-                casingColor: '#050505',
-                casingWidth: trackWidth + 2.8,
-                casingOpacity: 0.72,
-                color: '#ff6b63',
-                width: trackWidth + 0.4,
-                opacity: 0.96
-              });
+              const path = svgPathForLineString(map, feature.geometry?.coordinates);
+              if (!path) return null;
+              const gapDashed = !showDashedTrack;
+              return (
+                <path
+                  key={`track-gap-${index}`}
+                  d={path}
+                  fill="none"
+                  stroke={lineColor}
+                  strokeWidth={trackWidth}
+                  strokeOpacity={0.96}
+                  strokeDasharray={gapDashed ? '12 8' : undefined}
+                  strokeLinecap={gapDashed ? 'butt' : 'round'}
+                  strokeLinejoin={gapDashed ? 'miter' : 'round'}
+                />
+              );
             }
             const path = svgPathForLineString(map, feature.geometry?.coordinates);
             if (!path) return null;
             return (
               <g key={`track-${index}`}>
-                <path
-                  d={path}
-                  fill="none"
-                  stroke="#050505"
-                  strokeWidth={trackWidth + 2.4}
-                  strokeOpacity={satellite ? 0.62 : 0.42}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
+                {!showDashedTrack ? (
+                  <path
+                    d={path}
+                    fill="none"
+                    stroke="#050505"
+                    strokeWidth={trackWidth + 2.4}
+                    strokeOpacity={satellite ? 0.62 : 0.42}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                ) : null}
                 <path
                   d={path}
                   fill="none"

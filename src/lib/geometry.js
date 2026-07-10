@@ -410,52 +410,21 @@ function interpolateCoordinate(start, end, ratio) {
 }
 
 function buildGapMarkerFeatures(startPoint, endPoint) {
-  const centers = buildGapMarkerCenters(startPoint, endPoint);
-  const features = [];
-
-  centers.forEach(([lat, lon]) => {
-    const sizeM = 16;
-    const diagOneStart = projectCoordinate(lat, lon, 45, sizeM);
-    const diagOneEnd = projectCoordinate(lat, lon, 225, sizeM);
-    const diagTwoStart = projectCoordinate(lat, lon, 135, sizeM);
-    const diagTwoEnd = projectCoordinate(lat, lon, 315, sizeM);
-    features.push({
+  return [
+    {
       type: 'Feature',
       properties: {
         kind: 'gap'
       },
       geometry: {
-        type: 'MultiLineString',
+        type: 'LineString',
         coordinates: [
-          [diagOneStart, diagOneEnd],
-          [diagTwoStart, diagTwoEnd]
+          [startPoint.lon, startPoint.lat],
+          [endPoint.lon, endPoint.lat]
         ]
       }
-    });
-  });
-
-  return features;
-}
-
-function buildGapMarkerCenters(startPoint, endPoint) {
-  const distance = haversineDistanceM(
-    startPoint.lat,
-    startPoint.lon,
-    endPoint.lat,
-    endPoint.lon
-  );
-  const markerCount = Math.max(1, Math.min(4, Math.round(distance / 90)));
-  const centers = [];
-
-  for (let index = 0; index < markerCount; index += 1) {
-    const ratio = markerCount === 1 ? 0.5 : (index + 1) / (markerCount + 1);
-    centers.push([
-      startPoint.lat + (endPoint.lat - startPoint.lat) * ratio,
-      startPoint.lon + (endPoint.lon - startPoint.lon) * ratio
-    ]);
-  }
-
-  return centers;
+    }
+  ];
 }
 
 function haversineDistanceM(startLat, startLon, endLat, endLon) {
