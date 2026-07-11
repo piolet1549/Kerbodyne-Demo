@@ -1,14 +1,16 @@
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     fs,
+    net::{Ipv4Addr, SocketAddrV4},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use socket2::{Domain, Protocol, Socket, Type};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -21,16 +23,16 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
 
 use crate::{
-    db::Database,
+    db::{Database, TelemetryWrite},
     geometry::distance_m,
     models::{
         AircraftLiveState, AlertPayload, AlertRecord, AppConfig, AppSnapshot, BatterySummary,
         ConnectionHealth, ConnectionStatus, LegacyAlertPacket, LegacySystemStatusPacket,
-        LegacyTelemetryPacket, LegacyTelemetryPacketType, MapAlertSector, MissionSession,
-        OfflineRegionCatalog, OfflineRegionManifest, ReplayFrame, ReviewTelemetryFrame,
-        RuntimeEvent, RuntimeMode, SessionVideoClip, SystemStatusPayload, SystemStatusRecord,
-        TelemetryPayload, TrackPointRecord, VideoPreviewState, VideoPreviewStatus, WireEnvelope,
-        DEFAULT_AIRCRAFT_ID, SCHEMA_VERSION,
+        LegacyTelemetryPacket, LegacyTelemetryPacketType, LiveTelemetryUpdate, MapAlertSector,
+        MissionSession, OfflineRegionCatalog, OfflineRegionManifest, ReplayFrame,
+        ReviewTelemetryFrame, RuntimeEvent, RuntimeMode, SessionVideoClip, SystemStatusPayload,
+        SystemStatusRecord, TelemetryIngestDiagnostics, TelemetryPayload, TrackPointRecord,
+        VideoPreviewState, VideoPreviewStatus, WireEnvelope, DEFAULT_AIRCRAFT_ID, SCHEMA_VERSION,
     },
     offline_maps,
     server::{
@@ -45,6 +47,7 @@ const MAX_RECENT_MESSAGE_IDS: usize = 256;
 const MAX_WARNINGS: usize = 12;
 const MAX_SESSION_HISTORY: usize = 200;
 const MAX_RAW_TELEMETRY_PACKETS: usize = 160;
+const MAX_FAILED_TELEMETRY_WRITES: usize = 8_192;
 const LIVE_VIDEO_RTP_PORT: u16 = 5600;
 const AIRSIDE_VISION_COMMAND_HOST: &str = "192.168.1.11";
 const AIRSIDE_VISION_COMMAND_PORT: u16 = 45105;
@@ -157,6 +160,14 @@ impl CompatibilityTelemetryState {
         update_if_some(&mut self.npu_temp_c, packet.npu_temp_c);
         update_if_some(&mut self.vision_active, packet.vision_active);
 
+        if let Some(sequence) = packet.sequence {
+            self.extras.insert("sequence".into(), json!(sequence));
+        }
+        if let Some(generated_at) = packet.generated_at.as_ref() {
+            self.extras
+                .insert("generated_at".into(), generated_at.clone());
+        }
+
         for (key, value) in &packet.extras {
             self.extras.insert(key.clone(), value.clone());
         }
@@ -208,34 +219,6 @@ impl CompatibilityTelemetryState {
         last_seen
             .map(|timestamp| now.signed_duration_since(timestamp).num_seconds() <= window_seconds)
             .unwrap_or(false)
-    }
-
-    fn build_connection_note(&self, now: &DateTime<Utc>) -> String {
-        if !self.has_any_state() {
-            return "Telemetry packet received; awaiting aircraft state".into();
-        }
-
-        let mut missing = Vec::new();
-        if self.has_split_packets {
-            if !self.tier_is_current(self.last_hf_at.clone(), COMPAT_HF_STALE_SECS, now) {
-                missing.push("high-rate");
-            }
-            if !self.tier_is_current(self.last_mf_at.clone(), COMPAT_MF_STALE_SECS, now) {
-                missing.push("medium-rate");
-            }
-            if !self.tier_is_current(self.last_lf_at.clone(), COMPAT_LF_STALE_SECS, now) {
-                missing.push("low-rate");
-            }
-        }
-
-        if missing.is_empty() {
-            "Receiving split compatibility telemetry".into()
-        } else {
-            format!(
-                "Receiving split compatibility telemetry; awaiting {} packets",
-                missing.join(", ")
-            )
-        }
     }
 
     fn to_payload(&self, packet_type: Option<LegacyTelemetryPacketType>) -> TelemetryPayload {
@@ -344,6 +327,13 @@ pub enum IngestSource {
     CompatibilityAlert,
 }
 
+pub struct LegacyTelemetryProcessResult {
+    pub packet_type: LegacyTelemetryPacketType,
+    pub persistence_write: Option<TelemetryWrite>,
+    pub track_point: Option<TrackPointRecord>,
+    pub raw_packet: String,
+}
+
 impl IngestSource {
     fn mode(&self) -> RuntimeMode {
         RuntimeMode::Live
@@ -376,7 +366,7 @@ impl IngestSource {
 pub struct AppRuntime {
     data_dir: PathBuf,
     media_dir: PathBuf,
-    db: Database,
+    db: Arc<Database>,
     config: RwLock<AppConfig>,
     asset_server_origin: RwLock<String>,
     mode: RwLock<RuntimeMode>,
@@ -391,6 +381,8 @@ pub struct AppRuntime {
     review_video_clips: RwLock<Vec<SessionVideoClip>>,
     video_preview: RwLock<VideoPreviewState>,
     raw_telemetry_packets: RwLock<Vec<String>>,
+    telemetry_ingest: StdMutex<TelemetryIngestDiagnostics>,
+    failed_telemetry_writes: StdMutex<Vec<TelemetryWrite>>,
     warnings: RwLock<Vec<String>>,
     recent_message_ids: Mutex<VecDeque<String>>,
     current_session_id: RwLock<Option<String>>,
@@ -432,7 +424,7 @@ impl AppRuntime {
         let (preview_frame_sender, _) = watch::channel(None);
         let (shutdown_signal, _) = broadcast::channel(8);
 
-        let database = Database::open(&data_dir.join("kerbodyne.db"))?;
+        let database = Arc::new(Database::open(&data_dir.join("kerbodyne.db"))?);
         let mut config = database.load_config()?.unwrap_or_default();
         offline_maps::normalize_config(&mut config, &data_dir)?;
         database.save_config(&config)?;
@@ -463,6 +455,8 @@ impl AppRuntime {
             review_video_clips: RwLock::new(Vec::new()),
             video_preview: RwLock::new(VideoPreviewState::default()),
             raw_telemetry_packets: RwLock::new(Vec::new()),
+            telemetry_ingest: StdMutex::new(TelemetryIngestDiagnostics::default()),
+            failed_telemetry_writes: StdMutex::new(Vec::new()),
             warnings: RwLock::new(Vec::new()),
             recent_message_ids: Mutex::new(VecDeque::new()),
             current_session_id: RwLock::new(None),
@@ -511,6 +505,8 @@ impl AppRuntime {
         let runtime = self.clone();
         let mut shutdown_receiver = self.shutdown_signal.subscribe();
         let periodic_handle = tauri::async_runtime::spawn(async move {
+            let mut last_diagnostics_log = Instant::now();
+            let mut last_logged_packet_count = 0;
             loop {
                 tokio::select! {
                     _ = shutdown_receiver.recv() => break,
@@ -519,6 +515,30 @@ impl AppRuntime {
                         let video_changed = runtime.refresh_video_health(&app).await;
                         if connection_changed || video_changed {
                             let _ = runtime.emit_snapshot(&app).await;
+                        }
+                        if last_diagnostics_log.elapsed() >= Duration::from_secs(10) {
+                            let diagnostics = runtime.telemetry_ingest_snapshot();
+                            if diagnostics.received_packets != last_logged_packet_count {
+                                eprintln!(
+                                    "Kerbodyne telemetry ingest: received={} processed={} queue={}/{} delay={}ms max_delay={}ms persistence_queue={}/{} batch={} in {}ms coalesced={} dropped={} parse_errors={} persistence_errors={}",
+                                    diagnostics.received_packets,
+                                    diagnostics.processed_packets,
+                                    diagnostics.queue_depth,
+                                    diagnostics.queue_high_water,
+                                    diagnostics.processing_delay_ms,
+                                    diagnostics.max_processing_delay_ms,
+                                    diagnostics.persistence_queue_depth,
+                                    diagnostics.persistence_queue_high_water,
+                                    diagnostics.last_batch_size,
+                                    diagnostics.last_batch_write_ms,
+                                    diagnostics.coalesced_packets,
+                                    diagnostics.dropped_packets,
+                                    diagnostics.parse_errors,
+                                    diagnostics.persistence_errors,
+                                );
+                                last_logged_packet_count = diagnostics.received_packets;
+                            }
+                            last_diagnostics_log = Instant::now();
                         }
                     }
                 }
@@ -543,6 +563,7 @@ impl AppRuntime {
             review_frames: self.review_frames.read().await.clone(),
             review_video_clips: self.review_video_clips.read().await.clone(),
             video_preview: self.video_preview.read().await.clone(),
+            telemetry_ingest: self.telemetry_ingest_snapshot(),
             raw_telemetry_packets: self.raw_telemetry_packets.read().await.clone(),
             warnings: self.warnings.read().await.clone(),
         }
@@ -703,6 +724,7 @@ impl AppRuntime {
 
     pub async fn start_live_ingest(&self, app: &AppHandle) -> Result<(), String> {
         self.prepare_for_new_manual_stream(app).await?;
+        self.reset_telemetry_ingest_diagnostics();
         self.ensure_legacy_listener_tasks(app).await?;
         let session_id = self
             .begin_session(DEFAULT_AIRCRAFT_ID, LEGACY_SOURCE_LABEL)
@@ -721,6 +743,7 @@ impl AppRuntime {
                 )),
             };
         }
+        self.emit_snapshot(app).await?;
 
         if let Err(error) = self.start_video_subsystem(app, &session_id).await {
             self.push_warning(app, error).await;
@@ -922,6 +945,258 @@ impl AppRuntime {
         Ok(path.to_string_lossy().to_string())
     }
 
+    fn telemetry_ingest_snapshot(&self) -> TelemetryIngestDiagnostics {
+        self.telemetry_ingest
+            .lock()
+            .map(|diagnostics| diagnostics.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn reset_telemetry_ingest_diagnostics(&self) {
+        if let Ok(mut diagnostics) = self.telemetry_ingest.lock() {
+            *diagnostics = TelemetryIngestDiagnostics::default();
+        }
+        if let Ok(mut failed_writes) = self.failed_telemetry_writes.lock() {
+            failed_writes.clear();
+        }
+    }
+
+    pub fn record_telemetry_received(
+        &self,
+        packet_type: LegacyTelemetryPacketType,
+        received_at: DateTime<Utc>,
+        queue_depth: usize,
+        queue_high_water: usize,
+        coalesced: u64,
+        dropped: u64,
+    ) {
+        let Ok(mut diagnostics) = self.telemetry_ingest.lock() else {
+            return;
+        };
+        let timestamp = received_at.to_rfc3339();
+        diagnostics.received_packets = diagnostics.received_packets.saturating_add(1);
+        diagnostics.queue_depth = queue_depth;
+        diagnostics.queue_high_water = diagnostics.queue_high_water.max(queue_high_water);
+        diagnostics.coalesced_packets = diagnostics.coalesced_packets.saturating_add(coalesced);
+        diagnostics.dropped_packets = diagnostics.dropped_packets.saturating_add(dropped);
+        diagnostics.last_packet_type = Some(legacy_packet_type_label(packet_type).into());
+        diagnostics.last_received_at = Some(timestamp.clone());
+        match packet_type {
+            LegacyTelemetryPacketType::HighFrequency => {
+                diagnostics.last_hf_received_at = Some(timestamp)
+            }
+            LegacyTelemetryPacketType::MediumFrequency => {
+                diagnostics.last_mf_received_at = Some(timestamp)
+            }
+            LegacyTelemetryPacketType::LowFrequency => {
+                diagnostics.last_lf_received_at = Some(timestamp)
+            }
+            LegacyTelemetryPacketType::OnChange => {
+                diagnostics.last_oc_received_at = Some(timestamp)
+            }
+            LegacyTelemetryPacketType::Unknown => {}
+        }
+    }
+
+    pub fn record_telemetry_processed(
+        &self,
+        packet_type: LegacyTelemetryPacketType,
+        processed_at: DateTime<Utc>,
+        processing_delay: Duration,
+        queue_depth: usize,
+        sequence: Option<u64>,
+        generated_at: Option<String>,
+    ) {
+        let Ok(mut diagnostics) = self.telemetry_ingest.lock() else {
+            return;
+        };
+        let delay_ms = processing_delay.as_millis().min(u64::MAX as u128) as u64;
+        diagnostics.processed_packets = diagnostics.processed_packets.saturating_add(1);
+        diagnostics.processing_delay_ms = delay_ms;
+        diagnostics.max_processing_delay_ms = diagnostics.max_processing_delay_ms.max(delay_ms);
+        diagnostics.queue_depth = queue_depth;
+        diagnostics.last_packet_type = Some(legacy_packet_type_label(packet_type).into());
+        diagnostics.last_processed_at = Some(processed_at.to_rfc3339());
+        if sequence.is_some() {
+            diagnostics.last_sequence = sequence;
+        }
+        if generated_at.is_some() {
+            diagnostics.last_generated_at = generated_at;
+        }
+    }
+
+    pub fn record_telemetry_parse_error(&self, queue_depth: usize) {
+        if let Ok(mut diagnostics) = self.telemetry_ingest.lock() {
+            diagnostics.parse_errors = diagnostics.parse_errors.saturating_add(1);
+            diagnostics.queue_depth = queue_depth;
+        }
+    }
+
+    pub fn record_persistence_queue_depth(&self, queue_depth: usize) {
+        if let Ok(mut diagnostics) = self.telemetry_ingest.lock() {
+            diagnostics.persistence_queue_depth = queue_depth;
+            diagnostics.persistence_queue_high_water =
+                diagnostics.persistence_queue_high_water.max(queue_depth);
+        }
+    }
+
+    pub fn record_persistence_drop(&self, count: u64) {
+        if let Ok(mut diagnostics) = self.telemetry_ingest.lock() {
+            diagnostics.dropped_packets = diagnostics.dropped_packets.saturating_add(count);
+        }
+    }
+
+    fn queue_failed_telemetry_writes(&self, writes: Vec<TelemetryWrite>) -> usize {
+        let Ok(mut failed_writes) = self.failed_telemetry_writes.lock() else {
+            return writes.len();
+        };
+        let available = MAX_FAILED_TELEMETRY_WRITES.saturating_sub(failed_writes.len());
+        let accepted = available.min(writes.len());
+        let dropped = writes.len() - accepted;
+        failed_writes.extend(writes.into_iter().take(accepted));
+        dropped
+    }
+
+    fn record_persistence_result(&self, batch_size: usize, elapsed: Duration, success: bool) {
+        if let Ok(mut diagnostics) = self.telemetry_ingest.lock() {
+            diagnostics.last_batch_size = batch_size;
+            diagnostics.last_batch_write_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+            if !success {
+                diagnostics.persistence_errors = diagnostics.persistence_errors.saturating_add(1);
+            }
+        }
+    }
+
+    pub async fn persist_telemetry_batch(&self, app: &AppHandle, writes: Vec<TelemetryWrite>) {
+        if writes.is_empty() {
+            return;
+        }
+        let has_failed_writes = self
+            .failed_telemetry_writes
+            .lock()
+            .map(|failed_writes| !failed_writes.is_empty())
+            .unwrap_or(false);
+        if has_failed_writes {
+            let dropped = self.queue_failed_telemetry_writes(writes);
+            if dropped > 0 {
+                self.record_persistence_drop(dropped as u64);
+            }
+            return;
+        }
+
+        let started = Instant::now();
+        let batch_size = writes.len();
+        let mut last_error = None;
+        for attempt in 0..3 {
+            let database = self.db.clone();
+            let attempt_writes = writes.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                database.insert_telemetry_batch(&attempt_writes)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(event_counts)) => {
+                    {
+                        let mut sessions = self.sessions.write().await;
+                        for (session_id, count) in event_counts {
+                            if let Some(session) =
+                                sessions.iter_mut().find(|entry| entry.id == session_id)
+                            {
+                                session.event_count = session.event_count.saturating_add(count);
+                            }
+                        }
+                    }
+                    self.record_persistence_result(batch_size, started.elapsed(), true);
+                    return;
+                }
+                Ok(Err(error)) => last_error = Some(error),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+
+            sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
+        }
+
+        self.record_persistence_result(batch_size, started.elapsed(), false);
+        let dropped = self.queue_failed_telemetry_writes(writes);
+        if dropped > 0 {
+            self.record_persistence_drop(dropped as u64);
+        }
+        self.push_warning(
+            app,
+            format!(
+                "Telemetry recording batch failed and will be retried when the flight ends: {}",
+                last_error.unwrap_or_else(|| "unknown database error".into())
+            ),
+        )
+        .await;
+    }
+
+    async fn flush_failed_telemetry_writes(&self) -> Result<(), String> {
+        let writes = self
+            .failed_telemetry_writes
+            .lock()
+            .map_err(|_| "telemetry persistence mutex poisoned".to_string())?
+            .drain(..)
+            .collect::<Vec<_>>();
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        let database = self.db.clone();
+        let retry_writes = writes.clone();
+        match tauri::async_runtime::spawn_blocking(move || {
+            database.insert_telemetry_batch(&retry_writes)
+        })
+        .await
+        {
+            Ok(Ok(event_counts)) => {
+                let mut sessions = self.sessions.write().await;
+                for (session_id, count) in event_counts {
+                    if let Some(session) = sessions.iter_mut().find(|entry| entry.id == session_id)
+                    {
+                        session.event_count = session.event_count.saturating_add(count);
+                    }
+                }
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let dropped = self.queue_failed_telemetry_writes(writes);
+                self.record_persistence_drop(dropped as u64);
+                Err(format!("Unable to finalize telemetry recording: {error}"))
+            }
+            Err(error) => {
+                let dropped = self.queue_failed_telemetry_writes(writes);
+                self.record_persistence_drop(dropped as u64);
+                Err(format!("Unable to finalize telemetry recording: {error}"))
+            }
+        }
+    }
+
+    pub async fn emit_live_telemetry_update(
+        &self,
+        app: &AppHandle,
+        track_points: Vec<TrackPointRecord>,
+        raw_packets: Vec<String>,
+    ) -> Result<(), String> {
+        if let Ok(mut diagnostics) = self.telemetry_ingest.lock() {
+            diagnostics.frontend_updates = diagnostics.frontend_updates.saturating_add(1);
+        }
+        let update = LiveTelemetryUpdate {
+            connection: self.connection.read().await.clone(),
+            live_state: self.live_state.read().await.clone(),
+            active_session_has_armed_telemetry: *self.session_has_armed_telemetry.read().await,
+            track_points,
+            raw_telemetry_packets: raw_packets,
+            telemetry_ingest: self.telemetry_ingest_snapshot(),
+        };
+        app.emit(
+            "kerbodyne://runtime",
+            RuntimeEvent::LiveTelemetry { update },
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub async fn export_session_detections(
         &self,
         app: &AppHandle,
@@ -990,7 +1265,10 @@ impl AppRuntime {
                     );
                     let destination = export_dir.join(&file_name);
                     fs::copy(source_path, &destination).map_err(|error| {
-                        format!("Unable to copy detection image {}: {error}", source_path.display())
+                        format!(
+                            "Unable to copy detection image {}: {error}",
+                            source_path.display()
+                        )
                     })?;
                     image_file = file_name;
                 }
@@ -1092,8 +1370,9 @@ impl AppRuntime {
         name: Option<String>,
         description: Option<String>,
     ) -> Result<(), String> {
+        self.stop_legacy_listener_tasks().await?;
         *self.legacy_ingest_enabled.write().await = false;
-        self.stop_legacy_listener_tasks().await;
+        self.flush_failed_telemetry_writes().await?;
         let had_connection = self.connection.read().await.last_packet_at.is_some();
         let has_armed_telemetry = *self.session_has_armed_telemetry.read().await;
         let session_id = self
@@ -1221,8 +1500,9 @@ impl AppRuntime {
     }
 
     async fn prepare_for_new_manual_stream(&self, app: &AppHandle) -> Result<(), String> {
+        self.stop_legacy_listener_tasks().await?;
         *self.legacy_ingest_enabled.write().await = false;
-        self.stop_legacy_listener_tasks().await;
+        self.flush_failed_telemetry_writes().await?;
         {
             let mut active_tasks = self.active_tasks.lock().await;
             for handle in active_tasks.drain(..) {
@@ -1276,10 +1556,8 @@ impl AppRuntime {
         };
 
         if needs_udp_listener {
-            let udp_socket =
-                bind_legacy_udp_listener(("0.0.0.0", legacy_telemetry_port), legacy_telemetry_port)
-                    .await?;
-            let telemetry_handle = spawn_legacy_telemetry_listener(
+            let udp_socket = bind_legacy_udp_listener(legacy_telemetry_port).await?;
+            let telemetry_handles = spawn_legacy_telemetry_listener(
                 runtime.clone(),
                 app.clone(),
                 udp_socket,
@@ -1288,7 +1566,7 @@ impl AppRuntime {
             self.legacy_listener_tasks
                 .lock()
                 .await
-                .push(telemetry_handle);
+                .extend(telemetry_handles);
             *self.legacy_udp_listener_ready.write().await = true;
         }
 
@@ -1349,21 +1627,28 @@ impl AppRuntime {
         ))
     }
 
-    async fn stop_legacy_listener_tasks(&self) {
+    async fn stop_legacy_listener_tasks(&self) -> Result<(), String> {
         if let Some(shutdown_signal) = self.legacy_listener_shutdown.lock().await.take() {
             let _ = shutdown_signal.send(());
         }
 
         let mut legacy_listener_tasks = self.legacy_listener_tasks.lock().await;
+        let mut timed_out = false;
         for handle in legacy_listener_tasks.drain(..) {
             let mut handle = handle;
-            if timeout(Duration::from_secs(2), &mut handle).await.is_err() {
+            if timeout(Duration::from_secs(10), &mut handle).await.is_err() {
                 handle.abort();
+                timed_out = true;
             }
         }
 
         *self.legacy_udp_listener_ready.write().await = false;
         *self.legacy_tcp_listener_ready.write().await = false;
+        if timed_out {
+            Err("Telemetry pipeline did not finish flushing within 10 seconds.".into())
+        } else {
+            Ok(())
+        }
     }
 
     async fn refresh_connection_health(&self) -> bool {
@@ -1404,7 +1689,13 @@ impl AppRuntime {
     async fn refresh_compatibility_connection_health(&self, stale_after_seconds: u64) -> bool {
         let now = Utc::now();
         let state = self.compatibility_telemetry.read().await.clone();
-        let Some(last_packet_at) = state.last_packet_at() else {
+        let diagnostics = self.telemetry_ingest_snapshot();
+        let last_packet_at = diagnostics
+            .last_received_at
+            .as_deref()
+            .and_then(|timestamp| parse_timestamp(timestamp).ok())
+            .or_else(|| state.last_packet_at());
+        let Some(last_packet_at) = last_packet_at else {
             return false;
         };
 
@@ -1415,8 +1706,13 @@ impl AppRuntime {
         };
         let next_note = if next_status == ConnectionStatus::Stale {
             "Telemetry link is stale".to_string()
+        } else if diagnostics.queue_depth >= 5 || diagnostics.processing_delay_ms >= 250 {
+            format!(
+                "Receiving telemetry; processing backlog {} packets ({} ms delay)",
+                diagnostics.queue_depth, diagnostics.processing_delay_ms
+            )
         } else {
-            state.build_connection_note(&now)
+            build_ingress_connection_note(&state, &diagnostics, &now)
         };
         let next_last_packet_at = Some(last_packet_at.to_rfc3339());
 
@@ -1829,7 +2125,8 @@ impl AppRuntime {
                 handle.abort();
             }
         }
-        self.stop_legacy_listener_tasks().await;
+        let _ = self.stop_legacy_listener_tasks().await;
+        let _ = self.flush_failed_telemetry_writes().await;
         {
             let mut background_tasks = self.background_tasks.lock().await;
             for handle in background_tasks.drain(..) {
@@ -2035,61 +2332,92 @@ impl AppRuntime {
         Ok(())
     }
 
-    pub async fn ingest_legacy_telemetry(
+    pub async fn ingest_legacy_telemetry_received(
         &self,
         app: &AppHandle,
         raw_json: &str,
         source: IngestSource,
-    ) -> Result<(), String> {
+        received_at: DateTime<Utc>,
+        received_instant: Instant,
+        queue_depth: usize,
+    ) -> Result<Option<LegacyTelemetryProcessResult>, String> {
         if !*self.legacy_ingest_enabled.read().await {
-            return Ok(());
+            return Ok(None);
         }
 
         let packet: LegacyTelemetryPacket =
             serde_json::from_str(raw_json).map_err(|error| error.to_string())?;
-        self.push_raw_telemetry_packet(raw_json).await;
-        let now = Utc::now();
-        let packet_type = packet.packet_type;
+        let raw_packet = self.push_raw_telemetry_packet(raw_json).await;
+        let packet_type = packet
+            .packet_type
+            .unwrap_or(LegacyTelemetryPacketType::Unknown);
+        let sequence = packet.sequence;
+        let generated_at = packet.generated_at.as_ref().map(|value| match value {
+            Value::String(value) => value.clone(),
+            other => other.to_string(),
+        });
         let state = {
             let mut compatibility = self.compatibility_telemetry.write().await;
-            compatibility.apply_packet(&packet, now);
+            compatibility.apply_packet(&packet, received_at);
             compatibility.clone()
         };
 
         let has_any_state = state.has_any_state();
 
         if !has_any_state {
+            self.record_telemetry_processed(
+                packet_type,
+                Utc::now(),
+                received_instant.elapsed(),
+                queue_depth,
+                sequence,
+                generated_at,
+            );
             let _ = self
                 .refresh_compatibility_connection_health(
                     self.config.read().await.stale_after_seconds,
                 )
                 .await;
-            self.emit_snapshot(app).await?;
-            return Ok(());
+            return Ok(Some(LegacyTelemetryProcessResult {
+                packet_type,
+                persistence_write: None,
+                track_point: None,
+                raw_packet,
+            }));
         }
 
-        let sent_at = now.to_rfc3339();
-        let message_id = format!("legacy-telemetry-{}", Uuid::new_v4());
-        let payload = state.to_payload(packet_type);
-
-        let canonical_raw_json = serde_json::to_string(&json!({
-            "schema_version": SCHEMA_VERSION,
-            "message_id": message_id,
-            "aircraft_id": DEFAULT_AIRCRAFT_ID,
-            "sent_at": sent_at,
-            "type": "telemetry",
-            "payload": payload
-        }))
-        .map_err(|error| error.to_string())?;
-
-        self.ingest_json(app, &canonical_raw_json, source).await?;
-        let connection_changed = self
+        let envelope = WireEnvelope {
+            schema_version: SCHEMA_VERSION.into(),
+            message_id: format!("legacy-telemetry-{}", Uuid::new_v4()),
+            aircraft_id: DEFAULT_AIRCRAFT_ID.into(),
+            sent_at: received_at.to_rfc3339(),
+            envelope_type: "telemetry".into(),
+            payload: state.to_payload(Some(packet_type)),
+            extras: HashMap::new(),
+        };
+        let canonical_raw_json =
+            serde_json::to_string(&envelope).map_err(|error| error.to_string())?;
+        let (persistence_write, track_point) = self
+            .apply_telemetry_state(&envelope, &canonical_raw_json, source)
+            .await?;
+        self.record_telemetry_processed(
+            packet_type,
+            Utc::now(),
+            received_instant.elapsed(),
+            queue_depth,
+            sequence,
+            generated_at,
+        );
+        let _ = self
             .refresh_compatibility_connection_health(self.config.read().await.stale_after_seconds)
             .await;
-        if connection_changed {
-            self.emit_snapshot(app).await?;
-        }
-        Ok(())
+        let _ = app;
+        Ok(Some(LegacyTelemetryProcessResult {
+            packet_type,
+            persistence_write,
+            track_point,
+            raw_packet,
+        }))
     }
 
     pub async fn ingest_legacy_alert(
@@ -2253,11 +2581,45 @@ impl AppRuntime {
         canonical_raw_json: &str,
         source: IngestSource,
     ) -> Result<(), String> {
+        let (persistence_write, _) = self
+            .apply_telemetry_state(&envelope, canonical_raw_json, source)
+            .await?;
+        if let Some(write) = persistence_write {
+            self.record_event(
+                &write.session_id,
+                &write.envelope_json,
+                &write.sent_at,
+                false,
+            )
+            .await?;
+            if let Some(point) = write.track_point {
+                self.db.insert_track_point(
+                    &write.session_id,
+                    &point.recorded_at,
+                    point.lat,
+                    point.lon,
+                    point.alt_msl_m.unwrap_or_default(),
+                    point.heading_deg,
+                    point.groundspeed_mps,
+                )?;
+            }
+        }
+
+        self.emit_snapshot(app).await?;
+        Ok(())
+    }
+
+    async fn apply_telemetry_state(
+        &self,
+        envelope: &WireEnvelope<TelemetryPayload>,
+        canonical_raw_json: &str,
+        source: IngestSource,
+    ) -> Result<(Option<TelemetryWrite>, Option<TrackPointRecord>), String> {
         let session_id = self
             .ensure_session(&envelope.aircraft_id, &source.source_label())
             .await?;
         if !matches!(source, IngestSource::CompatibilityTelemetry) {
-            self.push_raw_telemetry_packet(canonical_raw_json).await;
+            let _ = self.push_raw_telemetry_packet(canonical_raw_json).await;
         }
         let sent_at = normalize_timestamp(&envelope.sent_at);
         let position_available = envelope.payload.armed;
@@ -2292,22 +2654,13 @@ impl AppRuntime {
             *self.session_has_armed_telemetry.write().await = true;
         }
 
-        if matches!(source, IngestSource::CompatibilityTelemetry) {
-            let _ = self
-                .refresh_compatibility_connection_health(
-                    self.config.read().await.stale_after_seconds,
-                )
-                .await;
-        } else {
+        if !matches!(source, IngestSource::CompatibilityTelemetry) {
             self.update_runtime_status(source, &sent_at).await;
         }
-        if envelope.payload.armed {
-            self.record_event(&session_id, canonical_raw_json, &sent_at, false)
-                .await?;
-        }
-        if let (Some(lat), Some(lon), Some(alt_msl_m)) = (lat, lon, envelope.payload.alt_msl_m) {
-            self.maybe_store_track_point(
-                &session_id,
+        let track_point = if let (Some(lat), Some(lon), Some(alt_msl_m)) =
+            (lat, lon, envelope.payload.alt_msl_m)
+        {
+            self.maybe_append_track_point(
                 &sent_at,
                 lat,
                 lon,
@@ -2315,11 +2668,18 @@ impl AppRuntime {
                 envelope.payload.heading_deg,
                 envelope.payload.groundspeed_mps,
             )
-            .await?;
-        }
+            .await
+        } else {
+            None
+        };
 
-        self.emit_snapshot(app).await?;
-        Ok(())
+        let persistence_write = envelope.payload.armed.then(|| TelemetryWrite {
+            session_id,
+            sent_at,
+            envelope_json: canonical_raw_json.to_string(),
+            track_point: track_point.clone(),
+        });
+        Ok((persistence_write, track_point))
     }
 
     async fn ingest_alert(
@@ -2566,22 +2926,21 @@ impl AppRuntime {
                 session.alert_count += 1;
             }
             self.db
-                .update_session_counts(session_id, session.event_count, session.alert_count)?;
+                .increment_session_counts(session_id, 1, u32::from(is_alert))?;
         }
 
         Ok(())
     }
 
-    async fn maybe_store_track_point(
+    async fn maybe_append_track_point(
         &self,
-        session_id: &str,
         recorded_at: &str,
         lat: f64,
         lon: f64,
         alt_msl_m: f64,
         heading_deg: Option<f64>,
         groundspeed_mps: Option<f64>,
-    ) -> Result<(), String> {
+    ) -> Option<TrackPointRecord> {
         let mut track = self.track.write().await;
         let should_store = track
             .last()
@@ -2599,39 +2958,30 @@ impl AppRuntime {
             .unwrap_or(true);
 
         if should_store {
-            track.push(TrackPointRecord {
+            let point = TrackPointRecord {
                 lat,
                 lon,
                 recorded_at: recorded_at.to_string(),
                 alt_msl_m: Some(alt_msl_m),
                 heading_deg,
                 groundspeed_mps,
-            });
-            self.db.insert_track_point(
-                session_id,
-                recorded_at,
-                lat,
-                lon,
-                alt_msl_m,
-                heading_deg,
-                groundspeed_mps,
-            )?;
+            };
+            track.push(point.clone());
+            return Some(point);
         }
 
-        Ok(())
+        None
     }
 
-    async fn push_raw_telemetry_packet(&self, packet: &str) {
+    async fn push_raw_telemetry_packet(&self, packet: &str) -> String {
+        let formatted = format!("[{}] {}", Local::now().format("%H:%M:%S"), packet.trim());
         let mut packets = self.raw_telemetry_packets.write().await;
-        packets.push(format!(
-            "[{}] {}",
-            Local::now().format("%H:%M:%S"),
-            packet.trim()
-        ));
+        packets.push(formatted.clone());
         if packets.len() > MAX_RAW_TELEMETRY_PACKETS {
             let drain_count = packets.len() - MAX_RAW_TELEMETRY_PACKETS;
             packets.drain(0..drain_count);
         }
+        formatted
     }
 
     async fn register_message_id(&self, message_id: &str) -> bool {
@@ -2679,9 +3029,9 @@ impl AppRuntime {
     }
 }
 
-async fn bind_legacy_udp_listener(address: (&str, u16), port: u16) -> Result<UdpSocket, String> {
+async fn bind_legacy_udp_listener(port: u16) -> Result<UdpSocket, String> {
     for attempt in 0..20 {
-        match UdpSocket::bind(address).await {
+        match create_legacy_udp_socket(port) {
             Ok(socket) => return Ok(socket),
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 19 => {
                 sleep(Duration::from_millis(250)).await;
@@ -2747,6 +3097,77 @@ async fn bind_legacy_alert_listener(
 fn update_if_some<T>(target: &mut Option<T>, value: Option<T>) {
     if let Some(value) = value {
         *target = Some(value);
+    }
+}
+
+fn create_legacy_udp_socket(port: u16) -> std::io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    // Large enough for short scheduler stalls without retaining minutes of stale telemetry.
+    let _ = socket.set_recv_buffer_size(1024 * 1024);
+    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
+    if let Ok(buffer_size) = socket.recv_buffer_size() {
+        eprintln!(
+            "Kerbodyne telemetry UDP listener bound on port {port} with {buffer_size} byte receive buffer"
+        );
+    }
+    socket.set_nonblocking(true)?;
+    let socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(socket)
+}
+
+fn legacy_packet_type_label(packet_type: LegacyTelemetryPacketType) -> &'static str {
+    match packet_type {
+        LegacyTelemetryPacketType::HighFrequency => "hf",
+        LegacyTelemetryPacketType::MediumFrequency => "mf",
+        LegacyTelemetryPacketType::LowFrequency => "lf",
+        LegacyTelemetryPacketType::OnChange => "oc",
+        LegacyTelemetryPacketType::Unknown => "unknown",
+    }
+}
+
+fn build_ingress_connection_note(
+    state: &CompatibilityTelemetryState,
+    diagnostics: &TelemetryIngestDiagnostics,
+    now: &DateTime<Utc>,
+) -> String {
+    if !state.has_any_state() {
+        return "Telemetry packet received; awaiting aircraft state".into();
+    }
+    if !state.has_split_packets {
+        return "Receiving compatibility telemetry".into();
+    }
+
+    let tier_timestamp = |value: Option<&str>| value.and_then(|value| parse_timestamp(value).ok());
+    let mut missing = Vec::new();
+    if !state.tier_is_current(
+        tier_timestamp(diagnostics.last_hf_received_at.as_deref()),
+        COMPAT_HF_STALE_SECS,
+        now,
+    ) {
+        missing.push("high-rate");
+    }
+    if !state.tier_is_current(
+        tier_timestamp(diagnostics.last_mf_received_at.as_deref()),
+        COMPAT_MF_STALE_SECS,
+        now,
+    ) {
+        missing.push("medium-rate");
+    }
+    if !state.tier_is_current(
+        tier_timestamp(diagnostics.last_lf_received_at.as_deref()),
+        COMPAT_LF_STALE_SECS,
+        now,
+    ) {
+        missing.push("low-rate");
+    }
+
+    if missing.is_empty() {
+        "Receiving split compatibility telemetry".into()
+    } else {
+        format!(
+            "Receiving split compatibility telemetry; awaiting {} packets",
+            missing.join(", ")
+        )
     }
 }
 

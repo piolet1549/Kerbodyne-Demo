@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -9,6 +10,14 @@ use rusqlite::{params, Connection, Error as SqlError, OptionalExtension};
 
 pub struct Database {
     connection: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TelemetryWrite {
+    pub session_id: String,
+    pub sent_at: String,
+    pub envelope_json: String,
+    pub track_point: Option<TrackPointRecord>,
 }
 
 impl Database {
@@ -279,9 +288,7 @@ impl Database {
         transaction
             .execute("DELETE FROM sessions_to_prune", [])
             .map_err(|error| error.to_string())?;
-        transaction
-            .commit()
-            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
         Ok(deleted)
     }
 
@@ -408,11 +415,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_session_counts(
+    pub fn increment_session_counts(
         &self,
         session_id: &str,
-        event_count: u32,
-        alert_count: u32,
+        event_delta: u32,
+        alert_delta: u32,
     ) -> Result<(), String> {
         let connection = self
             .connection
@@ -420,8 +427,11 @@ impl Database {
             .map_err(|_| "database mutex poisoned".to_string())?;
         connection
             .execute(
-                "UPDATE sessions SET event_count = ?2, alert_count = ?3 WHERE id = ?1",
-                params![session_id, event_count as i64, alert_count as i64],
+                "UPDATE sessions
+                 SET event_count = event_count + ?2,
+                     alert_count = alert_count + ?3
+                 WHERE id = ?1",
+                params![session_id, event_delta as i64, alert_delta as i64],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -618,6 +628,76 @@ impl Database {
             )
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub fn insert_telemetry_batch(
+        &self,
+        writes: &[TelemetryWrite],
+    ) -> Result<HashMap<String, u32>, String> {
+        if writes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "database mutex poisoned".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let mut event_counts = HashMap::<String, u32>::new();
+
+        {
+            let mut replay_statement = transaction
+                .prepare(
+                    "INSERT INTO replay_events (session_id, sent_at, envelope_json) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|error| error.to_string())?;
+            let mut track_statement = transaction
+                .prepare(
+                    "INSERT INTO track_points (
+                        session_id, recorded_at, lat, lon, alt_msl_m, heading_deg, groundspeed_mps
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|error| error.to_string())?;
+
+            for write in writes {
+                replay_statement
+                    .execute(params![
+                        &write.session_id,
+                        &write.sent_at,
+                        &write.envelope_json
+                    ])
+                    .map_err(|error| error.to_string())?;
+                *event_counts.entry(write.session_id.clone()).or_default() += 1;
+
+                if let Some(point) = write.track_point.as_ref() {
+                    track_statement
+                        .execute(params![
+                            &write.session_id,
+                            &point.recorded_at,
+                            point.lat,
+                            point.lon,
+                            point.alt_msl_m.unwrap_or_default(),
+                            point.heading_deg,
+                            point.groundspeed_mps
+                        ])
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+
+        for (session_id, event_count) in &event_counts {
+            transaction
+                .execute(
+                    "UPDATE sessions SET event_count = event_count + ?2 WHERE id = ?1",
+                    params![session_id, *event_count as i64],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(event_counts)
     }
 
     pub fn load_replay_events(&self, session_id: &str) -> Result<Vec<ReplayFrame>, String> {
@@ -888,4 +968,67 @@ fn ignore_duplicate_column(result: Result<usize, SqlError>) -> Result<(), String
 
 fn session_display_name(stored_name: Option<String>, started_at: &str) -> String {
     stored_name.unwrap_or_else(|| format!("Flight {}", started_at))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::MissionSession;
+
+    #[test]
+    fn telemetry_batch_commits_events_tracks_and_counts_atomically() {
+        let path = std::env::temp_dir().join(format!(
+            "kerbodyne-telemetry-batch-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let database = Database::open(&path).unwrap();
+            let session = MissionSession {
+                id: "session-1".into(),
+                name: "Batch test".into(),
+                description: None,
+                aircraft_id: "prototype-001".into(),
+                source: "test".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                ended_at: None,
+                is_active: true,
+                event_count: 0,
+                alert_count: 0,
+                storage_bytes: 0,
+            };
+            database.upsert_session(&session).unwrap();
+
+            let writes = (0..100)
+                .map(|index| TelemetryWrite {
+                    session_id: session.id.clone(),
+                    sent_at: format!("2026-01-01T00:00:{:02}Z", index % 60),
+                    envelope_json: format!(r#"{{"type":"telemetry","index":{index}}}"#),
+                    track_point: (index % 10 == 0).then(|| TrackPointRecord {
+                        lat: 44.0 + index as f64 / 10_000.0,
+                        lon: -93.0,
+                        recorded_at: format!("2026-01-01T00:00:{:02}Z", index % 60),
+                        alt_msl_m: Some(300.0),
+                        heading_deg: Some(90.0),
+                        groundspeed_mps: Some(20.0),
+                    }),
+                })
+                .collect::<Vec<_>>();
+
+            let counts = database.insert_telemetry_batch(&writes).unwrap();
+            assert_eq!(counts.get(&session.id), Some(&100));
+            assert_eq!(database.load_replay_events(&session.id).unwrap().len(), 100);
+            assert_eq!(database.load_track(&session.id).unwrap().len(), 10);
+            assert_eq!(database.load_sessions(1).unwrap()[0].event_count, 100);
+            database
+                .increment_session_counts(&session.id, 1, 1)
+                .unwrap();
+            let updated = database.load_sessions(1).unwrap();
+            assert_eq!(updated[0].event_count, 101);
+            assert_eq!(updated[0].alert_count, 1);
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
 }

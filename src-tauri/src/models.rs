@@ -456,14 +456,54 @@ pub struct AppSnapshot {
     pub review_frames: Vec<ReviewTelemetryFrame>,
     pub review_video_clips: Vec<SessionVideoClip>,
     pub video_preview: VideoPreviewState,
+    pub telemetry_ingest: TelemetryIngestDiagnostics,
     pub raw_telemetry_packets: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TelemetryIngestDiagnostics {
+    pub received_packets: u64,
+    pub processed_packets: u64,
+    pub parse_errors: u64,
+    pub coalesced_packets: u64,
+    pub dropped_packets: u64,
+    pub persistence_errors: u64,
+    pub frontend_updates: u64,
+    pub queue_depth: usize,
+    pub queue_high_water: usize,
+    pub persistence_queue_depth: usize,
+    pub persistence_queue_high_water: usize,
+    pub processing_delay_ms: u64,
+    pub max_processing_delay_ms: u64,
+    pub last_batch_size: usize,
+    pub last_batch_write_ms: u64,
+    pub last_packet_type: Option<String>,
+    pub last_received_at: Option<String>,
+    pub last_processed_at: Option<String>,
+    pub last_hf_received_at: Option<String>,
+    pub last_mf_received_at: Option<String>,
+    pub last_lf_received_at: Option<String>,
+    pub last_oc_received_at: Option<String>,
+    pub last_sequence: Option<u64>,
+    pub last_generated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveTelemetryUpdate {
+    pub connection: ConnectionHealth,
+    pub live_state: Option<AircraftLiveState>,
+    pub active_session_has_armed_telemetry: bool,
+    pub track_points: Vec<TrackPointRecord>,
+    pub raw_telemetry_packets: Vec<String>,
+    pub telemetry_ingest: TelemetryIngestDiagnostics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     Snapshot { snapshot: AppSnapshot },
+    LiveTelemetry { update: LiveTelemetryUpdate },
     Warning { message: String },
 }
 
@@ -507,6 +547,8 @@ pub struct LegacyTelemetryPacket {
     pub battery_wh: Option<f64>,
     pub energy_consumed: Option<f64>,
     pub time_boot_ms: Option<u64>,
+    pub sequence: Option<u64>,
+    pub generated_at: Option<Value>,
     pub armed: Option<bool>,
     pub cpu_temp_c: Option<f64>,
     pub cpu_pct: Option<f64>,
@@ -609,6 +651,8 @@ mod tests {
     fn split_legacy_telemetry_packet_roundtrips() {
         let raw = r#"{
             "type":"lf",
+            "sequence":421,
+            "generated_at":12345.67,
             "battery_v":15.6,
             "battery_a":22.4,
             "battery_pct":61,
@@ -627,6 +671,8 @@ mod tests {
         );
         assert_eq!(packet.battery_pct, Some(61.0));
         assert_eq!(packet.vision_active, Some(true));
+        assert_eq!(packet.sequence, Some(421));
+        assert_eq!(packet.generated_at, Some(serde_json::json!(12345.67)));
     }
 
     #[test]

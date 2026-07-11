@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "kerbodyne-ground-station"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1823,6 +1823,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "sysinfo",
  "tauri",
  "tauri-build",

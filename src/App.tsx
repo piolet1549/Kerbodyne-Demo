@@ -130,6 +130,32 @@ const emptySnapshot: AppSnapshot = {
     current_clip_id: null,
     message: null
   },
+  telemetry_ingest: {
+    received_packets: 0,
+    processed_packets: 0,
+    parse_errors: 0,
+    coalesced_packets: 0,
+    dropped_packets: 0,
+    persistence_errors: 0,
+    frontend_updates: 0,
+    queue_depth: 0,
+    queue_high_water: 0,
+    persistence_queue_depth: 0,
+    persistence_queue_high_water: 0,
+    processing_delay_ms: 0,
+    max_processing_delay_ms: 0,
+    last_batch_size: 0,
+    last_batch_write_ms: 0,
+    last_packet_type: null,
+    last_received_at: null,
+    last_processed_at: null,
+    last_hf_received_at: null,
+    last_mf_received_at: null,
+    last_lf_received_at: null,
+    last_oc_received_at: null,
+    last_sequence: null,
+    last_generated_at: null
+  },
   raw_telemetry_packets: [],
   warnings: []
 };
@@ -1135,6 +1161,28 @@ export function App() {
             setUnacknowledgedDetectionIds([]);
             setActiveMapHiddenDetectionIds([]);
           }
+        }
+        if (event.type === 'live_telemetry') {
+          setSnapshot((current) => {
+            const recordedAt = new Set(current.track.map((point) => point.recorded_at));
+            const trackPoints = event.update.track_points.filter(
+              (point) => !recordedAt.has(point.recorded_at)
+            );
+            const rawTelemetryPackets = [
+              ...current.raw_telemetry_packets,
+              ...event.update.raw_telemetry_packets
+            ].slice(-160);
+            return {
+              ...current,
+              connection: event.update.connection,
+              live_state: event.update.live_state,
+              active_session_has_armed_telemetry:
+                event.update.active_session_has_armed_telemetry,
+              track: trackPoints.length > 0 ? [...current.track, ...trackPoints] : current.track,
+              raw_telemetry_packets: rawTelemetryPackets,
+              telemetry_ingest: event.update.telemetry_ingest
+            };
+          });
         }
         if (event.type === 'warning') {
           showBanner(event.message);

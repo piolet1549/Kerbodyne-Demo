@@ -234,8 +234,45 @@ export interface AppSnapshot {
   review_frames: ReviewTelemetryFrame[];
   review_video_clips: SessionVideoClip[];
   video_preview: VideoPreviewState;
+  telemetry_ingest: TelemetryIngestDiagnostics;
   raw_telemetry_packets: string[];
   warnings: string[];
+}
+
+export interface TelemetryIngestDiagnostics {
+  received_packets: number;
+  processed_packets: number;
+  parse_errors: number;
+  coalesced_packets: number;
+  dropped_packets: number;
+  persistence_errors: number;
+  frontend_updates: number;
+  queue_depth: number;
+  queue_high_water: number;
+  persistence_queue_depth: number;
+  persistence_queue_high_water: number;
+  processing_delay_ms: number;
+  max_processing_delay_ms: number;
+  last_batch_size: number;
+  last_batch_write_ms: number;
+  last_packet_type?: string | null;
+  last_received_at?: string | null;
+  last_processed_at?: string | null;
+  last_hf_received_at?: string | null;
+  last_mf_received_at?: string | null;
+  last_lf_received_at?: string | null;
+  last_oc_received_at?: string | null;
+  last_sequence?: number | null;
+  last_generated_at?: string | null;
+}
+
+export interface LiveTelemetryUpdate {
+  connection: ConnectionHealth;
+  live_state?: AircraftLiveState | null;
+  active_session_has_armed_telemetry: boolean;
+  track_points: TrackPointRecord[];
+  raw_telemetry_packets: string[];
+  telemetry_ingest: TelemetryIngestDiagnostics;
 }
 
 export interface TelemetryPayload {
@@ -283,6 +320,10 @@ export type RuntimeEvent =
   | {
       type: 'snapshot';
       snapshot: AppSnapshot;
+    }
+  | {
+      type: 'live_telemetry';
+      update: LiveTelemetryUpdate;
     }
   | {
       type: 'warning';
