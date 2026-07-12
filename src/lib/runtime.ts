@@ -5,7 +5,8 @@ import type {
   AppSnapshot,
   OfflineRegionCatalog,
   OfflineRegionManifest,
-  RuntimeEvent
+  RuntimeEvent,
+  VideoFrontendPerformance
 } from './types';
 
 export async function bootstrapApp(): Promise<AppSnapshot> {
@@ -78,6 +79,12 @@ export async function exportSessionDetections(sessionId: string): Promise<string
 
 export async function setVisionPipelineEnabled(enabled: boolean): Promise<string> {
   return invoke<string>('set_vision_pipeline_enabled', { enabled });
+}
+
+export async function reportVideoPerformance(
+  performance: VideoFrontendPerformance
+): Promise<void> {
+  return invoke('report_video_performance', { performance });
 }
 
 export async function listenToRuntimeEvents(

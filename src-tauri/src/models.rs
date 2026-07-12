@@ -389,6 +389,14 @@ impl Default for VideoPreviewState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VideoFrontendPerformance {
+    pub rendered_fps_1s: f64,
+    pub decoder_dropped_frames_total: u64,
+    pub last_rendered_frame_age_ms: Option<u64>,
+    pub stall_active: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionStatus {

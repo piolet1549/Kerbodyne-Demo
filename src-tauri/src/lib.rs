@@ -13,7 +13,9 @@ use std::{
     },
 };
 
-use models::{AppConfig, AppSnapshot, OfflineRegionCatalog, OfflineRegionManifest};
+use models::{
+    AppConfig, AppSnapshot, OfflineRegionCatalog, OfflineRegionManifest, VideoFrontendPerformance,
+};
 use runtime::AppRuntime;
 #[cfg(windows)]
 use sysinfo::System;
@@ -143,6 +145,15 @@ async fn set_vision_pipeline_enabled(
     state.set_vision_pipeline_enabled(enabled).await
 }
 
+#[tauri::command]
+async fn report_video_performance(
+    state: State<'_, Arc<AppRuntime>>,
+    performance: VideoFrontendPerformance,
+) -> Result<(), String> {
+    state.report_video_performance(performance).await;
+    Ok(())
+}
+
 #[cfg(windows)]
 fn terminate_stale_ground_station_processes() {
     let Ok(current_exe) = std::env::current_exe() else {
@@ -245,7 +256,8 @@ pub fn run() {
             delete_session,
             export_session_telemetry,
             export_session_detections,
-            set_vision_pipeline_enabled
+            set_vision_pipeline_enabled,
+            report_video_performance
         ])
         .build(tauri::generate_context!())
         .expect("error while building Kerbodyne Ground Station");

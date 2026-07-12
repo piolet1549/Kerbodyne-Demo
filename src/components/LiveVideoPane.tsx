@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import JMuxer from 'jmuxer';
+import { reportVideoPerformance } from '../lib/runtime';
 import type { VideoPreviewState } from '../lib/types';
 
 interface LiveVideoPaneProps {
@@ -15,7 +16,24 @@ interface DecoderDiagnostic {
   tone: DecoderTone;
 }
 
+interface VideoPlaybackQualitySnapshot {
+  totalVideoFrames: number;
+  droppedVideoFrames: number;
+}
+
+type PerformanceVideoElement = HTMLVideoElement & {
+  requestVideoFrameCallback?: (
+    callback: (now: number, metadata: { presentedFrames?: number }) => void
+  ) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+  getVideoPlaybackQuality?: () => VideoPlaybackQualitySnapshot;
+  webkitDecodedFrameCount?: number;
+  webkitDroppedFrameCount?: number;
+};
+
 const FIRST_FRAME_WARNING_AFTER_MS = 5000;
+const VIDEO_PERFORMANCE_REPORT_INTERVAL_MS = 250;
+const VIDEO_STALL_AFTER_MS = 250;
 
 function statusLabel(status: VideoPreviewState['status']) {
   switch (status) {
@@ -143,10 +161,19 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
     }
 
     const videoElement = videoElementRef.current;
+    const performanceVideoElement = videoElement as PerformanceVideoElement;
     let cancelled = false;
     let firstDataWarningTimer: number | null = null;
     let frameCallbackHandle: number | null = null;
+    let performanceReportTimer: number | null = null;
     let accessUnitCount = 0;
+    let lastRenderedFrameAt: number | null = null;
+    let lastQualityPresentedFrames = 0;
+    let lastRawDecoderDroppedFrames = 0;
+    let decoderDroppedFramesOffset = 0;
+    let performanceReportInFlight = false;
+    const renderedFrameTimes: number[] = [];
+    const qualityFrameSamples: Array<{ at: number; presentedFrames: number }> = [];
 
     renderedDirectFrameRef.current = false;
     setHasRenderedDirectFrame(false);
@@ -182,7 +209,7 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
       }, FIRST_FRAME_WARNING_AFTER_MS);
     };
 
-    const markFrameRendered = () => {
+    const markFirstFrameRendered = () => {
       if (cancelled || renderedDirectFrameRef.current) {
         return;
       }
@@ -190,6 +217,23 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
       clearFirstDataWarning();
       setHasRenderedDirectFrame(true);
       setDecoderDiagnostic(null);
+    };
+
+    const recordRenderedFrame = (now: number) => {
+      if (cancelled) {
+        return;
+      }
+      lastRenderedFrameAt = performance.now();
+      renderedFrameTimes.push(now);
+      while (renderedFrameTimes[0] != null && now - renderedFrameTimes[0] > 1000) {
+        renderedFrameTimes.shift();
+      }
+      markFirstFrameRendered();
+      if (typeof performanceVideoElement.requestVideoFrameCallback === 'function') {
+        frameCallbackHandle = performanceVideoElement.requestVideoFrameCallback(
+          recordRenderedFrame
+        );
+      }
     };
 
     const onVideoError = () => {
@@ -205,20 +249,18 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
       updateDiagnostic({ message: 'Video decoder stalled while waiting for frames', tone: 'warning' });
     };
 
-    videoElement.addEventListener('loadeddata', markFrameRendered);
-    videoElement.addEventListener('canplay', markFrameRendered);
-    videoElement.addEventListener('playing', markFrameRendered);
-    videoElement.addEventListener('timeupdate', markFrameRendered);
+    videoElement.addEventListener('loadeddata', markFirstFrameRendered);
+    videoElement.addEventListener('canplay', markFirstFrameRendered);
+    videoElement.addEventListener('playing', markFirstFrameRendered);
+    videoElement.addEventListener('timeupdate', markFirstFrameRendered);
     videoElement.addEventListener('error', onVideoError);
     videoElement.addEventListener('waiting', onWaiting);
     videoElement.addEventListener('stalled', onStalled);
 
-    const videoWithFrameCallback = videoElement as HTMLVideoElement & {
-      requestVideoFrameCallback?: (callback: () => void) => number;
-      cancelVideoFrameCallback?: (handle: number) => void;
-    };
-    if (typeof videoWithFrameCallback.requestVideoFrameCallback === 'function') {
-      frameCallbackHandle = videoWithFrameCallback.requestVideoFrameCallback(markFrameRendered);
+    if (typeof performanceVideoElement.requestVideoFrameCallback === 'function') {
+      frameCallbackHandle = performanceVideoElement.requestVideoFrameCallback(
+        recordRenderedFrame
+      );
     }
 
     if (!resolveMediaSourceConstructor()) {
@@ -229,10 +271,16 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
       return () => {
         cancelled = true;
         clearFirstDataWarning();
-        videoElement.removeEventListener('loadeddata', markFrameRendered);
-        videoElement.removeEventListener('canplay', markFrameRendered);
-        videoElement.removeEventListener('playing', markFrameRendered);
-        videoElement.removeEventListener('timeupdate', markFrameRendered);
+        if (
+          frameCallbackHandle !== null &&
+          typeof performanceVideoElement.cancelVideoFrameCallback === 'function'
+        ) {
+          performanceVideoElement.cancelVideoFrameCallback(frameCallbackHandle);
+        }
+        videoElement.removeEventListener('loadeddata', markFirstFrameRendered);
+        videoElement.removeEventListener('canplay', markFirstFrameRendered);
+        videoElement.removeEventListener('playing', markFirstFrameRendered);
+        videoElement.removeEventListener('timeupdate', markFirstFrameRendered);
         videoElement.removeEventListener('error', onVideoError);
         videoElement.removeEventListener('waiting', onWaiting);
         videoElement.removeEventListener('stalled', onStalled);
@@ -288,10 +336,16 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
       return () => {
         cancelled = true;
         clearFirstDataWarning();
-        videoElement.removeEventListener('loadeddata', markFrameRendered);
-        videoElement.removeEventListener('canplay', markFrameRendered);
-        videoElement.removeEventListener('playing', markFrameRendered);
-        videoElement.removeEventListener('timeupdate', markFrameRendered);
+        if (
+          frameCallbackHandle !== null &&
+          typeof performanceVideoElement.cancelVideoFrameCallback === 'function'
+        ) {
+          performanceVideoElement.cancelVideoFrameCallback(frameCallbackHandle);
+        }
+        videoElement.removeEventListener('loadeddata', markFirstFrameRendered);
+        videoElement.removeEventListener('canplay', markFirstFrameRendered);
+        videoElement.removeEventListener('playing', markFirstFrameRendered);
+        videoElement.removeEventListener('timeupdate', markFirstFrameRendered);
         videoElement.removeEventListener('error', onVideoError);
         videoElement.removeEventListener('waiting', onWaiting);
         videoElement.removeEventListener('stalled', onStalled);
@@ -302,6 +356,87 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
     const websocket = new WebSocket(directStreamUrl);
     websocket.binaryType = 'arraybuffer';
     websocketRef.current = websocket;
+
+    const reportPerformance = () => {
+      if (cancelled || performanceReportInFlight) {
+        return;
+      }
+      const now = performance.now();
+      while (renderedFrameTimes[0] != null && now - renderedFrameTimes[0] > 1000) {
+        renderedFrameTimes.shift();
+      }
+
+      const quality = performanceVideoElement.getVideoPlaybackQuality?.();
+      const rawDroppedFrames = Math.max(
+        0,
+        Math.trunc(
+          quality?.droppedVideoFrames ?? performanceVideoElement.webkitDroppedFrameCount ?? 0
+        )
+      );
+      if (rawDroppedFrames < lastRawDecoderDroppedFrames) {
+        decoderDroppedFramesOffset += lastRawDecoderDroppedFrames;
+      }
+      lastRawDecoderDroppedFrames = rawDroppedFrames;
+      const decoderDroppedFramesTotal = decoderDroppedFramesOffset + rawDroppedFrames;
+
+      let renderedFps = renderedFrameTimes.length;
+      if (typeof performanceVideoElement.requestVideoFrameCallback !== 'function') {
+        const decodedFrames = Math.max(
+          0,
+          Math.trunc(
+            quality?.totalVideoFrames ?? performanceVideoElement.webkitDecodedFrameCount ?? 0
+          )
+        );
+        const presentedFrames = Math.max(0, decodedFrames - rawDroppedFrames);
+        if (presentedFrames < lastQualityPresentedFrames) {
+          qualityFrameSamples.length = 0;
+        }
+        if (presentedFrames > lastQualityPresentedFrames) {
+          lastRenderedFrameAt = now;
+          markFirstFrameRendered();
+        }
+        lastQualityPresentedFrames = presentedFrames;
+        qualityFrameSamples.push({ at: now, presentedFrames });
+        while (qualityFrameSamples[0] != null && now - qualityFrameSamples[0].at > 1000) {
+          qualityFrameSamples.shift();
+        }
+        const oldestSample = qualityFrameSamples[0];
+        if (oldestSample && now > oldestSample.at) {
+          renderedFps =
+            ((presentedFrames - oldestSample.presentedFrames) * 1000) /
+            (now - oldestSample.at);
+        }
+      }
+
+      const lastRenderedFrameAgeMs =
+        lastRenderedFrameAt == null ? null : Math.max(0, Math.round(now - lastRenderedFrameAt));
+      const stallActive = Boolean(
+        renderedDirectFrameRef.current &&
+          lastRenderedFrameAgeMs != null &&
+          lastRenderedFrameAgeMs >= VIDEO_STALL_AFTER_MS &&
+          document.visibilityState === 'visible' &&
+          websocket.readyState === WebSocket.OPEN
+      );
+
+      performanceReportInFlight = true;
+      void reportVideoPerformance({
+        rendered_fps_1s: Number(renderedFps.toFixed(2)),
+        decoder_dropped_frames_total: decoderDroppedFramesTotal,
+        last_rendered_frame_age_ms: lastRenderedFrameAgeMs,
+        stall_active: stallActive
+      })
+        .catch(() => {
+          // Runtime shutdown can race the final performance report.
+        })
+        .finally(() => {
+          performanceReportInFlight = false;
+        });
+    };
+
+    performanceReportTimer = window.setInterval(
+      reportPerformance,
+      VIDEO_PERFORMANCE_REPORT_INTERVAL_MS
+    );
 
     websocket.onopen = () => {
       updateDiagnostic({ message: 'Video bridge connected; waiting for aircraft frames', tone: 'info' });
@@ -366,14 +501,17 @@ export function LiveVideoPane({ video, dominant, onSwap }: LiveVideoPaneProps) {
       }
       if (
         frameCallbackHandle !== null &&
-        typeof videoWithFrameCallback.cancelVideoFrameCallback === 'function'
+        typeof performanceVideoElement.cancelVideoFrameCallback === 'function'
       ) {
-        videoWithFrameCallback.cancelVideoFrameCallback(frameCallbackHandle);
+        performanceVideoElement.cancelVideoFrameCallback(frameCallbackHandle);
       }
-      videoElement.removeEventListener('loadeddata', markFrameRendered);
-      videoElement.removeEventListener('canplay', markFrameRendered);
-      videoElement.removeEventListener('playing', markFrameRendered);
-      videoElement.removeEventListener('timeupdate', markFrameRendered);
+      if (performanceReportTimer !== null) {
+        window.clearInterval(performanceReportTimer);
+      }
+      videoElement.removeEventListener('loadeddata', markFirstFrameRendered);
+      videoElement.removeEventListener('canplay', markFirstFrameRendered);
+      videoElement.removeEventListener('playing', markFirstFrameRendered);
+      videoElement.removeEventListener('timeupdate', markFirstFrameRendered);
       videoElement.removeEventListener('error', onVideoError);
       videoElement.removeEventListener('waiting', onWaiting);
       videoElement.removeEventListener('stalled', onStalled);

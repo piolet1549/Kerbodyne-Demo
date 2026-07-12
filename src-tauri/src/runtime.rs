@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
     net::{Ipv4Addr, SocketAddrV4},
     path::{Path, PathBuf},
@@ -32,7 +32,8 @@ use crate::{
         MissionSession, OfflineRegionCatalog, OfflineRegionManifest, ReplayFrame,
         ReviewTelemetryFrame, RuntimeEvent, RuntimeMode, SessionVideoClip, SystemStatusPayload,
         SystemStatusRecord, TelemetryIngestDiagnostics, TelemetryPayload, TrackPointRecord,
-        VideoPreviewState, VideoPreviewStatus, WireEnvelope, DEFAULT_AIRCRAFT_ID, SCHEMA_VERSION,
+        VideoFrontendPerformance, VideoPreviewState, VideoPreviewStatus, WireEnvelope,
+        DEFAULT_AIRCRAFT_ID, SCHEMA_VERSION,
     },
     offline_maps,
     server::{
@@ -60,7 +61,14 @@ const VIDEO_PREVIEW_PATH: &str = "/live.mjpg";
 const APP_VIDEO_PREVIEW_FRAME_PATH: &str = "/__preview__/live.jpg";
 const DIRECT_VIDEO_WS_PATH: &str = "/live.h264";
 const DIRECT_VIDEO_CHANNEL_CAPACITY: usize = 12;
-const DIRECT_VIDEO_STATS_INTERVAL_MS: u64 = 750;
+const DIRECT_VIDEO_STATS_INTERVAL_MS: u64 = 250;
+const DIRECT_VIDEO_RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const RTP_REORDER_MAX_DELAY_MS: u64 = 12;
+const RTP_REORDER_MAX_PACKETS: usize = 32;
+const RTP_LOSS_REORDER_GRACE_MS: u64 = 500;
+const RTP_LOSS_WINDOW_SECS: u64 = 5;
+const VIDEO_RATE_WINDOW_MS: u64 = 1_000;
+const VIDEO_PERFORMANCE_REPORT_STALE_MS: u64 = 750;
 const VLC_HTTP_PROBE_INTERVAL_MS: u64 = 300;
 const VLC_HTTP_PROBE_TIMEOUT_MS: u64 = 2200;
 const VLC_SHUTDOWN_TIMEOUT_SECS: u64 = 8;
@@ -302,6 +310,23 @@ struct DirectVideoStats {
     packet_count: u64,
     access_unit_count: u64,
     waiting_for_keyframe: bool,
+    rtp_packets_lost_total: u64,
+    rtp_loss_percent_5s: f64,
+    rx_bitrate_mbps_1s: f64,
+    encoded_fps_1s: f64,
+    bridge_dropped_frames_total: u64,
+}
+
+struct DirectVideoReceiverStats {
+    packet_count: u64,
+    access_unit_count: u64,
+    last_packet_at: Option<DateTime<Utc>>,
+    last_packet_source: Option<String>,
+    waiting_for_keyframe: bool,
+    rtp_packets_lost_total: u64,
+    rtp_loss_percent_5s: f64,
+    rx_bitrate_mbps_1s: f64,
+    encoded_fps_1s: f64,
 }
 
 #[derive(Default)]
@@ -380,6 +405,8 @@ pub struct AppRuntime {
     review_frames: RwLock<Vec<ReviewTelemetryFrame>>,
     review_video_clips: RwLock<Vec<SessionVideoClip>>,
     video_preview: RwLock<VideoPreviewState>,
+    frontend_video_performance: RwLock<VideoFrontendPerformance>,
+    frontend_video_performance_reported_at: RwLock<Option<Instant>>,
     raw_telemetry_packets: RwLock<Vec<String>>,
     telemetry_ingest: StdMutex<TelemetryIngestDiagnostics>,
     failed_telemetry_writes: StdMutex<Vec<TelemetryWrite>>,
@@ -454,6 +481,8 @@ impl AppRuntime {
             review_frames: RwLock::new(Vec::new()),
             review_video_clips: RwLock::new(Vec::new()),
             video_preview: RwLock::new(VideoPreviewState::default()),
+            frontend_video_performance: RwLock::new(VideoFrontendPerformance::default()),
+            frontend_video_performance_reported_at: RwLock::new(None),
             raw_telemetry_packets: RwLock::new(Vec::new()),
             telemetry_ingest: StdMutex::new(TelemetryIngestDiagnostics::default()),
             failed_telemetry_writes: StdMutex::new(Vec::new()),
@@ -1941,17 +1970,15 @@ impl AppRuntime {
     async fn launch_direct_preview_bridge(&self, app: &AppHandle) -> Result<(), String> {
         self.stop_preview_process().await;
 
-        let udp_socket = UdpSocket::bind(("0.0.0.0", LIVE_VIDEO_RTP_PORT))
-            .await
-            .map_err(|error| {
-                let owner_note = detect_external_udp_port_owner(LIVE_VIDEO_RTP_PORT)
-                    .map(|pid| format!(" Port owner: {}.", describe_port_owner(Some(pid))))
-                    .unwrap_or_default();
-                format!(
-                    "Unable to bind live video RTP receiver on UDP {}: {error}{owner_note}",
-                    LIVE_VIDEO_RTP_PORT,
-                )
-            })?;
+        let udp_socket = create_live_video_udp_socket(LIVE_VIDEO_RTP_PORT).map_err(|error| {
+            let owner_note = detect_external_udp_port_owner(LIVE_VIDEO_RTP_PORT)
+                .map(|pid| format!(" Port owner: {}.", describe_port_owner(Some(pid))))
+                .unwrap_or_default();
+            format!(
+                "Unable to bind live video RTP receiver on UDP {}: {error}{owner_note}",
+                LIVE_VIDEO_RTP_PORT,
+            )
+        })?;
         let ws_listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|error| format!("Unable to bind live video bridge WebSocket: {error}"))?;
@@ -1965,6 +1992,7 @@ impl AppRuntime {
         let ingest_shutdown = direct_shutdown.subscribe();
         let ws_shutdown = direct_shutdown.subscribe();
         let runtime_for_ingest = app.state::<Arc<AppRuntime>>().inner().clone();
+        let runtime_for_ws = runtime_for_ingest.clone();
         let app_for_ingest = app.clone();
         let video_sender_for_ingest = video_sender.clone();
 
@@ -1979,7 +2007,8 @@ impl AppRuntime {
             .await;
         });
         let direct_ws_handle = tauri::async_runtime::spawn(async move {
-            serve_direct_video_websocket(ws_listener, video_sender, ws_shutdown).await;
+            serve_direct_video_websocket(runtime_for_ws, ws_listener, video_sender, ws_shutdown)
+                .await;
         });
 
         {
@@ -1994,6 +2023,8 @@ impl AppRuntime {
             };
         }
         *self.latest_preview_frame.write().await = None;
+        *self.frontend_video_performance.write().await = VideoFrontendPerformance::default();
+        *self.frontend_video_performance_reported_at.write().await = None;
         let _ = self.preview_frame_sender.send(None);
 
         let mut runtime = self.video_runtime.lock().await;
@@ -2147,6 +2178,8 @@ impl AppRuntime {
         self.stop_preview_process().await;
 
         *self.video_preview.write().await = VideoPreviewState::default();
+        *self.frontend_video_performance.write().await = VideoFrontendPerformance::default();
+        *self.frontend_video_performance_reported_at.write().await = None;
         *self.latest_preview_frame.write().await = None;
         let _ = self.preview_frame_sender.send(None);
         Ok(())
@@ -2227,11 +2260,6 @@ impl AppRuntime {
         let recording_active = {
             let mut runtime = self.video_runtime.lock().await;
             runtime.last_preview_frame_at = Some(Utc::now());
-            if runtime.direct_ingest_handle.is_some() {
-                runtime.direct_stats.access_unit_count =
-                    runtime.direct_stats.access_unit_count.saturating_add(1);
-                runtime.direct_stats.waiting_for_keyframe = false;
-            }
             runtime.recording.is_some()
         };
         {
@@ -2252,17 +2280,100 @@ impl AppRuntime {
         }
     }
 
-    async fn update_direct_video_stats(
-        &self,
-        packet_count: u64,
-        last_packet_source: Option<String>,
-        waiting_for_keyframe: bool,
-    ) {
+    async fn update_direct_video_stats(&self, stats: DirectVideoReceiverStats) {
         let mut runtime = self.video_runtime.lock().await;
-        runtime.direct_stats.packet_count = packet_count;
-        runtime.direct_stats.last_packet_at = Some(Utc::now());
-        runtime.direct_stats.last_packet_source = last_packet_source;
-        runtime.direct_stats.waiting_for_keyframe = waiting_for_keyframe;
+        runtime.direct_stats.packet_count = stats.packet_count;
+        runtime.direct_stats.access_unit_count = stats.access_unit_count;
+        runtime.direct_stats.last_packet_at = stats.last_packet_at;
+        runtime.direct_stats.last_packet_source = stats.last_packet_source;
+        runtime.direct_stats.waiting_for_keyframe = stats.waiting_for_keyframe;
+        runtime.direct_stats.rtp_packets_lost_total = stats.rtp_packets_lost_total;
+        runtime.direct_stats.rtp_loss_percent_5s = stats.rtp_loss_percent_5s;
+        runtime.direct_stats.rx_bitrate_mbps_1s = stats.rx_bitrate_mbps_1s;
+        runtime.direct_stats.encoded_fps_1s = stats.encoded_fps_1s;
+    }
+
+    async fn record_video_bridge_drop(&self, count: u64) {
+        let mut runtime = self.video_runtime.lock().await;
+        runtime.direct_stats.bridge_dropped_frames_total = runtime
+            .direct_stats
+            .bridge_dropped_frames_total
+            .saturating_add(count);
+    }
+
+    pub async fn report_video_performance(&self, mut performance: VideoFrontendPerformance) {
+        if self.current_session_id.read().await.is_none() {
+            return;
+        }
+        if !performance.rendered_fps_1s.is_finite() || performance.rendered_fps_1s < 0.0 {
+            performance.rendered_fps_1s = 0.0;
+        }
+        *self.frontend_video_performance.write().await = performance;
+        *self.frontend_video_performance_reported_at.write().await = Some(Instant::now());
+    }
+
+    async fn append_video_performance_extras(&self, extras: &mut HashMap<String, Value>) {
+        let status = self.video_preview.read().await.status.clone();
+        let direct_stats = self.video_runtime.lock().await.direct_stats.clone();
+        let mut frontend = self.frontend_video_performance.read().await.clone();
+        if let Some(reported_at) = *self.frontend_video_performance_reported_at.read().await {
+            let report_age_ms = reported_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            if let Some(frame_age_ms) = frontend.last_rendered_frame_age_ms.as_mut() {
+                *frame_age_ms = frame_age_ms.saturating_add(report_age_ms);
+            }
+            if report_age_ms > VIDEO_PERFORMANCE_REPORT_STALE_MS {
+                frontend.rendered_fps_1s = 0.0;
+                frontend.stall_active = frontend.last_rendered_frame_age_ms.is_some();
+            }
+        }
+
+        extras.insert(
+            "video_status".into(),
+            Value::String(video_preview_status_label(&status).into()),
+        );
+        extras.insert(
+            "video_waiting_for_keyframe".into(),
+            Value::Bool(direct_stats.waiting_for_keyframe),
+        );
+        extras.insert(
+            "video_rtp_packets_lost_total".into(),
+            json!(direct_stats.rtp_packets_lost_total),
+        );
+        extras.insert(
+            "video_rtp_loss_percent_5s".into(),
+            json!(direct_stats.rtp_loss_percent_5s),
+        );
+        extras.insert(
+            "video_rx_bitrate_mbps_1s".into(),
+            json!(direct_stats.rx_bitrate_mbps_1s),
+        );
+        extras.insert(
+            "video_encoded_fps_1s".into(),
+            json!(direct_stats.encoded_fps_1s),
+        );
+        extras.insert(
+            "video_bridge_dropped_frames_total".into(),
+            json!(direct_stats.bridge_dropped_frames_total),
+        );
+        extras.insert(
+            "video_rendered_fps_1s".into(),
+            json!(frontend.rendered_fps_1s),
+        );
+        extras.insert(
+            "video_decoder_dropped_frames_total".into(),
+            json!(frontend.decoder_dropped_frames_total),
+        );
+        extras.insert(
+            "video_last_rendered_frame_age_ms".into(),
+            frontend
+                .last_rendered_frame_age_ms
+                .map(|age| json!(age))
+                .unwrap_or(Value::Null),
+        );
+        extras.insert(
+            "video_stall_active".into(),
+            Value::Bool(frontend.stall_active),
+        );
     }
 
     async fn publish_preview_frame(&self, app: &AppHandle, frame: Vec<u8>) {
@@ -2386,13 +2497,16 @@ impl AppRuntime {
             }));
         }
 
+        let mut payload = state.to_payload(Some(packet_type));
+        self.append_video_performance_extras(&mut payload.extras)
+            .await;
         let envelope = WireEnvelope {
             schema_version: SCHEMA_VERSION.into(),
             message_id: format!("legacy-telemetry-{}", Uuid::new_v4()),
             aircraft_id: DEFAULT_AIRCRAFT_ID.into(),
             sent_at: received_at.to_rfc3339(),
             envelope_type: "telemetry".into(),
-            payload: state.to_payload(Some(packet_type)),
+            payload,
             extras: HashMap::new(),
         };
         let canonical_raw_json =
@@ -2577,12 +2691,16 @@ impl AppRuntime {
     async fn ingest_telemetry(
         &self,
         app: &AppHandle,
-        envelope: WireEnvelope<TelemetryPayload>,
-        canonical_raw_json: &str,
+        mut envelope: WireEnvelope<TelemetryPayload>,
+        _canonical_raw_json: &str,
         source: IngestSource,
     ) -> Result<(), String> {
+        self.append_video_performance_extras(&mut envelope.payload.extras)
+            .await;
+        let enriched_raw_json =
+            serde_json::to_string(&envelope).map_err(|error| error.to_string())?;
         let (persistence_write, _) = self
-            .apply_telemetry_state(&envelope, canonical_raw_json, source)
+            .apply_telemetry_state(&envelope, &enriched_raw_json, source)
             .await?;
         if let Some(write) = persistence_write {
             self.record_event(
@@ -3115,6 +3233,20 @@ fn create_legacy_udp_socket(port: u16) -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(socket)
 }
 
+fn create_live_video_udp_socket(port: u16) -> std::io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let _ = socket.set_recv_buffer_size(DIRECT_VIDEO_RECEIVE_BUFFER_BYTES);
+    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
+    if let Ok(buffer_size) = socket.recv_buffer_size() {
+        eprintln!(
+            "Kerbodyne video RTP listener bound on port {port} with {buffer_size} byte receive buffer"
+        );
+    }
+    socket.set_nonblocking(true)?;
+    let socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(socket)
+}
+
 fn legacy_packet_type_label(packet_type: LegacyTelemetryPacketType) -> &'static str {
     match packet_type {
         LegacyTelemetryPacketType::HighFrequency => "hf",
@@ -3196,6 +3328,18 @@ fn video_status_message(status: &VideoPreviewStatus) -> &'static str {
         VideoPreviewStatus::Recording => "Recording live video",
         VideoPreviewStatus::Stale => "Video stream stale",
         VideoPreviewStatus::Error => "Video unavailable",
+    }
+}
+
+fn video_preview_status_label(status: &VideoPreviewStatus) -> &'static str {
+    match status {
+        VideoPreviewStatus::Idle => "idle",
+        VideoPreviewStatus::WaitingForStream => "waiting_for_stream",
+        VideoPreviewStatus::WaitingForKeyframe => "waiting_for_keyframe",
+        VideoPreviewStatus::Live => "live",
+        VideoPreviewStatus::Recording => "recording",
+        VideoPreviewStatus::Stale => "stale",
+        VideoPreviewStatus::Error => "error",
     }
 }
 
@@ -3555,6 +3699,7 @@ async fn monitor_preview_stream(runtime: Arc<AppRuntime>, app: &AppHandle, previ
 }
 
 async fn serve_direct_video_websocket(
+    runtime: Arc<AppRuntime>,
     listener: TcpListener,
     video_sender: broadcast::Sender<Vec<u8>>,
     mut shutdown: broadcast::Receiver<()>,
@@ -3569,6 +3714,7 @@ async fn serve_direct_video_websocket(
         };
 
         let mut video_receiver = video_sender.subscribe();
+        let runtime = runtime.clone();
         tauri::async_runtime::spawn(async move {
             let websocket = match accept_async(stream).await {
                 Ok(socket) => socket,
@@ -3581,11 +3727,12 @@ async fn serve_direct_video_websocket(
                     frame = video_receiver.recv() => {
                         match frame {
                             Ok(frame) => {
-                                if writer.send(Message::Binary(frame.into())).await.is_err() {
+                                if writer.send(Message::Binary(frame)).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                runtime.record_video_bridge_drop(skipped).await;
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
@@ -3618,14 +3765,47 @@ async fn receive_direct_rtp_video(
 ) {
     let mut packet_buffer = vec![0_u8; 65_536];
     let mut depacketizer = RtpH264Depacketizer::default();
+    let mut reorder_buffer = RtpReorderBuffer::default();
+    let mut loss_tracker = RtpLossTracker::default();
+    let mut rate_tracker = VideoRateTracker::default();
     let mut packet_count = 0_u64;
-    let mut last_stats_update = Instant::now();
+    let mut access_unit_count = 0_u64;
+    let mut had_preview_activity = false;
+    let mut last_packet_at = None;
+    let mut last_packet_source = None;
+    let mut stats_interval =
+        tokio::time::interval(Duration::from_millis(DIRECT_VIDEO_STATS_INTERVAL_MS));
+    stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        let (size, source) = tokio::select! {
+        let receive_result = tokio::select! {
             _ = shutdown.recv() => break,
+            _ = stats_interval.tick() => {
+                let now = Instant::now();
+                let (rtp_packets_lost_total, rtp_loss_percent_5s) =
+                    loss_tracker.snapshot(now);
+                let (rx_bitrate_mbps_1s, encoded_fps_1s) = rate_tracker.snapshot(now);
+                runtime
+                    .update_direct_video_stats(DirectVideoReceiverStats {
+                        packet_count,
+                        access_unit_count,
+                        last_packet_at,
+                        last_packet_source: last_packet_source.clone(),
+                        waiting_for_keyframe: depacketizer.waiting_for_keyframe(),
+                        rtp_packets_lost_total,
+                        rtp_loss_percent_5s,
+                        rx_bitrate_mbps_1s,
+                        encoded_fps_1s,
+                    })
+                    .await;
+                if had_preview_activity {
+                    runtime.register_preview_activity(app).await;
+                    had_preview_activity = false;
+                }
+                continue;
+            }
             recv_result = socket.recv_from(&mut packet_buffer) => match recv_result {
-                Ok(parts) => parts,
+                Ok(parts) => Some(parts),
                 Err(error) => {
                     runtime
                         .push_warning(app, format!("Live video RTP receiver failed: {error}"))
@@ -3634,25 +3814,299 @@ async fn receive_direct_rtp_video(
                 }
             }
         };
+        let Some((size, source)) = receive_result else {
+            continue;
+        };
 
         packet_count = packet_count.saturating_add(1);
-        let packet_source = Some(source.to_string());
-        if packet_count == 1
-            || last_stats_update.elapsed() >= Duration::from_millis(DIRECT_VIDEO_STATS_INTERVAL_MS)
-        {
-            runtime
-                .update_direct_video_stats(
-                    packet_count,
-                    packet_source,
-                    depacketizer.waiting_for_keyframe(),
-                )
-                .await;
-            last_stats_update = Instant::now();
+        let received_at = Instant::now();
+        last_packet_at = Some(Utc::now());
+        last_packet_source = Some(source.to_string());
+        loss_tracker.observe_packet(&packet_buffer[..size], received_at);
+        rate_tracker.observe_packet(received_at, size);
+        for packet in reorder_buffer.push(packet_buffer[..size].to_vec(), received_at) {
+            let access_units = depacketizer.push_rtp_packet(&packet);
+            rate_tracker.observe_access_units(received_at, access_units.len());
+            access_unit_count = access_unit_count.saturating_add(access_units.len() as u64);
+            for access_unit in access_units {
+                let _ = video_sender.send(access_unit);
+                had_preview_activity = true;
+            }
+        }
+    }
+}
+
+struct BufferedRtpPacket {
+    received_at: Instant,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct RtpReorderBuffer {
+    ssrc: Option<u32>,
+    next_extended_sequence: Option<u64>,
+    max_extended_sequence: Option<u64>,
+    pending: BTreeMap<u64, BufferedRtpPacket>,
+}
+
+impl RtpReorderBuffer {
+    fn push(&mut self, packet: Vec<u8>, now: Instant) -> Vec<Vec<u8>> {
+        let Some((sequence, ssrc)) = rtp_sequence_and_ssrc(&packet) else {
+            return vec![packet];
+        };
+
+        if self.ssrc != Some(ssrc) {
+            self.reset(ssrc, sequence);
         }
 
-        for access_unit in depacketizer.push_rtp_packet(&packet_buffer[..size]) {
-            let _ = video_sender.send(access_unit);
-            runtime.register_preview_activity(app).await;
+        let max_sequence = self.max_extended_sequence.unwrap_or(sequence as u64);
+        let mut extended_sequence = extend_rtp_sequence(max_sequence, sequence);
+        let next_sequence = self.next_extended_sequence.unwrap_or(extended_sequence);
+        if extended_sequence > next_sequence.saturating_add(8_192) {
+            self.reset(ssrc, sequence);
+            extended_sequence = sequence as u64;
+        } else if extended_sequence < next_sequence {
+            return Vec::new();
+        }
+
+        self.max_extended_sequence = Some(
+            self.max_extended_sequence
+                .map(|current| current.max(extended_sequence))
+                .unwrap_or(extended_sequence),
+        );
+        self.next_extended_sequence.get_or_insert(extended_sequence);
+        self.pending
+            .entry(extended_sequence)
+            .or_insert(BufferedRtpPacket {
+                received_at: now,
+                bytes: packet,
+            });
+        self.drain_ready(now)
+    }
+
+    fn reset(&mut self, ssrc: u32, sequence: u16) {
+        self.ssrc = Some(ssrc);
+        self.next_extended_sequence = Some(sequence as u64);
+        self.max_extended_sequence = Some(sequence as u64);
+        self.pending.clear();
+    }
+
+    fn drain_ready(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        let mut output = Vec::new();
+        loop {
+            let Some(next_sequence) = self.next_extended_sequence else {
+                break;
+            };
+            if let Some(packet) = self.pending.remove(&next_sequence) {
+                output.push(packet.bytes);
+                self.next_extended_sequence = Some(next_sequence.saturating_add(1));
+                continue;
+            }
+
+            let waited_too_long = self
+                .pending
+                .values()
+                .map(|packet| now.duration_since(packet.received_at))
+                .max()
+                .map(|age| age >= Duration::from_millis(RTP_REORDER_MAX_DELAY_MS))
+                .unwrap_or(false);
+            if self.pending.len() >= RTP_REORDER_MAX_PACKETS || waited_too_long {
+                self.next_extended_sequence = self.pending.first_key_value().map(|(seq, _)| *seq);
+                continue;
+            }
+            break;
+        }
+        output
+    }
+}
+
+#[derive(Default)]
+struct RtpLossTracker {
+    ssrc: Option<u32>,
+    max_extended_sequence: Option<u64>,
+    pending_missing: BTreeMap<u64, Instant>,
+    received_window: VecDeque<Instant>,
+    loss_window: VecDeque<(Instant, u64)>,
+    lost_total: u64,
+    last_packet_at: Option<Instant>,
+}
+
+impl RtpLossTracker {
+    fn observe_packet(&mut self, packet: &[u8], now: Instant) {
+        let Some((sequence, ssrc)) = rtp_sequence_and_ssrc(packet) else {
+            return;
+        };
+        self.finalize_and_prune(now);
+
+        if self.ssrc != Some(ssrc) {
+            self.reset_sequence(ssrc, sequence, now);
+            return;
+        }
+
+        let Some(max_extended_sequence) = self.max_extended_sequence else {
+            self.reset_sequence(ssrc, sequence, now);
+            return;
+        };
+        let extended_sequence = extend_rtp_sequence(max_extended_sequence, sequence);
+        let stale_restart = self
+            .last_packet_at
+            .map(|last_packet_at| {
+                now.duration_since(last_packet_at)
+                    > Duration::from_secs(VIDEO_STALE_AFTER_SECS as u64)
+            })
+            .unwrap_or(false)
+            && extended_sequence.abs_diff(max_extended_sequence) > 1_024;
+        if stale_restart || extended_sequence > max_extended_sequence.saturating_add(8_192) {
+            self.reset_sequence(ssrc, sequence, now);
+            return;
+        }
+
+        self.last_packet_at = Some(now);
+        if extended_sequence > max_extended_sequence {
+            for missing in max_extended_sequence + 1..extended_sequence {
+                self.pending_missing.insert(missing, now);
+            }
+            self.max_extended_sequence = Some(extended_sequence);
+            self.received_window.push_back(now);
+        } else if self.pending_missing.remove(&extended_sequence).is_some() {
+            self.received_window.push_back(now);
+        }
+    }
+
+    fn reset_sequence(&mut self, ssrc: u32, sequence: u16, now: Instant) {
+        self.ssrc = Some(ssrc);
+        self.max_extended_sequence = Some(sequence as u64);
+        self.pending_missing.clear();
+        self.received_window.clear();
+        self.loss_window.clear();
+        self.last_packet_at = Some(now);
+        self.received_window.push_back(now);
+    }
+
+    fn snapshot(&mut self, now: Instant) -> (u64, f64) {
+        self.finalize_and_prune(now);
+        let lost_in_window = self
+            .loss_window
+            .iter()
+            .map(|(_, count)| *count)
+            .sum::<u64>();
+        let received_in_window = self.received_window.len() as u64;
+        let expected_in_window = received_in_window.saturating_add(lost_in_window);
+        let loss_percent = if expected_in_window == 0 {
+            0.0
+        } else {
+            lost_in_window as f64 * 100.0 / expected_in_window as f64
+        };
+        (self.lost_total, loss_percent)
+    }
+
+    fn finalize_and_prune(&mut self, now: Instant) {
+        let grace = Duration::from_millis(RTP_LOSS_REORDER_GRACE_MS);
+        let expired = self
+            .pending_missing
+            .iter()
+            .filter_map(|(sequence, first_missing_at)| {
+                (now.duration_since(*first_missing_at) >= grace).then_some(*sequence)
+            })
+            .collect::<Vec<_>>();
+        if !expired.is_empty() {
+            let count = expired.len() as u64;
+            for sequence in expired {
+                self.pending_missing.remove(&sequence);
+            }
+            self.lost_total = self.lost_total.saturating_add(count);
+            self.loss_window.push_back((now, count));
+        }
+
+        let rate_window = Duration::from_secs(RTP_LOSS_WINDOW_SECS);
+        while self
+            .received_window
+            .front()
+            .map(|received_at| now.duration_since(*received_at) > rate_window)
+            .unwrap_or(false)
+        {
+            self.received_window.pop_front();
+        }
+        while self
+            .loss_window
+            .front()
+            .map(|(lost_at, _)| now.duration_since(*lost_at) > rate_window)
+            .unwrap_or(false)
+        {
+            self.loss_window.pop_front();
+        }
+    }
+}
+
+fn rtp_sequence_and_ssrc(packet: &[u8]) -> Option<(u16, u32)> {
+    if packet.len() < 12 || packet[0] >> 6 != 2 {
+        return None;
+    }
+    Some((
+        u16::from_be_bytes([packet[2], packet[3]]),
+        u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]),
+    ))
+}
+
+fn extend_rtp_sequence(max_extended_sequence: u64, sequence: u16) -> u64 {
+    let cycle = max_extended_sequence & !0xffff;
+    let mut candidate = cycle | sequence as u64;
+    if candidate.saturating_add(32_768) < max_extended_sequence {
+        candidate = candidate.saturating_add(65_536);
+    } else if candidate > max_extended_sequence.saturating_add(32_768) && candidate >= 65_536 {
+        candidate -= 65_536;
+    }
+    candidate
+}
+
+#[derive(Default)]
+struct VideoRateTracker {
+    byte_window: VecDeque<(Instant, usize)>,
+    access_unit_window: VecDeque<Instant>,
+}
+
+impl VideoRateTracker {
+    fn observe_packet(&mut self, now: Instant, bytes: usize) {
+        self.byte_window.push_back((now, bytes));
+        self.prune(now);
+    }
+
+    fn observe_access_units(&mut self, now: Instant, count: usize) {
+        self.access_unit_window
+            .extend(std::iter::repeat_n(now, count));
+        self.prune(now);
+    }
+
+    fn snapshot(&mut self, now: Instant) -> (f64, f64) {
+        self.prune(now);
+        let bytes = self
+            .byte_window
+            .iter()
+            .map(|(_, bytes)| *bytes as u64)
+            .sum::<u64>();
+        (
+            bytes as f64 * 8.0 / 1_000_000.0,
+            self.access_unit_window.len() as f64,
+        )
+    }
+
+    fn prune(&mut self, now: Instant) {
+        let window = Duration::from_millis(VIDEO_RATE_WINDOW_MS);
+        while self
+            .byte_window
+            .front()
+            .map(|(received_at, _)| now.duration_since(*received_at) > window)
+            .unwrap_or(false)
+        {
+            self.byte_window.pop_front();
+        }
+        while self
+            .access_unit_window
+            .front()
+            .map(|produced_at| now.duration_since(*produced_at) > window)
+            .unwrap_or(false)
+        {
+            self.access_unit_window.pop_front();
         }
     }
 }
@@ -4166,6 +4620,149 @@ mod tests {
         let output = depacketizer.push_rtp_packet(&idr);
         assert_eq!(output.len(), 1);
         assert!(!depacketizer.waiting_for_keyframe());
+    }
+
+    #[test]
+    fn established_stream_waits_for_clean_keyframe_after_packet_loss() {
+        let mut depacketizer = RtpH264Depacketizer::default();
+        assert!(depacketizer
+            .push_rtp_packet(&rtp_packet(1, 100, false, &[0x67, 0x42, 0x00, 0x1f]))
+            .is_empty());
+        assert!(depacketizer
+            .push_rtp_packet(&rtp_packet(2, 100, false, &[0x68, 0xce, 0x06, 0xe2]))
+            .is_empty());
+        assert_eq!(
+            depacketizer
+                .push_rtp_packet(&rtp_packet(3, 100, true, &[0x65, 0x88, 0x84]))
+                .len(),
+            1
+        );
+
+        let damaged = depacketizer.push_rtp_packet(&rtp_packet(5, 200, true, &[0x41, 0x9a]));
+        assert!(damaged.is_empty());
+        assert!(depacketizer.waiting_for_keyframe());
+
+        assert!(depacketizer
+            .push_rtp_packet(&rtp_packet(6, 300, true, &[0x41, 0x9a]))
+            .is_empty());
+        let recovered = depacketizer.push_rtp_packet(&rtp_packet(7, 400, true, &[0x65, 0x88]));
+        assert_eq!(recovered.len(), 1);
+        assert!(!depacketizer.waiting_for_keyframe());
+    }
+
+    #[test]
+    fn rtp_reorder_buffer_restores_short_out_of_order_sequence() {
+        let start = Instant::now();
+        let mut reorder = RtpReorderBuffer::default();
+        assert_eq!(
+            reorder
+                .push(rtp_packet(10, 100, true, &[0x41]), start)
+                .len(),
+            1
+        );
+        assert!(reorder
+            .push(
+                rtp_packet(12, 300, true, &[0x41]),
+                start + Duration::from_millis(1)
+            )
+            .is_empty());
+        let restored = reorder.push(
+            rtp_packet(11, 200, true, &[0x41]),
+            start + Duration::from_millis(2),
+        );
+        let sequences = restored
+            .iter()
+            .filter_map(|packet| rtp_sequence_and_ssrc(packet).map(|(sequence, _)| sequence))
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![11, 12]);
+    }
+
+    #[test]
+    fn rtp_reorder_buffer_releases_after_bounded_delay() {
+        let start = Instant::now();
+        let mut reorder = RtpReorderBuffer::default();
+        assert_eq!(
+            reorder
+                .push(rtp_packet(20, 100, true, &[0x41]), start)
+                .len(),
+            1
+        );
+        assert!(reorder
+            .push(
+                rtp_packet(22, 300, true, &[0x41]),
+                start + Duration::from_millis(1)
+            )
+            .is_empty());
+        let released = reorder.push(
+            rtp_packet(23, 400, true, &[0x41]),
+            start + Duration::from_millis(RTP_REORDER_MAX_DELAY_MS + 1),
+        );
+        let sequences = released
+            .iter()
+            .filter_map(|packet| rtp_sequence_and_ssrc(packet).map(|(sequence, _)| sequence))
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![22, 23]);
+    }
+
+    #[test]
+    fn rtp_loss_tracker_allows_reordering_before_finalizing_loss() {
+        let start = Instant::now();
+        let mut tracker = RtpLossTracker::default();
+        tracker.observe_packet(&rtp_packet(1, 100, true, &[0x41]), start);
+        tracker.observe_packet(
+            &rtp_packet(4, 400, true, &[0x41]),
+            start + Duration::from_millis(10),
+        );
+        tracker.observe_packet(
+            &rtp_packet(2, 200, true, &[0x41]),
+            start + Duration::from_millis(100),
+        );
+
+        let (lost_before_grace, _) = tracker.snapshot(start + Duration::from_millis(400));
+        assert_eq!(lost_before_grace, 0);
+        let (lost_after_grace, loss_percent) = tracker.snapshot(start + Duration::from_millis(600));
+        assert_eq!(lost_after_grace, 1);
+        assert!((loss_percent - 25.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn rtp_loss_tracker_does_not_count_reordered_or_wrapped_packets() {
+        let start = Instant::now();
+        let mut reordered = RtpLossTracker::default();
+        reordered.observe_packet(&rtp_packet(10, 100, true, &[0x41]), start);
+        reordered.observe_packet(
+            &rtp_packet(12, 300, true, &[0x41]),
+            start + Duration::from_millis(10),
+        );
+        reordered.observe_packet(
+            &rtp_packet(11, 200, true, &[0x41]),
+            start + Duration::from_millis(20),
+        );
+        assert_eq!(reordered.snapshot(start + Duration::from_millis(600)).0, 0);
+
+        let mut wrapped = RtpLossTracker::default();
+        for (index, sequence) in [65_534, 65_535, 0, 1].into_iter().enumerate() {
+            wrapped.observe_packet(
+                &rtp_packet(sequence, index as u32 * 100, true, &[0x41]),
+                start + Duration::from_millis(index as u64 * 10),
+            );
+        }
+        assert_eq!(wrapped.snapshot(start + Duration::from_millis(600)).0, 0);
+    }
+
+    #[test]
+    fn video_rate_tracker_reports_rolling_bitrate_and_encoded_fps() {
+        let start = Instant::now();
+        let mut tracker = VideoRateTracker::default();
+        tracker.observe_packet(start, 125_000);
+        tracker.observe_access_units(start, 60);
+        let (bitrate, fps) = tracker.snapshot(start);
+        assert!((bitrate - 1.0).abs() < 0.001);
+        assert_eq!(fps, 60.0);
+
+        let (expired_bitrate, expired_fps) = tracker.snapshot(start + Duration::from_millis(1_001));
+        assert_eq!(expired_bitrate, 0.0);
+        assert_eq!(expired_fps, 0.0);
     }
 }
 

@@ -206,6 +206,13 @@ export interface VideoPreviewState {
   message?: string | null;
 }
 
+export interface VideoFrontendPerformance {
+  rendered_fps_1s: number;
+  decoder_dropped_frames_total: number;
+  last_rendered_frame_age_ms?: number | null;
+  stall_active: boolean;
+}
+
 export interface ConnectionHealth {
   status: ConnectionStatus;
   port: number;
