@@ -50,9 +50,9 @@ const MAX_SESSION_HISTORY: usize = 200;
 const MAX_RAW_TELEMETRY_PACKETS: usize = 160;
 const MAX_FAILED_TELEMETRY_WRITES: usize = 8_192;
 const LIVE_VIDEO_RTP_PORT: u16 = 5600;
-const AIRSIDE_VISION_COMMAND_HOST: &str = "192.168.1.11";
-const AIRSIDE_VISION_COMMAND_PORT: u16 = 45105;
-const AIRSIDE_VISION_COMMAND_TIMEOUT_SECS: u64 = 5;
+const AIRSIDE_COMMAND_HOST: &str = "192.168.1.11";
+const AIRSIDE_COMMAND_PORT: u16 = 45105;
+const AIRSIDE_COMMAND_TIMEOUT_SECS: u64 = 5;
 const VIDEO_STALE_AFTER_SECS: i64 = 3;
 const COMPAT_HF_STALE_SECS: i64 = 2;
 const COMPAT_MF_STALE_SECS: i64 = 4;
@@ -1329,67 +1329,68 @@ impl AppRuntime {
         } else {
             "stop_vision"
         };
+        self.send_airside_command(command, "vision").await
+    }
+
+    pub async fn set_airside_recording_enabled(&self, enabled: bool) -> Result<String, String> {
+        let command = if enabled {
+            "start_recording"
+        } else {
+            "stop_recording"
+        };
+        self.send_airside_command(command, "recording").await
+    }
+
+    async fn send_airside_command(&self, command: &str, subsystem: &str) -> Result<String, String> {
         let payload = serde_json::to_vec(&json!({ "command": command }))
             .map_err(|error| error.to_string())?;
-        let address = (AIRSIDE_VISION_COMMAND_HOST, AIRSIDE_VISION_COMMAND_PORT);
+        let address = (AIRSIDE_COMMAND_HOST, AIRSIDE_COMMAND_PORT);
         let mut stream = timeout(
-            Duration::from_secs(AIRSIDE_VISION_COMMAND_TIMEOUT_SECS),
+            Duration::from_secs(AIRSIDE_COMMAND_TIMEOUT_SECS),
             TcpStream::connect(address),
         )
         .await
         .map_err(|_| {
             format!(
-                "Timed out connecting to vision command listener at {}:{}.",
-                AIRSIDE_VISION_COMMAND_HOST, AIRSIDE_VISION_COMMAND_PORT
+                "Timed out connecting to airside command listener at {}:{}.",
+                AIRSIDE_COMMAND_HOST, AIRSIDE_COMMAND_PORT
             )
         })?
         .map_err(|error| {
             format!(
-                "Unable to connect to vision command listener at {}:{}: {error}",
-                AIRSIDE_VISION_COMMAND_HOST, AIRSIDE_VISION_COMMAND_PORT
+                "Unable to connect to airside command listener at {}:{}: {error}",
+                AIRSIDE_COMMAND_HOST, AIRSIDE_COMMAND_PORT
             )
         })?;
 
         timeout(
-            Duration::from_secs(AIRSIDE_VISION_COMMAND_TIMEOUT_SECS),
+            Duration::from_secs(AIRSIDE_COMMAND_TIMEOUT_SECS),
             stream.write_all(&payload),
         )
         .await
-        .map_err(|_| "Timed out sending vision command.".to_string())?
-        .map_err(|error| format!("Unable to send vision command: {error}"))?;
+        .map_err(|_| format!("Timed out sending {subsystem} command."))?
+        .map_err(|error| format!("Unable to send {subsystem} command: {error}"))?;
 
-        let mut response = vec![0_u8; 1024];
+        let mut response = Vec::with_capacity(256);
         let bytes_read = timeout(
-            Duration::from_secs(AIRSIDE_VISION_COMMAND_TIMEOUT_SECS),
-            stream.read(&mut response),
+            Duration::from_secs(AIRSIDE_COMMAND_TIMEOUT_SECS),
+            (&mut stream).take(4_097).read_to_end(&mut response),
         )
         .await
-        .map_err(|_| "Timed out waiting for vision command response.".to_string())?
-        .map_err(|error| format!("Unable to read vision command response: {error}"))?;
+        .map_err(|_| format!("Timed out waiting for {subsystem} command response."))?
+        .map_err(|error| format!("Unable to read {subsystem} command response: {error}"))?;
 
         if bytes_read == 0 {
-            return Ok("Vision command sent.".into());
+            return Err(format!(
+                "Airside command listener closed without acknowledging the {subsystem} command."
+            ));
+        }
+        if response.len() > 4_096 {
+            return Err("Airside command response exceeded the 4096-byte limit.".into());
         }
 
-        let response_text = String::from_utf8(response[..bytes_read].to_vec())
-            .map_err(|error| error.to_string())?;
-        let value: Value = serde_json::from_str(&response_text)
-            .map_err(|error| format!("Vision command listener returned invalid JSON: {error}"))?;
-        let status = value
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let message = value
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("Vision command acknowledged.")
-            .to_string();
-
-        if status.eq_ignore_ascii_case("error") {
-            Err(message)
-        } else {
-            Ok(message)
-        }
+        let response_text = String::from_utf8(response).map_err(|error| error.to_string())?;
+        parse_airside_command_response(&response_text, subsystem)
     }
 
     pub async fn complete_active_stream(
@@ -4764,6 +4765,46 @@ mod tests {
         assert_eq!(expired_bitrate, 0.0);
         assert_eq!(expired_fps, 0.0);
     }
+
+    #[test]
+    fn airside_command_response_accepts_success_and_idempotent_ignored_states() {
+        assert_eq!(
+            parse_airside_command_response(
+                r#"{"status":"success","message":"Recording started."}"#,
+                "recording"
+            )
+            .unwrap(),
+            "Recording started."
+        );
+        assert_eq!(
+            parse_airside_command_response(
+                r#"{"status":"ignored","message":"Already recording."}"#,
+                "recording"
+            )
+            .unwrap(),
+            "Already recording."
+        );
+    }
+
+    #[test]
+    fn airside_command_response_rejects_errors_and_malformed_acknowledgements() {
+        assert_eq!(
+            parse_airside_command_response(
+                r#"{"status":"error","message":"Unable to start recorder."}"#,
+                "recording"
+            )
+            .unwrap_err(),
+            "Unable to start recorder."
+        );
+        assert!(
+            parse_airside_command_response(r#"{"message":"missing status"}"#, "vision")
+                .unwrap_err()
+                .contains("did not include a status")
+        );
+        assert!(parse_airside_command_response("not json", "vision")
+            .unwrap_err()
+            .contains("invalid JSON"));
+    }
 }
 
 fn normalize_class_label(label: &str) -> String {
@@ -4819,6 +4860,28 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, String> {
     }
 
     Err(format!("unrecognized timestamp format: {value}"))
+}
+
+fn parse_airside_command_response(response: &str, subsystem: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(response)
+        .map_err(|error| format!("Airside command listener returned invalid JSON: {error}"))?;
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Airside command response did not include a status.".to_string())?;
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Airside command acknowledged.")
+        .to_string();
+
+    match status.trim().to_ascii_lowercase().as_str() {
+        "success" | "ignored" => Ok(message),
+        "error" => Err(message),
+        _ => Err(format!(
+            "Airside command listener returned an unexpected {subsystem} status `{status}`: {message}"
+        )),
+    }
 }
 
 fn normalize_timestamp(value: &str) -> String {

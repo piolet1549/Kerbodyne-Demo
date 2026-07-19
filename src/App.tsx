@@ -18,6 +18,7 @@ import {
   listOfflineRegions,
   listenToRuntimeEvents,
   selectOfflineRegion,
+  setAirsideRecordingEnabled,
   startLiveIngest,
   setVisionPipelineEnabled,
   updateSessionDetails,
@@ -39,6 +40,7 @@ import type {
 type OverlayPanel = 'flights' | 'settings' | null;
 type FlightNotificationSeverity = 'info' | 'caution' | 'warning';
 type VisionCommandState = 'idle' | 'starting' | 'stopping';
+type AirsideRecordingCommandState = 'idle' | 'starting' | 'stopping';
 type ExportChoice = 'telemetry' | 'detections' | 'both';
 
 interface FlightNotificationRecord {
@@ -704,6 +706,10 @@ export function App() {
   const [visionCommandState, setVisionCommandState] = useState<VisionCommandState>('idle');
   const [visionStartupConfirmed, setVisionStartupConfirmed] = useState(false);
   const [visionStopAcknowledged, setVisionStopAcknowledged] = useState(false);
+  // The finalized airside protocol reports command acknowledgements but has no status query.
+  const [airsideRecordingCommandState, setAirsideRecordingCommandState] =
+    useState<AirsideRecordingCommandState>('idle');
+  const [airsideRecordingActive, setAirsideRecordingActive] = useState(false);
   const [efficiencyMetric, setEfficiencyMetric] = useState<EfficiencyMetric>({
     liveWhPerKm: null,
     averageWhPerKm: null
@@ -1779,6 +1785,51 @@ export function App() {
         onToggle: handleVisionToggle
       }
     : null;
+  const airsideRecordingLinkAvailable =
+    activeFlight && flightHasReceivedConnection && snapshot.connection.status !== 'stale';
+  const airsideRecordingBusy = airsideRecordingCommandState !== 'idle';
+  const airsideRecordingLabel = !airsideRecordingLinkAvailable
+    ? 'RECORDING N/A'
+    : airsideRecordingCommandState === 'starting'
+      ? 'STARTING'
+      : airsideRecordingCommandState === 'stopping'
+        ? 'STOPPING'
+        : airsideRecordingActive
+          ? 'STOP RECORDING'
+          : 'START RECORDING';
+  const airsideRecordingTitle = !airsideRecordingLinkAvailable
+    ? 'Airside recording is unavailable until live telemetry resumes'
+    : airsideRecordingCommandState === 'starting'
+      ? 'Starting airside recording'
+      : airsideRecordingCommandState === 'stopping'
+        ? 'Stopping airside recording'
+        : airsideRecordingActive
+          ? 'Stop airside recording'
+          : 'Start airside recording';
+
+  useEffect(() => {
+    if (!activeFlight) {
+      setAirsideRecordingCommandState('idle');
+    }
+  }, [activeFlight]);
+
+  function handleAirsideRecordingToggle() {
+    if (!airsideRecordingLinkAvailable || airsideRecordingBusy) {
+      return;
+    }
+
+    const enable = !airsideRecordingActive;
+    setAirsideRecordingCommandState(enable ? 'starting' : 'stopping');
+    void runCommand(async () => {
+      try {
+        await setAirsideRecordingEnabled(enable);
+        setAirsideRecordingActive(enable);
+      } finally {
+        setAirsideRecordingCommandState('idle');
+      }
+    });
+  }
+
   const telemetryMetricStates = useMemo(() => {
     const safeColor = '#f4f4f4';
     const cautionColor = '#ffb347';
@@ -2399,6 +2450,25 @@ export function App() {
           </div>
 
           <div className="map-toolbar__group">
+            {activeFlight ? (
+              <button
+                className={`airside-recording-button ${
+                  airsideRecordingActive ? 'airside-recording-button--active' : ''
+                } ${airsideRecordingBusy ? 'airside-recording-button--busy' : ''} ${
+                  !airsideRecordingLinkAvailable ? 'airside-recording-button--unavailable' : ''
+                }`}
+                type="button"
+                title={airsideRecordingTitle}
+                aria-label={airsideRecordingLabel}
+                aria-pressed={airsideRecordingActive}
+                disabled={!airsideRecordingLinkAvailable || airsideRecordingBusy}
+                onClick={handleAirsideRecordingToggle}
+              >
+                <span className="airside-recording-button__ring" aria-hidden="true">
+                  <span className="airside-recording-button__core" />
+                </span>
+              </button>
+            ) : null}
             {!toolbarVideoMode ? (
               <div className="map-mode-toggle" role="tablist" aria-label="Basemap mode">
                 <button

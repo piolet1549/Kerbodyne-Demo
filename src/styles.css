@@ -160,6 +160,83 @@ button {
   font-weight: 700;
 }
 
+.airside-recording-button {
+  width: 46px;
+  min-width: 46px;
+  height: 46px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #6d6d6d;
+  border-radius: 50%;
+  background: rgba(6, 6, 6, 0.94);
+  cursor: pointer;
+  transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+
+.airside-recording-button:not(:disabled):hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.72);
+}
+
+.airside-recording-button:disabled {
+  cursor: not-allowed;
+}
+
+.airside-recording-button__ring {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid rgba(255, 255, 255, 0.88);
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+
+.airside-recording-button__core {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #ff4d4d;
+  box-shadow: 0 0 10px rgba(255, 77, 77, 0.28);
+  transition: width 160ms ease, height 160ms ease, border-radius 160ms ease, background 160ms ease;
+}
+
+.airside-recording-button--active .airside-recording-button__core {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+}
+
+.airside-recording-button--busy .airside-recording-button__ring {
+  animation: airside-recording-button-pulse 760ms ease-in-out infinite alternate;
+}
+
+.airside-recording-button--unavailable {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(104, 104, 104, 0.22);
+}
+
+.airside-recording-button--unavailable .airside-recording-button__ring {
+  border-color: rgba(190, 190, 190, 0.42);
+}
+
+.airside-recording-button--unavailable .airside-recording-button__core {
+  background: #777;
+  box-shadow: none;
+}
+
+@keyframes airside-recording-button-pulse {
+  from {
+    opacity: 0.48;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .toolbar-measure-slot {
   position: relative;
   display: flex;

@@ -81,6 +81,10 @@ export async function setVisionPipelineEnabled(enabled: boolean): Promise<string
   return invoke<string>('set_vision_pipeline_enabled', { enabled });
 }
 
+export async function setAirsideRecordingEnabled(enabled: boolean): Promise<string> {
+  return invoke<string>('set_airside_recording_enabled', { enabled });
+}
+
 export async function reportVideoPerformance(
   performance: VideoFrontendPerformance
 ): Promise<void> {

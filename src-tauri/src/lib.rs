@@ -146,6 +146,14 @@ async fn set_vision_pipeline_enabled(
 }
 
 #[tauri::command]
+async fn set_airside_recording_enabled(
+    state: State<'_, Arc<AppRuntime>>,
+    enabled: bool,
+) -> Result<String, String> {
+    state.set_airside_recording_enabled(enabled).await
+}
+
+#[tauri::command]
 async fn report_video_performance(
     state: State<'_, Arc<AppRuntime>>,
     performance: VideoFrontendPerformance,
@@ -257,6 +265,7 @@ pub fn run() {
             export_session_telemetry,
             export_session_detections,
             set_vision_pipeline_enabled,
+            set_airside_recording_enabled,
             report_video_performance
         ])
         .build(tauri::generate_context!())
