@@ -4,6 +4,7 @@ import { FlightSavesPanel } from './components/FlightSavesPanel';
 import { LiveMap } from './components/LiveMap';
 import { LiveVideoPane } from './components/LiveVideoPane';
 import { ReplayTimeline } from './components/ReplayTimeline';
+import { RawTelemetryPage } from './components/RawTelemetryPage';
 import { ReviewVideoModal } from './components/ReviewVideoModal';
 import { SettingsDrawer } from './components/SettingsPanel';
 import { TelemetryHud } from './components/TelemetryHud';
@@ -656,7 +657,6 @@ function buildMetricState(
 
 export function App() {
   const measureToolbarHostRef = useRef<HTMLDivElement | null>(null);
-  const rawTelemetryLogRef = useRef<HTMLDivElement | null>(null);
   const regionMenuRef = useRef<HTMLDivElement | null>(null);
   const notificationTimersRef = useRef<Record<string, number>>({});
   const seenSystemStatusIdsRef = useRef<Set<string>>(new Set());
@@ -1268,9 +1268,10 @@ export function App() {
   }, [reviewFrames.length, snapshot.active_session_id, snapshot.focused_session_id]);
 
   const activeFlight = Boolean(snapshot.active_session_id);
+  const rawDataMode = activeFlight && rawTelemetryOpen;
   const hasFlightContext = activeFlight || reviewMode;
   const flightLabel = activeSession?.name ?? focusedSession?.name ?? 'Ready';
-  const showTelemetryHud = activeFlight || reviewMode;
+  const showTelemetryHud = (activeFlight || reviewMode) && !rawDataMode;
   const panelOpen = activePanel === 'flights';
   const hasDetections = hasFlightContext && deferredAlerts.length > 0;
   const activeFlightHasDetections = activeFlight && deferredAlerts.length > 0;
@@ -1323,9 +1324,8 @@ export function App() {
   const flightHasReceivedConnection = Boolean(snapshot.connection.last_packet_at);
   const flightHasArmedTelemetry = snapshot.active_session_has_armed_telemetry;
   const videoDominant = activeFlight && activeFlightLayout === 'video-dominant';
-  const mapIsCornerPane = activeFlight && videoDominant;
-  const videoIsCornerPane = activeFlight && !videoDominant;
-  const toolbarVideoMode = activeFlight && videoDominant;
+  const mapIsCornerPane = activeFlight && videoDominant && !rawDataMode;
+  const toolbarVideoMode = activeFlight && (videoDominant || rawDataMode);
   const videoPreview = snapshot.video_preview;
 
   useEffect(() => {
@@ -1378,17 +1378,6 @@ export function App() {
       setExpandedHudOpen(false);
     }
   }, [activeFlight]);
-
-  useEffect(() => {
-    if (!rawTelemetryOpen) {
-      return;
-    }
-    const terminal = rawTelemetryLogRef.current;
-    if (!terminal) {
-      return;
-    }
-    terminal.scrollTop = terminal.scrollHeight;
-  }, [rawTelemetryOpen, snapshot.raw_telemetry_packets]);
 
   useEffect(() => {
     if (!activeFlight) {
@@ -2178,15 +2167,6 @@ export function App() {
     });
   }
 
-  function swapFlightSurfaces() {
-    if (!activeFlight) {
-      return;
-    }
-    setActiveFlightLayout((current) =>
-      current === 'video-dominant' ? 'map-dominant' : 'video-dominant'
-    );
-  }
-
   function openExportPrompt(sessionId: string) {
     const session = snapshot.sessions.find((entry) => entry.id === sessionId);
     setExportFlightTarget({
@@ -2194,6 +2174,14 @@ export function App() {
       name: session?.name ?? 'Saved flight',
       alertCount: session?.alert_count ?? 0
     });
+  }
+
+  function openFlightSurface(layout: 'video-dominant' | 'map-dominant') {
+    if (!activeFlight) {
+      return;
+    }
+    setRawTelemetryOpen(false);
+    setActiveFlightLayout(layout);
   }
 
   async function handleExportSession(sessionId: string, choice: ExportChoice) {
@@ -2274,33 +2262,47 @@ export function App() {
         <div
           className={`flight-surface-layout ${
             activeFlight
-              ? videoDominant
-                ? 'flight-surface-layout--video-dominant'
-                : 'flight-surface-layout--map-dominant'
+              ? rawDataMode
+                ? 'flight-surface-layout--raw-data'
+                : videoDominant
+                  ? 'flight-surface-layout--video-dominant'
+                  : 'flight-surface-layout--map-dominant'
               : 'flight-surface-layout--idle'
           }`}
         >
+          {rawDataMode ? (
+            <RawTelemetryPage
+              liveState={snapshot.live_state}
+              connection={snapshot.connection}
+              rawPackets={snapshot.raw_telemetry_packets}
+              onExit={() => setRawTelemetryOpen(false)}
+            />
+          ) : null}
           <div
             className={`flight-surface flight-surface--video ${
               activeFlight
-                ? videoDominant
-                  ? 'flight-surface--dominant'
-                  : 'flight-surface--corner'
+                ? rawDataMode
+                  ? 'flight-surface--dominant flight-surface--background-hidden'
+                  : videoDominant
+                    ? 'flight-surface--dominant'
+                    : 'flight-surface--corner flight-surface--corner-right'
                 : 'flight-surface--hidden'
             }`}
           >
             <LiveVideoPane
               video={videoPreview}
-              dominant={videoDominant}
-              onSwap={swapFlightSurfaces}
+              dominant={rawDataMode || videoDominant}
+              onSwap={() => openFlightSurface('video-dominant')}
             />
           </div>
           <div
             className={`flight-surface flight-surface--map ${
               activeFlight
-                ? videoDominant
-                  ? 'flight-surface--corner'
-                  : 'flight-surface--dominant'
+                ? rawDataMode
+                  ? 'flight-surface--dominant flight-surface--background-hidden'
+                  : videoDominant
+                    ? 'flight-surface--corner flight-surface--corner-right'
+                    : 'flight-surface--dominant'
                 : 'flight-surface--dominant'
             }`}
           >
@@ -2309,7 +2311,7 @@ export function App() {
               <button
                 type="button"
                 className="flight-surface__swap-hitbox"
-                onClick={swapFlightSurfaces}
+                onClick={() => openFlightSurface('map-dominant')}
                 aria-label="Show map in main view"
               />
             ) : null}
@@ -2881,48 +2883,6 @@ export function App() {
               >
                 Cancel
               </button>
-            </div>
-          </section>
-        </>
-      ) : null}
-
-      {activeFlight && rawTelemetryOpen ? (
-        <>
-          <button
-            className="modal-backdrop"
-            onClick={() => setRawTelemetryOpen(false)}
-            aria-label="Close raw telemetry panel"
-          />
-          <section className="modal-card raw-data-modal">
-            <div className="modal-card__header">
-              <div>
-                <span className="section-title">Raw telemetry</span>
-                <strong>Live ingest feed</strong>
-              </div>
-              <button
-                className="secondary-button secondary-button--muted"
-                onClick={() => setRawTelemetryOpen(false)}
-              >
-                Close
-              </button>
-            </div>
-
-            <div
-              ref={rawTelemetryLogRef}
-              className="raw-data-terminal"
-              role="log"
-              aria-live="polite"
-              aria-label="Raw telemetry packets"
-            >
-              {snapshot.raw_telemetry_packets.length > 0 ? (
-                snapshot.raw_telemetry_packets.map((packet, index) => (
-                  <pre key={`${index}-${packet.slice(0, 32)}`} className="raw-data-terminal__line">
-                    {packet}
-                  </pre>
-                ))
-              ) : (
-                <div className="raw-data-terminal__empty">Waiting for telemetry packets...</div>
-              )}
             </div>
           </section>
         </>
