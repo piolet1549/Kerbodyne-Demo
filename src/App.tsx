@@ -1,4 +1,12 @@
-import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  startTransition,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react';
 import { AlertDetail } from './components/AlertDetail';
 import { FlightSavesPanel } from './components/FlightSavesPanel';
 import { LiveMap } from './components/LiveMap';
@@ -2176,13 +2184,24 @@ export function App() {
     });
   }
 
-  function openFlightSurface(layout: 'video-dominant' | 'map-dominant') {
-    if (!activeFlight) {
-      return;
-    }
-    setRawTelemetryOpen(false);
-    setActiveFlightLayout(layout);
-  }
+  const openFlightSurface = useCallback(
+    (layout: 'video-dominant' | 'map-dominant') => {
+      if (!activeFlight) {
+        return;
+      }
+      setRawTelemetryOpen(false);
+      setActiveFlightLayout(layout);
+    },
+    [activeFlight]
+  );
+  const openVideoFlightSurface = useCallback(
+    () => openFlightSurface('video-dominant'),
+    [openFlightSurface]
+  );
+  const openMapFlightSurface = useCallback(
+    () => openFlightSurface('map-dominant'),
+    [openFlightSurface]
+  );
 
   async function handleExportSession(sessionId: string, choice: ExportChoice) {
     const savedPaths: string[] = [];
@@ -2292,7 +2311,8 @@ export function App() {
             <LiveVideoPane
               video={videoPreview}
               dominant={rawDataMode || videoDominant}
-              onSwap={() => openFlightSurface('video-dominant')}
+              visible={activeFlight && !rawDataMode}
+              onSwap={openVideoFlightSurface}
             />
           </div>
           <div
@@ -2311,7 +2331,7 @@ export function App() {
               <button
                 type="button"
                 className="flight-surface__swap-hitbox"
-                onClick={() => openFlightSurface('map-dominant')}
+                onClick={openMapFlightSurface}
                 aria-label="Show map in main view"
               />
             ) : null}
