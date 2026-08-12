@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import JMuxer from 'jmuxer';
+import { pruneMuxerBuffer, recordMuxerKeyframe } from '../lib/live-video-buffer';
 import { reportVideoPerformance } from '../lib/runtime';
 import type { VideoPreviewState } from '../lib/types';
 
@@ -45,6 +46,9 @@ const VIDEO_DEGRADED_FPS_FLOOR = 40;
 const VIDEO_DEGRADED_FPS_RATIO = 0.55;
 const VIDEO_DEGRADED_REFRESH_AFTER_MS = 8000;
 const VIDEO_DECODER_REFRESH_COOLDOWN_MS = 60_000;
+const VIDEO_MSE_MAINTENANCE_INTERVAL_MS = 5000;
+const VIDEO_MSE_RETAIN_SECONDS = 15;
+const VIDEO_HEALTHY_INGRESS_FPS = 50;
 
 interface PendingAccessUnit {
   data: Uint8Array;
@@ -80,12 +84,15 @@ export const LiveVideoPane = memo(function LiveVideoPane({
   const [decoderDiagnostic, setDecoderDiagnostic] = useState<DecoderDiagnostic | null>(null);
   const [hasRenderedDirectFrame, setHasRenderedDirectFrame] = useState(false);
   const [decoderRecoveryFrame, setDecoderRecoveryFrame] = useState<string | null>(null);
+  const [decoderGeneration, setDecoderGeneration] = useState(0);
   const displayUrlRef = useRef<string | null>(null);
   const videoElementRef = useRef<HTMLVideoElement | null>(null);
   const jmuxerRef = useRef<JMuxer | null>(null);
   const websocketRef = useRef<WebSocket | null>(null);
   const renderedDirectFrameRef = useRef(false);
   const visibleRef = useRef(visible);
+  const peakRenderedFpsRef = useRef(0);
+  const decoderRefreshCooldownUntilRef = useRef(0);
   const directStreamUrl = video.preview_url?.startsWith('ws://') || video.preview_url?.startsWith('wss://')
     ? video.preview_url
     : null;
@@ -118,6 +125,11 @@ export const LiveVideoPane = memo(function LiveVideoPane({
   useEffect(() => {
     visibleRef.current = visible;
   }, [visible]);
+
+  useEffect(() => {
+    peakRenderedFpsRef.current = 0;
+    decoderRefreshCooldownUntilRef.current = 0;
+  }, [directStreamUrl]);
 
   useEffect(() => {
     if (!jpegPreviewUrl) {
@@ -202,17 +214,16 @@ export const LiveVideoPane = memo(function LiveVideoPane({
     let batchFlushTimer: number | null = null;
     let pendingAccessUnits: PendingAccessUnit[] = [];
     let pendingAccessUnitBytes = 0;
-    let discardUntilKeyframe = false;
+    let discardUntilKeyframe = true;
     let frontendDroppedAccessUnits = 0;
     let fedFrameCount = 0;
     let fedTimelineDurationMs = 0;
     let lastAccessUnitAt: number | null = null;
-    let peakRenderedFps = 0;
     let degradedRenderingStartedAt: number | null = null;
-    let decoderRefreshCooldownUntil = 0;
-    let recoveryAwaitingFrame = false;
-    let recoveryKeyframeFed = false;
+    let decoderRestartRequested = false;
+    let lastMseMaintenanceAt = 0;
     const renderedFrameTimes: number[] = [];
+    const accessUnitTimes: number[] = [];
     const qualityFrameSamples: Array<{ at: number; presentedFrames: number }> = [];
 
     renderedDirectFrameRef.current = false;
@@ -253,16 +264,10 @@ export const LiveVideoPane = memo(function LiveVideoPane({
       if (cancelled || renderedDirectFrameRef.current) {
         return;
       }
-      if (recoveryAwaitingFrame && !recoveryKeyframeFed) {
-        return;
-      }
       renderedDirectFrameRef.current = true;
       clearFirstDataWarning();
       setHasRenderedDirectFrame(true);
-      if (!recoveryAwaitingFrame || recoveryKeyframeFed) {
-        recoveryAwaitingFrame = false;
-        setDecoderRecoveryFrame(null);
-      }
+      setDecoderRecoveryFrame(null);
       setDecoderDiagnostic(null);
     };
 
@@ -274,6 +279,9 @@ export const LiveVideoPane = memo(function LiveVideoPane({
       renderedFrameTimes.push(now);
       while (renderedFrameTimes[0] != null && now - renderedFrameTimes[0] > 1000) {
         renderedFrameTimes.shift();
+      }
+      while (accessUnitTimes[0] != null && now - accessUnitTimes[0] > 1000) {
+        accessUnitTimes.shift();
       }
       markFirstFrameRendered();
       if (typeof performanceVideoElement.requestVideoFrameCallback === 'function') {
@@ -364,6 +372,10 @@ export const LiveVideoPane = memo(function LiveVideoPane({
         onMissingVideoFrames: () => {
           updateDiagnostic({ message: 'Video frame gaps detected; waiting for a clean keyframe', tone: 'warning' });
         },
+        onKeyframePosition: (position) => {
+          // JMuxer 2.1.0 fails to populate its cleanup index even with clearBuffer enabled.
+          recordMuxerKeyframe(jmuxerRef.current, position);
+        },
         onError: (error) => {
           updateDiagnostic({
             message: `Video buffer error: ${formatJmuxerError(error)}. Retrying decoder.`,
@@ -426,7 +438,6 @@ export const LiveVideoPane = memo(function LiveVideoPane({
       pendingAccessUnits = [];
       pendingAccessUnitBytes = 0;
       const videoBatch = concatenateAccessUnits(batch, batchBytes);
-      recoveryKeyframeFed ||= batch.some((unit) => unit.keyframe);
 
       try {
         jmuxer.feed({
@@ -525,22 +536,18 @@ export const LiveVideoPane = memo(function LiveVideoPane({
       pendingAccessUnits = [];
       pendingAccessUnitBytes = 0;
       discardUntilKeyframe = true;
-      fedFrameCount = 0;
-      fedTimelineDurationMs = 0;
-      recoveryAwaitingFrame = true;
-      recoveryKeyframeFed = false;
       renderedDirectFrameRef.current = false;
       setHasRenderedDirectFrame(false);
-      setDecoderDiagnostic({ message: 'Refreshing video decoder', tone: 'info' });
+      setDecoderDiagnostic({ message: 'Reconnecting video decoder', tone: 'info' });
       videoElement.playbackRate = 1;
-      jmuxer.reset();
-      peakRenderedFps = 0;
       degradedRenderingStartedAt = null;
-      decoderRefreshCooldownUntil = now + VIDEO_DECODER_REFRESH_COOLDOWN_MS;
+      decoderRefreshCooldownUntilRef.current = now + VIDEO_DECODER_REFRESH_COOLDOWN_MS;
+      decoderRestartRequested = true;
+      setDecoderGeneration((generation) => generation + 1);
     };
     requestDecoderRefresh = () => {
       const now = performance.now();
-      if (now >= decoderRefreshCooldownUntil) {
+      if (now >= decoderRefreshCooldownUntilRef.current) {
         refreshDegradedDecoder(now);
       }
     };
@@ -614,16 +621,23 @@ export const LiveVideoPane = memo(function LiveVideoPane({
       );
       const bufferAheadSeconds = currentBufferAheadSeconds();
       correctPlaybackLatency(bufferAheadSeconds);
+      if (now - lastMseMaintenanceAt >= VIDEO_MSE_MAINTENANCE_INTERVAL_MS) {
+        // Keep a bounded live window even if the muxer's automatic cleanup regresses.
+        pruneMuxerBuffer(jmuxer, videoElement.currentTime, VIDEO_MSE_RETAIN_SECONDS);
+        lastMseMaintenanceAt = now;
+      }
 
       if (renderedFps > 0) {
-        peakRenderedFps = Math.max(peakRenderedFps, renderedFps);
+        peakRenderedFpsRef.current = Math.max(peakRenderedFpsRef.current, renderedFps);
       }
       const ingressCurrent = lastAccessUnitAt != null && now - lastAccessUnitAt < 500;
+      const healthyIngress = accessUnitTimes.length >= VIDEO_HEALTHY_INGRESS_FPS;
       const severelyDegraded = Boolean(
         renderedDirectFrameRef.current &&
-          peakRenderedFps >= VIDEO_DEGRADED_FPS_FLOOR &&
-          renderedFps < peakRenderedFps * VIDEO_DEGRADED_FPS_RATIO &&
+          peakRenderedFpsRef.current >= VIDEO_DEGRADED_FPS_FLOOR &&
+          renderedFps < peakRenderedFpsRef.current * VIDEO_DEGRADED_FPS_RATIO &&
           ingressCurrent &&
+          healthyIngress &&
           visibleRef.current &&
           document.visibilityState === 'visible'
       );
@@ -631,7 +645,7 @@ export const LiveVideoPane = memo(function LiveVideoPane({
         degradedRenderingStartedAt ??= now;
         if (
           now - degradedRenderingStartedAt >= VIDEO_DEGRADED_REFRESH_AFTER_MS &&
-          now >= decoderRefreshCooldownUntil
+          now >= decoderRefreshCooldownUntilRef.current
         ) {
           refreshDegradedDecoder(now);
         }
@@ -669,7 +683,12 @@ export const LiveVideoPane = memo(function LiveVideoPane({
       }
 
       accessUnitCount += 1;
-      lastAccessUnitAt = performance.now();
+      const receivedAt = performance.now();
+      lastAccessUnitAt = receivedAt;
+      accessUnitTimes.push(receivedAt);
+      while (accessUnitTimes[0] != null && receivedAt - accessUnitTimes[0] > 1000) {
+        accessUnitTimes.shift();
+      }
       if (accessUnitCount === 1 || accessUnitCount % 120 === 0) {
         updateDiagnostic({
           message: `Receiving H.264 video (${accessUnitCount} access units); waiting for WebView to render`,
@@ -728,10 +747,12 @@ export const LiveVideoPane = memo(function LiveVideoPane({
       videoElement.load();
       renderedDirectFrameRef.current = false;
       setHasRenderedDirectFrame(false);
-      setDecoderDiagnostic(null);
-      setDecoderRecoveryFrame(null);
+      if (!decoderRestartRequested) {
+        setDecoderDiagnostic(null);
+        setDecoderRecoveryFrame(null);
+      }
     };
-  }, [directStreamUrl]);
+  }, [decoderGeneration, directStreamUrl]);
 
   const streamUrl = useMemo(() => displayUrl, [displayUrl]);
 

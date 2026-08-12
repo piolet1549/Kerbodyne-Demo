@@ -59,6 +59,8 @@ const SOURCE_CONVERGENCE_LINES = 'convergence-lines-source';
 const SOURCE_COVERAGE_MASK = 'coverage-mask-source';
 const SOURCE_COVERAGE_BOUNDS = 'coverage-bounds-source';
 const SOURCE_MEASURE = 'measure-source';
+const ACTIVE_TRACK_RENDER_INTERVAL_MS = 250;
+const MOVING_MAP_UI_INTERVAL_MS = 67;
 const INTERACTIVE_LAYERS = [
   'convergence-hit-layer',
   'alerts-layer',
@@ -122,6 +124,7 @@ export function LiveMap({
   onSelectAlert,
   onSelectConvergence
 }: LiveMapProps) {
+  const renderedTrack = useRenderedTrack(track, activeFlight);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
   const aircraftMarkerRef = useRef<maplibregl.Marker | null>(null);
@@ -184,8 +187,15 @@ export function LiveMap({
     () => (isValidCoordinate(liveState?.lat, liveState?.lon) ? liveState ?? null : null),
     [liveState]
   );
-  const filteredTrack = useMemo(() => track.filter(isValidTrackPoint), [track]);
+  const filteredTrack = useMemo(
+    () => renderedTrack.filter(isValidTrackPoint),
+    [renderedTrack]
+  );
   const filteredAlerts = useMemo(() => alerts.filter(isValidAlertRecord), [alerts]);
+  const trackGeoJson = useMemo(
+    () => buildTrackGeoJson(filteredTrack, config.stale_after_seconds) as GeoJsonFeatureCollection,
+    [config.stale_after_seconds, filteredTrack]
+  );
   const style = useMemo(
     () =>
       createMapStyle(config, {
@@ -244,7 +254,7 @@ export function LiveMap({
     }
     return buildSvgMapOverlay({
       map,
-      track: filteredTrack,
+      trackGeoJson,
       alerts: filteredAlerts,
       selectedAlertId,
       highlightedAlertIds,
@@ -252,26 +262,24 @@ export function LiveMap({
       selectedConvergenceId,
       convergenceAlerts,
       trackDisplay: config.track_display,
-      staleAfterSeconds: config.stale_after_seconds,
       mapMode,
       interactive: !measureOpen,
       onSelectAlert: (alertId) => onSelectAlertRef.current(alertId),
       onSelectConvergence: (convergenceId) => onSelectConvergenceRef.current?.(convergenceId)
     });
   }, [
-    config.stale_after_seconds,
     config.track_display,
     convergenceAlerts,
     convergences,
     filteredAlerts,
-    filteredTrack,
     highlightedAlertIds,
     mapError,
     mapMode,
     mapOverlayRevision,
     measureOpen,
     selectedAlertId,
-    selectedConvergenceId
+    selectedConvergenceId,
+    trackGeoJson
   ]);
   const measureControl = (
     <div ref={measureShellRef} className="measure-shell">
@@ -499,6 +507,38 @@ export function LiveMap({
           linkPulseActiveRef.current
         );
         let disposed = false;
+        let movingMapUiTimer: number | null = null;
+        let lastMovingMapUiUpdateAt = 0;
+        const syncMovingMapUi = () => {
+          if (movingMapUiTimer !== null) {
+            window.clearTimeout(movingMapUiTimer);
+          }
+          movingMapUiTimer = null;
+          if (disposed) {
+            return;
+          }
+          lastMovingMapUiUpdateAt = performance.now();
+          const currentCenter = map.getCenter();
+          setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
+          syncMeasureOverlay(
+            map,
+            measurePointsRef.current,
+            measureUnitRef.current,
+            setMeasureLabelScreen
+          );
+          syncScaleIndicator(map, setScaleIndicator);
+          setMapOverlayRevision((revision) => (revision + 1) % 1_000_000);
+        };
+        const scheduleMovingMapUiSync = () => {
+          if (movingMapUiTimer !== null) {
+            return;
+          }
+          const elapsed = performance.now() - lastMovingMapUiUpdateAt;
+          movingMapUiTimer = window.setTimeout(
+            syncMovingMapUi,
+            Math.max(0, MOVING_MAP_UI_INTERVAL_MS - elapsed)
+          );
+        };
         const syncCurrentMapOverlays = () => {
           if (disposed || !map.isStyleLoaded()) {
             return false;
@@ -527,16 +567,7 @@ export function LiveMap({
               linkPulseActiveRef.current
             );
             syncMeasureData(map, measurePointsRef.current);
-            syncMeasureOverlay(
-              map,
-              measurePointsRef.current,
-              measureUnitRef.current,
-              setMeasureLabelScreen
-            );
-            const currentCenter = map.getCenter();
-            setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
-            syncScaleIndicator(map, setScaleIndicator);
-            setMapOverlayRevision((revision) => (revision + 1) % 1_000_000);
+            syncMovingMapUi();
             setMapLoadingLabel(null);
             return true;
           } catch (error) {
@@ -609,13 +640,7 @@ export function LiveMap({
         map.getCanvas().style.cursor = '';
       });
 
-      map.on('move', () => {
-        const currentCenter = map.getCenter();
-        setCenterCoordinates([currentCenter.lat, currentCenter.lng]);
-        syncMeasureOverlay(map, measurePointsRef.current, measureUnitRef.current, setMeasureLabelScreen);
-        syncScaleIndicator(map, setScaleIndicator);
-        setMapOverlayRevision((revision) => (revision + 1) % 1_000_000);
-      });
+      map.on('move', scheduleMovingMapUiSync);
 
       map.on('moveend', () => {
         const currentCenter = map.getCenter();
@@ -669,6 +694,9 @@ export function LiveMap({
         return () => {
           disposed = true;
           window.cancelAnimationFrame(initialOverlaySyncFrame);
+          if (movingMapUiTimer !== null) {
+            window.clearTimeout(movingMapUiTimer);
+          }
           map.off('style.load', syncCurrentMapOverlays);
           map.off('load', syncCurrentMapOverlays);
           map.off('idle', syncCurrentMapOverlays);
@@ -889,7 +917,14 @@ export function LiveMap({
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !activeFlight || selectedAlertId || !effectiveFollowEnabled || !filteredLiveState?.armed) {
+    if (
+      !map ||
+      !activeFlight ||
+      forceFollow ||
+      selectedAlertId ||
+      !effectiveFollowEnabled ||
+      !filteredLiveState?.armed
+    ) {
       return;
     }
 
@@ -904,6 +939,7 @@ export function LiveMap({
   }, [
     activeFlight,
     effectiveFollowEnabled,
+    forceFollow,
     filteredLiveState?.armed,
     filteredLiveState?.lat,
     filteredLiveState?.lon,
@@ -923,11 +959,17 @@ export function LiveMap({
       return;
     }
 
-    map.easeTo({
+    map.jumpTo({
       center: [filteredLiveState.lon as number, filteredLiveState.lat as number],
-      duration: 240
     });
-  }, [activeFlight, filteredLiveState, forceFollow, selectedAlertId]);
+  }, [
+    activeFlight,
+    filteredLiveState?.armed,
+    filteredLiveState?.lat,
+    filteredLiveState?.lon,
+    forceFollow,
+    selectedAlertId
+  ]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1090,7 +1132,7 @@ interface GeoJsonFeatureCollection {
 
 interface SvgMapOverlayOptions {
   map: Map;
-  track: TrackPointRecord[];
+  trackGeoJson: GeoJsonFeatureCollection;
   alerts: AlertRecord[];
   selectedAlertId?: string | null;
   highlightedAlertIds: string[];
@@ -1098,7 +1140,6 @@ interface SvgMapOverlayOptions {
   selectedConvergenceId?: string | null;
   convergenceAlerts: AlertRecord[];
   trackDisplay: AppConfig['track_display'];
-  staleAfterSeconds: number;
   mapMode: MapMode;
   interactive: boolean;
   onSelectAlert: (alertId: string) => void;
@@ -1107,7 +1148,7 @@ interface SvgMapOverlayOptions {
 
 function buildSvgMapOverlay({
   map,
-  track,
+  trackGeoJson,
   alerts,
   selectedAlertId,
   highlightedAlertIds,
@@ -1115,7 +1156,6 @@ function buildSvgMapOverlay({
   selectedConvergenceId,
   convergenceAlerts,
   trackDisplay,
-  staleAfterSeconds,
   mapMode,
   interactive,
   onSelectAlert,
@@ -1131,7 +1171,6 @@ function buildSvgMapOverlay({
     selectedConvergenceId != null
       ? convergences.find((convergence) => convergence.id === selectedConvergenceId) ?? null
       : null;
-  const trackGeoJson = buildTrackGeoJson(track, staleAfterSeconds) as GeoJsonFeatureCollection;
   const sectorGeoJson = buildAlertSectorsGeoJson(
     selectedConvergenceId ? [] : alerts,
     selectedAlertId,
@@ -1512,6 +1551,33 @@ function isValidTrackPoint(point: TrackPointRecord) {
 
 function isValidAlertRecord(alert: AlertRecord) {
   return isValidCoordinate(alert.sector.center_lat, alert.sector.center_lon);
+}
+
+function useRenderedTrack(track: TrackPointRecord[], activeFlight: boolean) {
+  const latestTrackRef = useRef(track);
+  const [renderedTrack, setRenderedTrack] = useState(track);
+
+  useEffect(() => {
+    latestTrackRef.current = track;
+    if (!activeFlight) {
+      setRenderedTrack(track);
+    }
+  }, [activeFlight, track]);
+
+  useEffect(() => {
+    setRenderedTrack(latestTrackRef.current);
+    if (!activeFlight) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      setRenderedTrack((current) =>
+        current === latestTrackRef.current ? current : latestTrackRef.current
+      );
+    }, ACTIVE_TRACK_RENDER_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [activeFlight]);
+
+  return renderedTrack;
 }
 
 function ensureGeoJsonSource(map: Map, sourceId: string, data: GeoJSON.GeoJSON) {

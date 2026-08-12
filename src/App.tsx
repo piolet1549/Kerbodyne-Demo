@@ -671,6 +671,7 @@ export function App() {
   const armedAltitudeBaselineRef = useRef<number | null>(null);
   const armedAtTimestampRef = useRef<string | null>(null);
   const efficiencyAccumulatorRef = useRef<EfficiencyAccumulator>(createEfficiencyAccumulator());
+  const recordedTrackTimesRef = useRef<Set<string>>(new Set());
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [offlineCatalog, setOfflineCatalog] = useState<OfflineRegionCatalog>({
     asset_origin: '',
@@ -1111,6 +1112,9 @@ export function App() {
                 }
               };
         setSnapshot(normalizedSnapshot);
+        recordedTrackTimesRef.current = new Set(
+          normalizedSnapshot.track.map((point) => point.recorded_at)
+        );
         previousAlertCountRef.current = nextSnapshot.alerts.length;
         setSelectedAlertId(null);
         setSelectedConvergenceId(null);
@@ -1132,6 +1136,9 @@ export function App() {
     listenToRuntimeEvents((event: RuntimeEvent) => {
       startTransition(() => {
         if (event.type === 'snapshot') {
+          recordedTrackTimesRef.current = new Set(
+            event.snapshot.track.map((point) => point.recorded_at)
+          );
           setSnapshot(event.snapshot);
           const previousAlertCount = previousAlertCountRef.current;
           const newAlertCount = Math.max(0, event.snapshot.alerts.length - previousAlertCount);
@@ -1177,11 +1184,14 @@ export function App() {
           }
         }
         if (event.type === 'live_telemetry') {
+          const trackPoints = event.update.track_points.filter((point) => {
+            if (recordedTrackTimesRef.current.has(point.recorded_at)) {
+              return false;
+            }
+            recordedTrackTimesRef.current.add(point.recorded_at);
+            return true;
+          });
           setSnapshot((current) => {
-            const recordedAt = new Set(current.track.map((point) => point.recorded_at));
-            const trackPoints = event.update.track_points.filter(
-              (point) => !recordedAt.has(point.recorded_at)
-            );
             const rawTelemetryPackets = [
               ...current.raw_telemetry_packets,
               ...event.update.raw_telemetry_packets

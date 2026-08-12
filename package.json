@@ -1,11 +1,12 @@
 {
   "name": "kerbodyne-ground-station",
   "private": true,
-  "version": "0.1.30",
+  "version": "0.1.31",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 1420",
     "dev:tauri-server": "node scripts/tauri-dev-server.mjs",
+    "test:frontend": "node --test src/lib/*.test.js",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "clean:build": "powershell -ExecutionPolicy Bypass -File scripts/clean-build-artifacts.ps1",

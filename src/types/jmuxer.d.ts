@@ -15,6 +15,7 @@ declare module 'jmuxer' {
     onError?: (error?: unknown) => void;
     onUnsupportedCodec?: (codec?: string) => void;
     onMissingVideoFrames?: () => void;
+    onKeyframePosition?: (position: number) => void;
     onLoggerLog?: (...args: unknown[]) => void;
     onLoggerErr?: (...args: unknown[]) => void;
   }

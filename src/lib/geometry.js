@@ -292,7 +292,13 @@ export function buildCoverageBoundsGeoJson(enabledRegions) {
   };
 }
 
-export function buildTrackGeoJson(track, staleAfterSeconds = 10) {
+export const MAX_RENDERED_TRACK_SOURCE_POINTS = 640;
+
+export function buildTrackGeoJson(
+  track,
+  staleAfterSeconds = 10,
+  maxSourcePoints = MAX_RENDERED_TRACK_SOURCE_POINTS
+) {
   const normalizedTrack = Array.isArray(track)
     ? track.map(normalizeTrackPoint).filter(Boolean)
     : [];
@@ -303,7 +309,7 @@ export function buildTrackGeoJson(track, staleAfterSeconds = 10) {
     };
   }
 
-  const features = [];
+  const entries = [];
   let currentSegment = [normalizedTrack[0]];
 
   for (let index = 1; index < normalizedTrack.length; index += 1) {
@@ -316,8 +322,8 @@ export function buildTrackGeoJson(track, staleAfterSeconds = 10) {
     const staleGap = Number.isFinite(elapsedSeconds) && elapsedSeconds > staleAfterSeconds;
 
     if (staleGap) {
-      features.push(...buildTrackSegmentFeatures(currentSegment));
-      features.push(...buildGapMarkerFeatures(previous, current));
+      entries.push({ kind: 'segment', points: currentSegment });
+      entries.push({ kind: 'gap', start: previous, end: current });
       currentSegment = [current];
       continue;
     }
@@ -325,7 +331,23 @@ export function buildTrackGeoJson(track, staleAfterSeconds = 10) {
     currentSegment.push(current);
   }
 
-  features.push(...buildTrackSegmentFeatures(currentSegment));
+  entries.push({ kind: 'segment', points: currentSegment });
+  const segmentEntries = entries.filter((entry) => entry.kind === 'segment');
+  const budgets = allocateTrackPointBudgets(
+    segmentEntries.map((entry) => entry.points.length),
+    maxSourcePoints
+  );
+  const smoothingIterations =
+    budgets.reduce((total, budget) => total + budget, 0) > 320 ? 1 : 2;
+  let segmentIndex = 0;
+  const features = entries.flatMap((entry) => {
+    if (entry.kind === 'gap') {
+      return buildGapMarkerFeatures(entry.start, entry.end);
+    }
+    const budget = budgets[segmentIndex] ?? entry.points.length;
+    segmentIndex += 1;
+    return buildTrackSegmentFeatures(entry.points, budget, smoothingIterations);
+  });
 
   return {
     type: 'FeatureCollection',
@@ -353,12 +375,58 @@ function normalizeTrackPoint(point) {
   };
 }
 
-function buildTrackSegmentFeatures(segment) {
+function allocateTrackPointBudgets(segmentLengths, maxSourcePoints) {
+  if (segmentLengths.length === 0) {
+    return [];
+  }
+  const totalPoints = segmentLengths.reduce((total, length) => total + length, 0);
+  const minimumPoints = segmentLengths.reduce(
+    (total, length) => total + Math.min(2, length),
+    0
+  );
+  const requestedLimit = Number.isFinite(maxSourcePoints)
+    ? Math.max(2, Math.trunc(maxSourcePoints))
+    : MAX_RENDERED_TRACK_SOURCE_POINTS;
+  const targetPoints = Math.min(totalPoints, Math.max(minimumPoints, requestedLimit));
+  const extraCapacity = segmentLengths.reduce(
+    (total, length) => total + Math.max(0, length - 2),
+    0
+  );
+  const remainingPoints = targetPoints - minimumPoints;
+  const budgets = segmentLengths.map((length) => {
+    const base = Math.min(2, length);
+    if (remainingPoints <= 0 || extraCapacity <= 0) {
+      return base;
+    }
+    return Math.min(
+      length,
+      base + Math.floor((remainingPoints * Math.max(0, length - 2)) / extraCapacity)
+    );
+  });
+
+  let assignedPoints = budgets.reduce((total, budget) => total + budget, 0);
+  while (assignedPoints < targetPoints) {
+    let addedPoint = false;
+    for (let index = 0; index < budgets.length && assignedPoints < targetPoints; index += 1) {
+      if (budgets[index] < segmentLengths[index]) {
+        budgets[index] += 1;
+        assignedPoints += 1;
+        addedPoint = true;
+      }
+    }
+    if (!addedPoint) {
+      break;
+    }
+  }
+  return budgets;
+}
+
+function buildTrackSegmentFeatures(segment, pointBudget = segment.length, smoothingIterations = 2) {
   if (!segment || segment.length < 2) {
     return [];
   }
-  const coordinates = segment.map((point) => [point.lon, point.lat]);
-  const smoothed = smoothPolyline(coordinates, 2);
+  const coordinates = sampleTrackCoordinates(segment, pointBudget);
+  const smoothed = smoothPolyline(coordinates, smoothingIterations);
   return [
     {
       type: 'Feature',
@@ -425,6 +493,21 @@ function buildGapMarkerFeatures(startPoint, endPoint) {
       }
     }
   ];
+}
+
+function sampleTrackCoordinates(segment, pointBudget) {
+  const budget = Math.max(2, Math.min(segment.length, Math.trunc(pointBudget)));
+  if (segment.length <= budget) {
+    return segment.map((point) => [point.lon, point.lat]);
+  }
+
+  const coordinates = [];
+  for (let index = 0; index < budget; index += 1) {
+    const sourceIndex = Math.round((index * (segment.length - 1)) / (budget - 1));
+    const point = segment[sourceIndex];
+    coordinates.push([point.lon, point.lat]);
+  }
+  return coordinates;
 }
 
 function haversineDistanceM(startLat, startLon, endLat, endLon) {

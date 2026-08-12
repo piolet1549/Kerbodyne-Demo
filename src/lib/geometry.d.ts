@@ -8,8 +8,11 @@ export function buildAlertSectorsGeoJson(
 
 export function buildTrackGeoJson(
   track: TrackPointRecord[],
-  staleAfterSeconds?: number
+  staleAfterSeconds?: number,
+  maxSourcePoints?: number
 ): any;
+
+export const MAX_RENDERED_TRACK_SOURCE_POINTS: number;
 
 export function buildAlertsGeoJson(
   alerts: AlertRecord[],
